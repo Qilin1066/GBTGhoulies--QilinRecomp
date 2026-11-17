@@ -1,12 +1,12 @@
 #include "cfg.hpp"
 
-#include <cstdlib>
 #include <algorithm>
 #include <format>
 #include <optional>
 #include <ranges>
 
 #include "json.hpp"
+#include "vrange.hpp"
 
 namespace qilin {
 
@@ -29,6 +29,8 @@ bool is_flat_mem(const Operand& o) {
     return o.kind == Operand::Kind::Mem && (o.seg == ZYDIS_REGISTER_DS || o.seg == ZYDIS_REGISTER_NONE);
 }
 
+}  // namespace
+
 // Does this instruction (possibly) write 32-bit register r (or part of it)?
 // Conservative: calls and the implicit-operand instructions count as writes.
 bool writes_reg(const Insn& i, ZydisRegister r) {
@@ -41,10 +43,17 @@ bool writes_reg(const Insn& i, ZydisRegister r) {
         case ZYDIS_MNEMONIC_IMUL:
             if (i.nops == 1) return r == ZYDIS_REGISTER_EAX || r == ZYDIS_REGISTER_EDX;
             break;
-        case ZYDIS_MNEMONIC_MOVSB: case ZYDIS_MNEMONIC_MOVSD: case ZYDIS_MNEMONIC_STOSB: case ZYDIS_MNEMONIC_STOSD:
-        case ZYDIS_MNEMONIC_LODSB: case ZYDIS_MNEMONIC_LODSD: case ZYDIS_MNEMONIC_SCASB: case ZYDIS_MNEMONIC_SCASD:
-        case ZYDIS_MNEMONIC_CMPSB: case ZYDIS_MNEMONIC_CMPSD:
-            return true;
+        // String instructions: the pointers they step, ecx under a rep prefix,
+        // eax for lods. (movsd/cmpsd here are the string forms: the SSE2 forms
+        // don't exist on the Pentium III and are rejected as implausible.)
+        case ZYDIS_MNEMONIC_MOVSB: case ZYDIS_MNEMONIC_MOVSW: case ZYDIS_MNEMONIC_MOVSD:
+        case ZYDIS_MNEMONIC_CMPSB: case ZYDIS_MNEMONIC_CMPSW: case ZYDIS_MNEMONIC_CMPSD:
+            return r == ZYDIS_REGISTER_ESI || r == ZYDIS_REGISTER_EDI || (i.has_rep() && r == ZYDIS_REGISTER_ECX);
+        case ZYDIS_MNEMONIC_STOSB: case ZYDIS_MNEMONIC_STOSW: case ZYDIS_MNEMONIC_STOSD:
+        case ZYDIS_MNEMONIC_SCASB: case ZYDIS_MNEMONIC_SCASW: case ZYDIS_MNEMONIC_SCASD:
+            return r == ZYDIS_REGISTER_EDI || (i.has_rep() && r == ZYDIS_REGISTER_ECX);
+        case ZYDIS_MNEMONIC_LODSB: case ZYDIS_MNEMONIC_LODSW: case ZYDIS_MNEMONIC_LODSD:
+            return r == ZYDIS_REGISTER_ESI || r == ZYDIS_REGISTER_EAX || (i.has_rep() && r == ZYDIS_REGISTER_ECX);
         case ZYDIS_MNEMONIC_CMP: case ZYDIS_MNEMONIC_TEST: case ZYDIS_MNEMONIC_PUSH:
             return false;
         default:
@@ -61,6 +70,8 @@ bool writes_reg(const Insn& i, ZydisRegister r) {
     }
     return false;
 }
+
+namespace {
 
 uint32_t width_mask(uint16_t bits) { return bits >= 32 ? 0xFFFFFFFFu : (1u << bits) - 1; }
 
@@ -265,7 +276,65 @@ void Cfg::resolve_jt(const std::vector<const Insn*>& hist, const XbeSection& sec
     out.targets.assign(tg.begin(), tg.end());
 }
 
+// Fill t (at, table set) from a proven index range. Every slot in range must
+// hold an address in the table's code section; otherwise the proof doesn't
+// describe this table and it stays heuristic.
+bool Cfg::prove_table(const IndexFact& fact, const XbeSection& sec, JumpTable& t) const {
+    const Range r = fact.index;
+    // Non-negative or entirely negative (as int32); at most 4096 slots.
+    const bool neg = r.lo >= 0x80000000u;
+    if (!neg && r.hi >= 0x80000000u) return false;
+    if (r.hi - r.lo >= 4096) return false;
+    t.entries.assign(r.hi - r.lo + 1, 0);
+    std::set<uint32_t> tg;
+    for (uint32_t k = 0; k < t.entries.size(); ++k) {
+        const uint32_t a = t.table + 4 * (r.lo + k);  // mod 2^32, as the CPU computes it
+        if (!xbe_.mapped(a, 4)) return false;
+        const uint32_t v = xbe_.u32(a);
+        if (v < sec.va || v >= sec.file_end()) return false;
+        t.entries[k] = v;
+        tg.insert(v);
+    }
+    t.first = int32_t(r.lo);
+    t.targets.assign(tg.begin(), tg.end());
+    t.bounded = true;
+    t.how = fact.byte_table ? "range+bytetable" : "range";
+    t.index_table = fact.byte_table;
+    t.index_count = fact.byte_count;
+    return true;
+}
+
+// Explore, then prove the size of any heuristically sized jump table with the
+// value-range analysis and explore again with the proven tables, until stable.
 Cfg::Explored Cfg::explore(uint32_t f, uint32_t bound) {
+    std::map<uint32_t, JumpTable> proven;
+    for (int round = 0;; ++round) {
+        Explored r = explore_once(f, bound, proven);
+        std::vector<uint32_t> want;
+        for (auto& j : r.jtabs)
+            if (!j.bounded && !proven.contains(j.at)) want.push_back(j.at);
+        if (want.empty() || round == 4) return r;
+        std::vector<uint32_t> entries{f};
+        for (auto it = eh_roots_.upper_bound(f); it != eh_roots_.end() && (!bound || *it < bound); ++it)
+            if (r.insns.contains(*it)) entries.push_back(*it);
+        const auto facts = index_ranges(xbe_, r.insns, entries, r.jtabs, want);
+        const XbeSection* sec = xbe_.code_section_at(f);
+        bool any = false;
+        for (uint32_t w : want) {
+            auto jt = std::ranges::find(r.jtabs, w, &JumpTable::at);
+            JumpTable p;
+            p.at = w;
+            p.table = jt->table;
+            if (auto fit = facts.find(w); fit != facts.end() && prove_table(fit->second, *sec, p)) {
+                proven.emplace(w, std::move(p));
+                any = true;
+            }
+        }
+        if (!any) return r;
+    }
+}
+
+Cfg::Explored Cfg::explore_once(uint32_t f, uint32_t bound, const std::map<uint32_t, JumpTable>& proven) {
     Explored r;
     r.leaders.insert(f);
     std::vector<uint32_t> work{f};
@@ -309,13 +378,21 @@ Cfg::Explored Cfg::explore(uint32_t f, uint32_t bound) {
                     }
                 } else {
                     const Operand& m = ins->op[0];
+                    // A switch table sits in the code section, after its function.
+                    // [4*reg + T] with T in data indexes a table of records (e.g.
+                    // handler pointers): an indirect jump, not a switch.
                     const bool jt = ins->nops >= 1 && is_flat_mem(m) && m.size == 32 && m.base == ZYDIS_REGISTER_NONE &&
-                                    is_gpr32(m.index) && m.scale == 4 && m.has_disp && m.disp > 0;
+                                    is_gpr32(m.index) && m.scale == 4 && m.has_disp && m.disp > 0 &&
+                                    xbe_.code_section_at(uint32_t(m.disp)) != nullptr;
                     if (jt) {
                         JumpTable j;
-                        j.at = a;
-                        j.table = uint32_t(m.disp);
-                        resolve_jt(hist, *sec_f, j);
+                        if (auto p = proven.find(a); p != proven.end()) {
+                            j = p->second;
+                        } else {
+                            j.at = a;
+                            j.table = uint32_t(m.disp);
+                            resolve_jt(hist, *sec_f, j);
+                        }
                         for (uint32_t x : j.targets)
                             if (!inside(x)) j.dropped.push_back(x);
                         std::erase_if(j.targets, [&](uint32_t x) { return !inside(x); });
@@ -843,7 +920,7 @@ void Cfg::run() {
         std::vector<std::pair<uint32_t, uint32_t>> v;
         for (auto& [_, fn] : funcs_)
             for (auto& j : fn.jtabs) {
-                v.emplace_back(j.table, j.table + 4 * std::max<uint32_t>(1, uint32_t(j.entries.size())));
+                v.emplace_back(j.data_lo(), j.data_hi());
                 if (j.index_table) v.emplace_back(j.index_table, j.index_table + j.index_count);
             }
         std::ranges::sort(v);
@@ -958,7 +1035,7 @@ void Cfg::validate() {
         std::vector<T> tables;
         for (auto& [s0, fn] : funcs_)
             for (auto& j : fn.jtabs) {
-                tables.push_back({j.table, j.table + 4 * uint32_t(j.entries.size()), s0});
+                tables.push_back({j.data_lo(), j.table + 4 * uint32_t(j.entries.size()), s0});
                 if (j.index_table) tables.push_back({j.index_table, j.index_table + j.index_count, s0});
             }
         std::ranges::sort(tables, {}, &T::lo);
@@ -1077,7 +1154,7 @@ std::vector<CoverageRegion> Cfg::coverage() {
     std::vector<std::pair<uint32_t, uint32_t>> tables;
     for (auto& [_, fn] : funcs_)
         for (auto& j : fn.jtabs) {
-            tables.emplace_back(j.table, j.table + 4 * uint32_t(j.entries.size()));
+            tables.emplace_back(j.data_lo(), j.table + 4 * uint32_t(j.entries.size()));
             if (j.index_table) tables.emplace_back(j.index_table, j.index_table + j.index_count);
         }
     auto account = [&](CoverageRegion reg) {
@@ -1255,7 +1332,7 @@ std::string Cfg::to_json() const {
         j.key("jtabs").begin_array();
         for (auto& t : f.jtabs) {
             j.begin_object().kv("at", t.at).kv("table", t.table).kv("n", t.targets.size()).kv("how", t.how);
-            j.kv("entries", t.entries.size()).kv("index_table", t.index_table).kv("index_count", t.index_count);
+            j.kv("entries", t.entries.size()).kv("first", t.first).kv("index_table", t.index_table).kv("index_count", t.index_count);
             j.key("dropped").begin_array();
             for (auto x : t.dropped) j.value(x);
             j.end_array();

@@ -72,6 +72,7 @@ add_library(qilin_core STATIC
     recomp/src/xbe.cpp
     recomp/src/decoder.cpp
     recomp/src/cfg.cpp
+    recomp/src/vrange.cpp
     recomp/src/lifter.cpp
 )
 target_include_directories(qilin_core PUBLIC recomp/src)

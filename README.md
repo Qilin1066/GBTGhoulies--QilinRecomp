@@ -12,7 +12,7 @@ Roadmap step 2, **recompiler core**, is in progress.
 |---|---|
 | XBE loader (headers, certificate, sections, libraries, kernel thunks, flat image) | ✅ output identical to the Python prototype |
 | x86 decoder (Zydis, vendored) | ✅ agrees with LLVM on every reachable instruction |
-| Function discovery + CFG (recursive descent, switch tables, C++ EH tables, data-as-code validation) | ✅ 8,843 functions, 558 jump tables; **100% of the lifted code accounted for** (`qilin coverage`: 0 unknown bytes in the game code, Rare libraries and EH funclets) |
+| Function discovery + CFG (recursive descent, switch tables, C++ EH tables, data-as-code validation) | ✅ 8,843 functions, 556 jump tables (every one in lifted code has a proven size); **100% of the lifted code accounted for** (`qilin coverage`: 0 unknown bytes in the game code, Rare libraries and EH funclets) |
 | Lifter → C++, slice 1 (leaf functions: integer, scalar SSE, jump tables) | ✅ 1,276 functions (game code + Rare libraries), differentially tested against the original x86 under Unicorn, also under UBSan: 0 mismatches |
 | Lifter slice 2 (calls) / slice 3 (x87) | next |
 | Runtime, HLE, Vulkan | later (see roadmap) |

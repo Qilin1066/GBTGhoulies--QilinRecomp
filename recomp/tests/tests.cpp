@@ -135,6 +135,42 @@ std::vector<uint8_t> make_xbe() {
     put32(d, 0x12D6, uint32_t(0x11130 - 0x112DA));  // jmp 11130 (stands in for __CxxFrameHandler)
     const uint8_t funclet[] = {0xDF, 0xF1, 0x8D, 0x4D, 0xFC, 0xC3};  // fcomip st1; lea ecx, [ebp-4]; ret
     std::memcpy(&d[0x12E0], funclet, sizeof funclet);
+
+    // 11300: a switch bounded by a register holding a constant, with the bound
+    // a block away from the jump; its table is followed directly by another
+    // table, which a heuristic scan would run into.
+    const uint8_t regbound[] = {
+        0x8B, 0x4C, 0x24, 0x04,                    // 11300 mov ecx, [esp+4]
+        0xBA, 0x03, 0x00, 0x00, 0x00,              // 11304 mov edx, 3
+        0x3B, 0xCA,                                // 11309 cmp ecx, edx
+        0x77, 0x11,                                // 1130B ja 1131E
+        0x33, 0xC0,                                // 1130D xor eax, eax
+        0xFF, 0x24, 0x8D, 0x20, 0x13, 0x01, 0x00,  // 1130F jmp [4*ecx + 0x11320]
+        0x40, 0xC3, 0x48, 0xC3, 0x41, 0xC3, 0x49, 0xC3,  // 11316.. four cases
+        0xC3,                                      // 1131E ret
+    };
+    std::memcpy(&d[0x1300], regbound, sizeof regbound);
+    put32(d, 0x1320, 0x11316);
+    put32(d, 0x1324, 0x11318);
+    put32(d, 0x1328, 0x1131A);
+    put32(d, 0x132C, 0x1131C);
+    // 11340: MSVC's negative-index form: `sub ecx, 4; jb` then
+    // jmp [4*ecx + 0x11340] reads the four slots at 11330 (ecx = -4..-1).
+    const uint8_t negidx[] = {
+        0x8B, 0x4C, 0x24, 0x04,                    // 11340 mov ecx, [esp+4]
+        0x83, 0xE9, 0x04,                          // 11344 sub ecx, 4
+        0x72, 0x03,                                // 11347 jb 1134C
+        0x31, 0xC0, 0xC3,                          // 11349 xor eax, eax; ret
+        0xFF, 0x24, 0x8D, 0x40, 0x13, 0x01, 0x00,  // 1134C jmp [4*ecx + 0x11340]
+        0xB0, 0x01, 0xC3, 0xB0, 0x02, 0xC3, 0xB0, 0x03, 0xC3, 0xB0, 0x04, 0xC3,  // 11353.. cases
+    };
+    std::memcpy(&d[0x1340], negidx, sizeof negidx);
+    put32(d, 0x1330, 0x11353);
+    put32(d, 0x1334, 0x11356);
+    put32(d, 0x1338, 0x11359);
+    put32(d, 0x133C, 0x1135C);
+    put32(d, 0x1414, 0x11300);  // .rdata pointers to both
+    put32(d, 0x1418, 0x11340);
     return d;
 }
 
@@ -197,7 +233,18 @@ int main() {
     if (f.contains(0x112A0)) CHECK(std::ranges::binary_search(f.at(0x112A0).insns, 0x112B0u));
     CHECK(f.contains(0x112D0) && f.at(0x112D0).origin == Origin::Eh);  // __ehhandler stub
     CHECK(f.contains(0x112E0));  // unwind funclet
-    CHECK(f.size() == 7);  // nothing seeded inside the jump/index tables or the filler
+    CHECK(f.size() == 9);  // nothing seeded inside the jump/index tables or the filler
+    if (f.contains(0x11300) && f.at(0x11300).jtabs.size() == 1) {
+        auto& t = f.at(0x11300).jtabs[0];  // proven by value ranges, not by a cmp next to the jump
+        CHECK(t.how == "range" && t.bounded && t.first == 0);
+        CHECK((t.entries == std::vector<uint32_t>{0x11316, 0x11318, 0x1131A, 0x1131C}));
+    } else CHECK(false);
+    if (f.contains(0x11340) && f.at(0x11340).jtabs.size() == 1) {
+        auto& t = f.at(0x11340).jtabs[0];
+        CHECK(t.how == "range" && t.bounded && t.first == -4);
+        CHECK((t.entries == std::vector<uint32_t>{0x11353, 0x11356, 0x11359, 0x1135C}));
+        CHECK(t.data_lo() == 0x11330u && t.data_hi() == 0x11340u);
+    } else CHECK(false);
     {
         const Insn* fc = dec.decode(0x112E0);  // fcomip: ZF, PF, CF set; OF, SF, AF cleared
         CHECK(fc && fc->flags_written == 63 && fc->flags_defined == 63 && fc->flags_read == 0);
@@ -231,6 +278,11 @@ int main() {
 
     // ---------------------------------------------------------------- lifter
     Lifter lifter(dec);
+    if (f.contains(0x11340)) {
+        auto r = lifter.lift(f.at(0x11340));  // negative cases: unsigned values of ecx
+        CHECK(r.has_value() && r->contains("case 4294967292u: goto L_00011353;") &&
+              r->contains("case 4294967295u: goto L_0001135C;"));
+    }
     if (f.contains(0x112A0)) {
         auto r = lifter.lift(f.at(0x112A0));  // the label is lifted as part of its function
         CHECK(r.has_value() && r->contains("L_000112B0"));
@@ -240,7 +292,7 @@ int main() {
         CHECK(r.has_value());
         if (r) {
             CHECK(r->contains("switch (eax)"));
-            CHECK(r->contains("case 2: goto L_00011026;"));
+            CHECK(r->contains("case 2u: goto L_00011026;"));
             // cmp eax, 2 feeds only ja: CF and ZF are computed, OF/SF/AF are not.
             CHECK(r->contains("cf = a < b;"));
             CHECK(!r->contains("of = (("));

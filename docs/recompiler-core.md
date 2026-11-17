@@ -1,6 +1,6 @@
 # Recompiler core: status (roadmap step 2)
 
-Last updated 2026-11-17 (v0.4.0: every byte of the lifted code accounted for; earlier: C++23 migration and code review, validation pass, lifter slice 1, differential test).
+Last updated 2026-11-17 (every jump table in lifted code proven by value-range analysis; v0.4.0: every byte of the lifted code accounted for; earlier: C++23 migration and code review, validation pass, lifter slice 1, differential test).
 
 ## Language and toolchain
 Everything is **C++23**: the recompiler, the runtime header and the generated code. The C++23 features in use are `std::expected` (XBE loader and lifter results), `std::print`/`std::format`, `std::ranges` algorithms, `std::string::contains`, `std::unreachable` and `std::bit_cast`.
@@ -53,8 +53,8 @@ This is a C++ port of `tools/analysis/cfg.py` and `analyze.py`. It works on Zydi
 | Functions | 9,402 | 9,197 | 8,843 |
 | Reachable instructions | 530,764 | 529,718 | 530,444 |
 | Lifted code accounted for (game, Rare libraries, EH funclets) | — | — | **100%**, 0 unknown bytes |
-| Jump tables resolved | 556 | 553 | 558 (307 cmp, 202 cmp + byte table, 3 `and` mask, 46 heuristic) |
-| Unresolved indirect jumps | 24 | 26 | 26 (7 in lifted code, all indirect tail calls) |
+| Jump tables resolved | 556 | 553 | 556 (307 cmp, 202 cmp + byte table, 5 `and` mask, 35 value-range, 7 heuristic, none in lifted code) |
+| Unresolved indirect jumps | 24 | 26 | 28 (7 in lifted code, all indirect tail calls; 2 are jumps through tables of records in `.rdata`) |
 | Indirect calls | ~1,960 | 1,980 | 1,930 |
 
 There are fewer functions in v0.4.0 because 2,834 fragments of real functions were merged back into their parents, while about 1,300 functions were newly found.
@@ -108,6 +108,24 @@ The game code went from 15,198 unknown bytes to 0. These are the rules that got 
 - **Misaligned overlaps.** When one function's entry falls inside another's instruction, the one with weaker evidence goes. Before v0.4.0 the inner seed always lost, which threw away a real function at `0xD3310` in favour of a jump table decoded as an orphan.
 - **Switch bounds.** The backward search for a jump table's bound follows the index register through `movzx` and `mov reg, reg` and stops when the register is overwritten. It accepts `and reg, 2^k - 1` as a bound. A table entry may not land on another function's start, and byte index tables are clipped against their dword table.
 - **Fixpoint.** Immediate seeding, fragment merging, validation, label dropping and re-exploration repeat until nothing changes (at most 8 rounds).
+
+### Jump-table sizes: value-range analysis (`recomp/src/vrange.*`)
+A `cmp` or `and` directly above a table jump bounds most switches. For the rest, the CFG runs a value-range analysis over the function and uses the proven range of the index register at the jump. Before this, those tables were sized by scanning until an entry stopped looking like a code address.
+
+**How it works:**
+- Each of the eight 32-bit registers holds an unsigned interval. Instructions update it: constant moves, register copies, `movzx` (including loads from a byte index table, whose bytes give the range), `lea`, `add`/`sub`/`inc`/`dec` with x86 wraparound, `and` masks, shifts and `imul` by a constant.
+- On each conditional branch, the last `cmp`/`test` narrows the compared register: unsigned, signed and equality conditions, a register holding a constant on either side, and the flags of `sub reg, imm`.
+- Ranges flow along every path, including from one jump table's cases into another, and merge where paths join. Anything it can't model (memory, calls, partial-register writes) makes the register unknown, so a result is never narrower than the truth.
+- A proof is accepted only if every slot in the range holds an address in the code section. The function is then re-explored with the proven table.
+
+**Results in lifted code:** all 32 heuristically sized tables there are now proven, or turned out not to be switch tables.
+- **15 tables in the `0x108xxx` group** (`dec ecx; cmp ecx, 4; ja`) were over-read by the scan. Each was taken as 10 slots when it has 5, running into the next function's table, so every one of those functions had 5 phantom cases.
+- **`0x16322D`** was read as 14 slots; it has 10. The last 4 are a separate table, used by the jump at `0x16328D`.
+- **`0x165B44`** in the Rare `memcpy` uses MSVC's negative-index form: `sub ecx, 4; jb` then `jmp [4*ecx + 0x165C4C]` with ecx from -4 to -1, which reads the 4 slots at `0x165C3C`. Tables now carry a signed first index for this.
+- **`0xD410B` and `0xD4179`** index tables of 20-byte records in `.rdata` (`lea ecx, [eax+eax*4]` then `jmp [4*ecx + 0x304EB8]`). They aren't switches, and are now indirect jumps. A switch table always sits in the code section.
+- **The others** had their bound in a register (`mov edx, 3; cmp ecx, edx`), in an earlier block, or behind a `rep movsd` that the old bound search wrongly treated as overwriting every register.
+
+**Cross-check:** run on the 311 tables already bounded by `cmp` or `and`, the analysis gives the same size for all of them except two `and` tables in replaced library code, where it reports the full mask range and the old path drops unused trailing slots. Both answers are correct. The 7 tables still sized by scanning are all in XDK libraries that aren't lifted.
 
 **Lift check.** The lift report has no fragments left: every failure is an instruction class still to be implemented (calls for slice 2, x87 for slice 3, `std`, `pushfd`). In v0.3.0, 61 lift failures were fragments.
 
@@ -203,7 +221,7 @@ The generated code compiles with no warnings at `-Wall -Wextra` under GCC 14 for
 The function and jump-table counts are **what we have found so far, not totals read from the game**. A retail XBE has no symbol table: nothing in the file says how many functions or switch tables there are. The real totals are fixed by the binary, but we can only approach them by accounting for every byte. So "done" is defined by these checks rather than by reaching a number:
 
 1. **Every byte of the code we lift is accounted for.** It is either an instruction of a function, or a known kind of data: a jump table, a byte index table, alignment padding, or a constant. ✅ **Done in v0.4.0:** 0 unknown bytes in the game code, the Rare libraries and the EH funclets (`qilin coverage`). The 97.8% quoted before was for all of `.text`, including XAPI and the CRT, which aren't lifted.
-2. **Every switch has a proven size.** Of the 558 jump tables, 46 are sized heuristically. They need a bounding `cmp`, or the lifter must trap on any index outside the table, which it already does.
+2. **Every switch has a proven size.** ✅ **Done for lifted code:** every jump table in the game code and Rare libraries is bounded by a `cmp`, an `and` mask or the value-range analysis. 7 tables are still sized by scanning, all in XDK libraries that get replaced. The lifter also traps on any index outside a table.
 3. **Every indirect jump is resolved.** 7 remain in lifted code, and all are indirect tail calls through function pointers (`jmp [eax+0x14]`, `jmp eax`, `jmp [0x304EC4]`), not switches. Slice 2's indirect-call dispatcher handles them.
 4. **Every function lifts.** The lift report must show zero failures. Today 1,276 of 5,748 functions in the game code and Rare libraries lift. The rest are waiting on calls (slice 2), x87 (slice 3) or two one-off instructions; none is a fragment.
 5. **Nothing turns up at runtime.** An indirect call to an address we don't have a function for traps with the address logged. A full playthrough (and the attract mode, menus and every level) with no such trap closes the list. The Ghoulies PC Recomp's seed list of functions found during play is an extra cross-check.

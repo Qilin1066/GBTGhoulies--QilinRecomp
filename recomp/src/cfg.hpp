@@ -16,6 +16,7 @@
 //      another instruction, decode failures, implausible instructions).
 #pragma once
 
+#include <algorithm>
 #include <cstdint>
 #include <map>
 #include <set>
@@ -27,15 +28,23 @@
 
 namespace qilin {
 
+struct IndexFact;  // vrange.hpp
+
 struct JumpTable {
     uint32_t at = 0;                // the jmp [4*reg + table]
     uint32_t table = 0;             // table address
-    std::string how;                // "cmp", "cmp+bytetable", "heuristic"
+    std::string how;                // "cmp", "and", "range" (value-range analysis), "+bytetable", or "heuristic"
     std::vector<uint32_t> targets;  // unique, sorted
     std::vector<uint32_t> entries;  // table contents in index order (0 = not a code address)
     bool bounded = false;           // index range proven by a cmp
     uint32_t index_table = 0;       // byte index table (movzx reg, byte [idx + T]), 0 if none
     uint32_t index_count = 0;       // its length in bytes
+    // entries[k] is the slot for index value first + k, at table + 4 * (first + k).
+    // first is the lowest possible index: 0 for a cmp/and bound, possibly
+    // negative for MSVC's `sub ecx, 4; jb; jmp [4*ecx + T]` trick.
+    int32_t first = 0;
+    uint32_t data_lo() const { return table + 4 * uint32_t(first); }
+    uint32_t data_hi() const { return data_lo() + 4 * std::max<uint32_t>(1, uint32_t(entries.size())); }
     std::vector<uint32_t> dropped;  // targets beyond the function's bound (candidates for absorb_fragments)
 };
 
@@ -109,6 +118,8 @@ struct Suspect {
 
 // MSVC alignment filler (mov r, r / lea r, [r + 0]); semantically a no-op.
 bool is_pad_filler(const Insn& i);
+// Does i (possibly) write 32-bit register r or part of it? Calls count as writing eax/ecx/edx.
+bool writes_reg(const Insn& i, ZydisRegister r);
 
 // Byte-level accounting of a code range: every byte is code, a known table,
 // padding, or unknown. "Done" means unknown == 0 in every lifted region.
@@ -156,6 +167,8 @@ public:
 private:
     struct Explored;
     Explored explore(uint32_t f, uint32_t bound);
+    Explored explore_once(uint32_t f, uint32_t bound, const std::map<uint32_t, JumpTable>& proven);
+    bool prove_table(const IndexFact& fact, const XbeSection& sec, JumpTable& t) const;
     void resolve_jt(const std::vector<const Insn*>& hist, const XbeSection& sec, JumpTable& out);
     void linear_seeds();
     void run_queue(std::vector<uint32_t> q, Origin origin, uint8_t round = 0);
@@ -189,7 +202,8 @@ private:
     std::map<uint32_t, Function> funcs_;
     AddrSet owned_;
     std::set<uint32_t> imm_seeds_;
-    std::set<uint32_t> dptr_;          // 16-aligned code pointers found in .rdata/.data
+    std::set<uint32_t> dptr_;
+    std::set<uint32_t> unprovable_;    // table jumps the range analysis can't bound (not retried)          // 16-aligned code pointers found in .rdata/.data
     std::set<uint32_t> evidence_;      // addresses with independent evidence of being a function entry
     size_t absorbed_ = 0;              // fragments merged back into their parent
     // MSVC C++ exception metadata (FuncInfo in .rdata): unwind funclets are

@@ -620,7 +620,8 @@ void FnEmitter::emit(const Insn& i, uint8_t live_out) {
             use(gpr(d.index)->gpr);
             line(std::format("switch ({}) {{", gpr(d.index)->name()));
             for (size_t k = 0; k < jt->entries.size(); ++k)
-                if (jt->entries[k]) line(std::format("    case {}: goto L_{:08X};", k, jt->entries[k]));
+                if (jt->entries[k])
+                    line(std::format("    case {}u: goto L_{:08X};", uint32_t(jt->first) + uint32_t(k), jt->entries[k]));
             line(std::format("    default: rt::trap(0x{:X}u, \"jump table index outside the recovered table\");", i.addr));
             line("}");
             return;
