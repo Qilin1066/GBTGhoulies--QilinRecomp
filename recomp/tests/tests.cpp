@@ -132,7 +132,7 @@ std::vector<uint8_t> make_xbe() {
     put32(d, 0x1464, 0x112E0);     // action
     const uint8_t stub[] = {0xB8, 0x40, 0x20, 0x01, 0x00, 0xE9, 0x00, 0x00, 0x00, 0x00};
     std::memcpy(&d[0x12D0], stub, sizeof stub);
-    put32(d, 0x12D6, 0x11130 - 0x112DA);  // jmp 11130 (stands in for __CxxFrameHandler)
+    put32(d, 0x12D6, uint32_t(0x11130 - 0x112DA));  // jmp 11130 (stands in for __CxxFrameHandler)
     const uint8_t funclet[] = {0xDF, 0xF1, 0x8D, 0x4D, 0xFC, 0xC3};  // fcomip st1; lea ecx, [ebp-4]; ret
     std::memcpy(&d[0x12E0], funclet, sizeof funclet);
     return d;
