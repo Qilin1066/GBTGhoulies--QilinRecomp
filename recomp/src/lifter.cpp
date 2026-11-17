@@ -147,6 +147,12 @@ uint32_t mask_of(int w) { return w == 32 ? 0xFFFFFFFFu : (1u << w) - 1; }
 uint32_t sign_of(int w) { return 1u << (w - 1); }
 
 // ------------------------------------------------------------------ emitter
+constexpr int64_t kStackUnknown = INT64_MIN;
+struct StackState {  // esp/ebp as offsets from esp at entry
+    int64_t esp = kStackUnknown, ebp = kStackUnknown;
+    bool seen = false;
+};
+
 class FnEmitter {
 public:
     FnEmitter(Decoder& d, const Function& f) : dec_(d), f_(f) {}
@@ -627,8 +633,8 @@ void FnEmitter::emit(const Insn& i, uint8_t live_out) {
 // Every `ret` must find esp back at offset 0, otherwise this "function" is a
 // fragment of another one (or not code), and lifting it would be wrong.
 void FnEmitter::check_stack_balance(const std::vector<std::vector<size_t>>& succ) {
-    constexpr int64_t UNK = INT64_MIN;
-    struct St { int64_t esp = UNK, ebp = UNK; bool seen = false; };
+    constexpr int64_t UNK = kStackUnknown;
+    using St = StackState;
     const size_t n = ins_.size();
     std::vector<St> in(n);
     size_t entry = idx_.at(f_.start);
@@ -712,7 +718,7 @@ std::string FnEmitter::run() {
             } else {
                 for (auto& j : f_.jtabs)
                     if (j.at == i.addr)
-                        for (uint32_t t : j.targets) succ[k].push_back(need_idx(i, t));
+                        for (uint32_t jt : j.targets) succ[k].push_back(need_idx(i, jt));
             }
             continue;
         }

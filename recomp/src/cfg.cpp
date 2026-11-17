@@ -191,14 +191,14 @@ Cfg::Explored Cfg::explore(uint32_t f, uint32_t bound) {
                         j.table = uint32_t(m.disp);
                         resolve_jt(*ins, m.index, j.table, hist, *sec_f, j);
                         if (bound) {
-                            auto outside = [&](uint32_t t) { return !(t >= f && t < bound); };
+                            auto outside = [&](uint32_t x) { return !(x >= f && x < bound); };
                             std::erase_if(j.targets, outside);
                             for (auto& e : j.entries)
                                 if (e && outside(e)) e = 0;
                         }
-                        for (uint32_t t : j.targets) {
-                            r.leaders.insert(t);
-                            work.push_back(t);
+                        for (uint32_t jt : j.targets) {
+                            r.leaders.insert(jt);
+                            work.push_back(jt);
                         }
                         r.jtabs.push_back(std::move(j));
                     } else {
