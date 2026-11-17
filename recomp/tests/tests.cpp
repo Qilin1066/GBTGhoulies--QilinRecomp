@@ -247,7 +247,9 @@ int main() {
     {
         JsonWriter j;
         j.begin_object().kv("a", uint8_t(7)).kv("b", true).kv("s", std::string("x\"y")).key("n").null().end_object();
-        CHECK(j.str() == R"({"a":7,"b":true,"s":"x\"y","n":null})");
+        // (kept out of CHECK: MSVC's preprocessor mangles raw strings when stringizing)
+        const std::string expected = R"({"a":7,"b":true,"s":"x\"y","n":null})";
+        CHECK(j.str() == expected);
     }
 
     if (failures) {

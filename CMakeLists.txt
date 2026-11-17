@@ -40,7 +40,9 @@ add_subdirectory(third_party/zydis EXCLUDE_FROM_ALL)
 # ---- Warnings for our own targets ----
 add_library(qilin_warnings INTERFACE)
 if(MSVC)
-    target_compile_options(qilin_warnings INTERFACE /W4 /permissive- /utf-8 /Zc:__cplusplus)
+    target_compile_options(qilin_warnings INTERFACE /W4 /permissive- /utf-8 /Zc:__cplusplus /Zc:preprocessor)
+    # fopen/strerror etc. are standard C++; MSVC's "use the _s variants" advice is not.
+    target_compile_definitions(qilin_warnings INTERFACE _CRT_SECURE_NO_WARNINGS)
     if(QILIN_WERROR)
         target_compile_options(qilin_warnings INTERFACE /WX)
     endif()
