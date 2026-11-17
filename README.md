@@ -1,6 +1,6 @@
 # GBTG-Qilincomp
 
-A static recompilation of **Grabbed by the Ghoulies** (Rare, original Xbox, 2003) into portable C++23 with a Vulkan renderer, aimed at Windows, Linux, macOS (Apple Silicon) and ARM64 Linux. Efficiency is the first priority: a Raspberry Pi 4–class board is our reference for typical low-end hardware, not a floor, and the aim is to run well below it if the engineering allows.
+A static recompilation of **Grabbed by the Ghoulies** (Rare, original Xbox, 2003) into portable C++23 with a Vulkan renderer, aimed at 64-bit Windows, Linux and macOS (Apple Silicon), on x86-64 or ARM64. Anything with a Vulkan driver is in scope; Apple Silicon is covered through MoltenVK. Efficiency is the first priority: a Raspberry Pi 4–class board is our reference for typical low-end hardware, not a floor.
 
 > **No game data is included, and none ever will be.** You need your own copy of the game. The tools read `default.xbe` and the disc files from a path you give them. `.gitignore` keeps game files, and anything generated from them, out of the repo.
 

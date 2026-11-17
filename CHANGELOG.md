@@ -12,7 +12,8 @@ Each release is a git tag (`vX.Y.Z`) with a matching GitHub release. The version
 ## [Unreleased]
 
 ### Changed
-- **Docs:** the Raspberry Pi 4 is described as a reference point for typical low-end hardware, not a minimum spec. A new *Hardware scope* section in the roadmap says what going lower would take (an OpenGL ES 2 renderer for Pi 1–3, and a windowed memory model for 32-bit hosts).
+- **Docs:** hardware scope decided. Supported hosts are 64-bit machines with Vulkan, with macOS on Apple Silicon covered through MoltenVK. Hardware without Vulkan, and 32-bit hosts, are out of scope, so there is one renderer and one flat memory model. The Raspberry Pi 4 is described as a reference point for typical low-end hardware, not a minimum spec.
+- **Docs:** naming convention for `qilin` (see `docs/naming.md`).
 - **Docs:** `recompiler-core.md` explains that function and jump-table counts are discoveries, not known totals, and defines the checks that mean everything is recompiled.
 
 ## [0.3.0] - 2026-11-17

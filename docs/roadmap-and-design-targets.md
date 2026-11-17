@@ -3,7 +3,7 @@
 **Guiding principle: efficiency and reliability come first.** Every design choice is judged on whether it makes the game cheaper to run on low-end hardware and whether it fails loudly and predictably instead of silently misbehaving.
 
 ## Targets
-- **Platforms:** Windows, Linux, macOS (Apple Silicon), ARM64 Linux. See *Hardware scope* below.
+- **Platforms:** 64-bit Windows, Linux and macOS (Apple Silicon), on x86-64 or ARM64, with Vulkan. See *Hardware scope* below.
 - **Language:** **C++23** throughout (recompiler, generated code and runtime). Minimum compilers: GCC 14, Clang 19, Xcode 16, Visual Studio 2022 17.10. No DirectX anywhere.
 - **Graphics API:** **Vulkan only**, restricted to a small baseline feature set (today: what Mesa's v3dv driver on a Pi 4 supports), so one render path works everywhere (MoltenVK on macOS).
 - **Reference:** xemu running the original game is ground truth for behaviour and visuals. The existing Windows-only Ghoulies PC Recomp (xboxrecomp-based, D3D11) is a second behavioural reference; its known-issue list doubles as a regression checklist (see `prior-art.md`).
@@ -29,11 +29,14 @@
 - **Portability rules:** no inline asm or x86 intrinsics in the runtime; ARM64 Linux builds from day one.
 
 ## Hardware scope
-A **Raspberry Pi 4–class board is the reference for "typical low-end hardware"**: it's what we measure efficiency against and test on. It is not a floor and not the goal. The goal is the cheapest possible game, and if the engineering gets us below the Pi 4, so much the better.
+**Supported: 64-bit hosts with a Vulkan driver.** In practice that means:
+- **Windows and Linux** on x86-64 or ARM64 with a Vulkan-capable GPU and driver;
+- **macOS on Apple Silicon**, through MoltenVK (Vulkan on top of Metal);
+- **ARM boards** with Vulkan drivers, e.g. Raspberry Pi 4 and newer (Mesa v3dv).
 
-Going below it would mean extra work in two places. Neither is ruled out:
-- **Graphics.** Vulkan needs a Vulkan driver. On Raspberry Pis that means Pi 4 or newer; Pi 1–3 (VideoCore IV) only have OpenGL ES 2. Supporting them would need a second, OpenGL ES 2 renderer behind the same D3D8-translation layer.
-- **32-bit hosts.** The runtime maps the Xbox's whole 4 GB address space flat, which needs a 64-bit OS. A Pi 1 or Zero (32-bit ARMv6) would need a windowed memory model. That's feasible, since the Xbox only has 64 MB of RAM, but it costs some speed on every memory access.
+**Out of scope:** anything without Vulkan (or, on Apple, a Vulkan translation layer), and 32-bit hosts. That rules out the Raspberry Pi 1–3 and Zero (OpenGL ES 2 only), and Intel Macs aren't a target. Because of this there is one renderer (Vulkan) and one memory model: the Xbox's 4 GB address space mapped flat into a 64-bit host's address space, with no windowing cost on memory accesses.
+
+**Low-end reference:** a Raspberry Pi 4–class board is our reference for typical low-end hardware. It's what we measure efficiency against and test on. It is not a floor: anything Vulkan-capable that's slower is fair game if the efficiency work gets us there. The Vulkan feature set we use is kept small (today: what v3dv on a Pi 4 supports) so the one render path runs on all of it.
 
 ## Settings, not platform branches
 All enhancements live behind a settings file with presets, e.g.:
