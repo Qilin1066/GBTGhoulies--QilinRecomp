@@ -72,6 +72,7 @@ def llvm_mnemonic(text):
 
 
 def zydis_mnemonic(zm, ztext):
+    """Zydis mnemonic mapped to LLVM's name for the same instruction."""
     # Zydis folds rep/lock into attributes; its mnemonic is the base instruction.
     if zm in FAR and " far" in ztext:
         # LLVM prints a far call/jmp through memory (FF /3, FF /5) as plain call/jmp.
@@ -81,7 +82,7 @@ def zydis_mnemonic(zm, ztext):
     return ZY2LLVM.get(zm, zm)
 
 
-def equivalent(zm, lm, ztext, ltext):
+def equivalent(zm, lm):
     if zm == lm:
         return True
     # Size-suffixed string ops: LLVM prints movsd/stosd/..., Zydis movsd/stosd too, but
@@ -134,7 +135,7 @@ def check(path, reachable, dis, hard, benign, stats):
         else:
             lm = llvm_mnemonic(ltext)
             zmn = zydis_mnemonic(zm, ztext)
-            if not equivalent(zmn, lm, ztext, ltext):
+            if not equivalent(zmn, lm):
                 msg = f"{kind} {addr:08x}: mnemonic Zydis {zmn!r} '{ztext}' vs LLVM {lm!r} '{ltext}'"
             if reachable and zmn in ("lcall", "ljmp", "retf"):
                 far.append(f"{addr:08x}: {ztext}")

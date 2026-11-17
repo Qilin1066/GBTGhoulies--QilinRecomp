@@ -1,7 +1,7 @@
 #include "decoder.hpp"
 
 #include <algorithm>
-#include <cstring>
+#include <limits>
 
 namespace qilin {
 
@@ -26,6 +26,7 @@ bool Insn::is_cond_branch() const {
 }
 
 const char* Insn::implausible_reason() const {
+    if (too_many_operands) return "more than three operands (VEX/EVEX)";
     if (branch == ZYDIS_BRANCH_TYPE_FAR) return "far control transfer";
     if (attributes & ZYDIS_ATTRIB_IS_PRIVILEGED) return "privileged instruction";
     if (address_width == 16) return "16-bit addressing";
@@ -44,12 +45,14 @@ const char* Insn::implausible_reason() const {
         case ZYDIS_MNEMONIC_LDS: case ZYDIS_MNEMONIC_LES: case ZYDIS_MNEMONIC_LFS: case ZYDIS_MNEMONIC_LGS:
         case ZYDIS_MNEMONIC_LSS:
             return "far pointer load";
+        case ZYDIS_MNEMONIC_STI: case ZYDIS_MNEMONIC_CLI:
+            return "interrupt flag change";
         default:
             break;
     }
     // Writes to a segment register (mov sreg, pop sreg).
-    if (nops >= 1 && op[0].kind == Operand::Kind::Reg && op[0].reg >= ZYDIS_REGISTER_ES && op[0].reg <= ZYDIS_REGISTER_GS &&
-        (mnem == ZYDIS_MNEMONIC_MOV || mnem == ZYDIS_MNEMONIC_POP))
+    if (nops >= 1 && op[0].kind == Operand::Kind::Reg && op[0].reg >= ZYDIS_REGISTER_ES &&
+        op[0].reg <= ZYDIS_REGISTER_GS && (mnem == ZYDIS_MNEMONIC_MOV || mnem == ZYDIS_MNEMONIC_POP))
         return "segment register write";
     // Undocumented shift alias: C0/C1/D0-D3 with ModRM.reg = 6 (SAL /6).
     if (opcode_map == ZYDIS_OPCODE_MAP_DEFAULT && (opcode == 0xC0 || opcode == 0xC1 || (opcode >= 0xD0 && opcode <= 0xD3)) &&
@@ -58,43 +61,47 @@ const char* Insn::implausible_reason() const {
     // Undocumented TEST alias: F6/F7 /1.
     if (opcode_map == ZYDIS_OPCODE_MAP_DEFAULT && (opcode == 0xF6 || opcode == 0xF7) && modrm_reg == 1)
         return "undocumented TEST /1";
-    // Instructions the Xbox's Pentium III (SSE1, no SSE2) cannot execute.
+    // The Xbox CPU is a Pentium III: base, x87, MMX and SSE only.
     switch (isa_ext) {
         case ZYDIS_ISA_EXT_BASE: case ZYDIS_ISA_EXT_X87: case ZYDIS_ISA_EXT_MMX: case ZYDIS_ISA_EXT_SSE:
         case ZYDIS_ISA_EXT_PAUSE:
-            break;
+            return nullptr;
         default:
             return "instruction set the Pentium III lacks";
     }
-    return nullptr;
 }
 
 Decoder::Decoder(const Xbe& xbe) : xbe_(xbe) {
     ZydisDecoderInit(&dec_, ZYDIS_MACHINE_MODE_LEGACY_32, ZYDIS_STACK_WIDTH_32);
     ZydisFormatterInit(&fmt_, ZYDIS_FORMATTER_STYLE_INTEL);
     ZydisFormatterSetProperty(&fmt_, ZYDIS_FORMATTER_PROP_FORCE_SIZE, ZYAN_TRUE);
-    cache_.reserve(1 << 20);
+    // One slot per byte of the address range spanned by the code sections.
+    lo_ = std::numeric_limits<uint32_t>::max();
+    for (auto& s : xbe.sections)
+        if (s.code && s.rsize) {
+            lo_ = std::min(lo_, s.va);
+            hi_ = std::max(hi_, s.file_end());
+        }
+    if (lo_ < hi_) table_.assign(hi_ - lo_, kUnknown);
+    else lo_ = hi_ = 0;
 }
 
-const Insn* Decoder::decode(uint32_t va) {
-    if (auto it = cache_.find(va); it != cache_.end()) return it->second ? &*it->second : nullptr;
+uint32_t* Decoder::slot(uint32_t va) {
+    if (va >= lo_ && va < hi_) return &table_[va - lo_];
+    return &outside_[va];  // value-initialised to kUnknown
+}
 
+bool Decoder::decode_uncached(uint32_t va, Insn& ins) const {
+    if (!xbe_.mapped(va)) return false;
     auto img = xbe_.image();
-    if (!xbe_.mapped(va)) {
-        cache_.emplace(va, std::nullopt);
-        return nullptr;
-    }
-    size_t off = va - xbe_.base;
-    size_t avail = std::min<size_t>(15, img.size() - off);
+    const size_t off = va - xbe_.base;
+    const size_t avail = std::min<size_t>(ZYDIS_MAX_INSTRUCTION_LENGTH, img.size() - off);
 
     ZydisDecodedInstruction zi;
     ZydisDecodedOperand zo[ZYDIS_MAX_OPERAND_COUNT];
-    if (ZYAN_FAILED(ZydisDecoderDecodeFull(&dec_, img.data() + off, avail, &zi, zo))) {
-        cache_.emplace(va, std::nullopt);
-        return nullptr;
-    }
+    if (ZYAN_FAILED(ZydisDecoderDecodeFull(&dec_, img.data() + off, avail, &zi, zo))) return false;
 
-    Insn ins;
+    ins = Insn{};
     ins.addr = va;
     ins.len = zi.length;
     ins.mnem = zi.mnemonic;
@@ -103,14 +110,14 @@ const Insn* Decoder::decode(uint32_t va) {
     ins.opcode_map = uint8_t(zi.opcode_map);
     ins.modrm_reg = zi.raw.modrm.reg;
     ins.address_width = zi.address_width;
-    ins.isa_ext = zi.meta.isa_ext;
     ins.operand_width = zi.operand_width;
+    ins.isa_ext = zi.meta.isa_ext;
     ins.branch = zi.meta.branch_type;
-    std::memcpy(ins.bytes.data(), img.data() + off, zi.length);
-    ins.nops = std::min<uint8_t>(zi.operand_count_visible, uint8_t(ins.op.size()));
+    ins.too_many_operands = zi.operand_count_visible > Insn::kMaxOperands;
+    ins.nops = uint8_t(std::min<int>(zi.operand_count_visible, Insn::kMaxOperands));
     for (uint8_t i = 0; i < ins.nops; ++i) {
-        const auto& s = zo[i];
-        auto& d = ins.op[i];
+        const ZydisDecodedOperand& s = zo[i];
+        Operand& d = ins.op[i];
         d.size = s.size;
         switch (s.type) {
             case ZYDIS_OPERAND_TYPE_REGISTER:
@@ -140,15 +147,33 @@ const Insn* Decoder::decode(uint32_t va) {
                 break;
         }
     }
-    auto [it, _] = cache_.emplace(va, std::move(ins));
-    return &*it->second;
+    return true;
+}
+
+const Insn* Decoder::decode(uint32_t va) {
+    uint32_t* s = slot(va);
+    if (*s == kInvalid) return nullptr;
+    if (*s != kUnknown) return &insns_[*s - 2];
+    Insn ins;
+    if (!decode_uncached(va, ins)) {
+        *s = kInvalid;
+        return nullptr;
+    }
+    insns_.push_back(ins);
+    *s = uint32_t(insns_.size() + 1);  // index + 2
+    return &insns_.back();
+}
+
+std::span<const uint8_t> Decoder::bytes(const Insn& ins) const {
+    return xbe_.image().subspan(ins.addr - xbe_.base, ins.len);
 }
 
 std::string Decoder::format(const Insn& ins) const {
-    // Re-decode from the stored bytes: the compact form is not enough for the formatter.
+    // Re-decode from the image: the compact form is not enough for the formatter.
     ZydisDecodedInstruction zi;
     ZydisDecodedOperand zo[ZYDIS_MAX_OPERAND_COUNT];
-    if (ZYAN_FAILED(ZydisDecoderDecodeFull(&dec_, ins.bytes.data(), ins.len, &zi, zo))) return "(bad)";
+    auto b = bytes(ins);
+    if (ZYAN_FAILED(ZydisDecoderDecodeFull(&dec_, b.data(), b.size(), &zi, zo))) return "(bad)";
     char buf[256];
     if (ZYAN_FAILED(ZydisFormatterFormatInstruction(&fmt_, &zi, zo, zi.operand_count_visible, buf, sizeof buf,
                                                     ins.addr, nullptr)))
@@ -161,4 +186,8 @@ const char* Decoder::mnemonic_name(ZydisMnemonic m) {
     return s ? s : "?";
 }
 
+}  // namespace qilin
+
+namespace qilin {
+static_assert(sizeof(Operand) == 32, "Operand grew: check the bit-field packing");
 }  // namespace qilin

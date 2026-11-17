@@ -6,7 +6,7 @@
 #pragma once
 
 #include <cstdint>
-#include <optional>
+#include <expected>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -14,6 +14,7 @@
 
 namespace qilin {
 
+// Thrown only for programming errors: reading outside the mapped image.
 struct XbeError : std::runtime_error {
     using std::runtime_error::runtime_error;
 };
@@ -22,17 +23,18 @@ struct XbeSection {
     std::string name;
     uint32_t flags = 0;
     uint32_t va = 0;      // virtual address
-    uint32_t vsize = 0;   // virtual size (>= rsize; tail is BSS)
+    uint32_t vsize = 0;   // virtual size (>= rsize; the tail is BSS)
     uint32_t raw = 0;     // file offset
     uint32_t rsize = 0;   // bytes present in the file
+    bool code = false;    // holds x86 code (as opposed to data, images, or APU DSP microcode)
+
     bool writable() const { return flags & 1; }
     bool preload() const { return flags & 2; }
     bool executable() const { return flags & 4; }
     bool inserted() const { return flags & 8; }
-    // Holds x86 code (as opposed to data, images, or APU DSP microcode).
-    bool code = false;
     uint32_t end() const { return va + vsize; }
-    bool contains(uint32_t a) const { return a >= va && a < va + vsize; }
+    uint32_t file_end() const { return va + rsize; }
+    bool contains(uint32_t a) const { return a >= va && a < end(); }
 };
 
 struct XbeLibrary {
@@ -55,9 +57,9 @@ struct XbeCertificate {
 
 class Xbe {
 public:
-    // Throws XbeError on anything malformed.
-    static Xbe load(const std::string& path);
-    static Xbe parse(std::vector<uint8_t> file);
+    // Errors (unreadable file, malformed header, ...) come back as a message.
+    static std::expected<Xbe, std::string> load(const std::string& path);
+    static std::expected<Xbe, std::string> parse(std::span<const uint8_t> file);
 
     // Header fields
     std::string kind;  // "retail" or "debug" (which XOR keys decoded the entry point)
@@ -84,13 +86,18 @@ public:
 
     const XbeSection* section_at(uint32_t va) const;
     // Code section containing va, using the file-backed extent (va .. va+rsize).
+    // O(log n): this sits in the analysis passes' hottest loops.
     const XbeSection* code_section_at(uint32_t va) const;
 
     std::string to_json() const;
 
 private:
-    std::vector<uint8_t> file_;
+    void index_code_sections();
+
     std::vector<uint8_t> image_;
+    // Indices into `sections` of the code sections, sorted by address, for
+    // code_section_at(). Indices (not pointers) so Xbe stays safely copyable.
+    std::vector<uint16_t> code_index_;
 };
 
 }  // namespace qilin

@@ -1,6 +1,6 @@
 # GBTG-Qilincomp
 
-A static recompilation of **Grabbed by the Ghoulies** (Rare, original Xbox, 2003) into portable C++20 with a Vulkan renderer, aimed at Windows, Linux, macOS (Apple Silicon) and ARM64 Linux, with a Raspberry Pi 4 as the minimum spec.
+A static recompilation of **Grabbed by the Ghoulies** (Rare, original Xbox, 2003) into portable C++23 with a Vulkan renderer, aimed at Windows, Linux, macOS (Apple Silicon) and ARM64 Linux, with a Raspberry Pi 4 as the minimum spec.
 
 > **No game data is included, and none ever will be.** You need your own copy of the game. The tools read `default.xbe` and the disc files from a path you give them. `.gitignore` keeps game files, and anything generated from them, out of the repo.
 
@@ -11,15 +11,24 @@ Roadmap step 2, **recompiler core**, is in progress.
 | Piece | State |
 |---|---|
 | XBE loader (headers, certificate, sections, libraries, kernel thunks, flat image) | ✅ output identical to the Python prototype |
-| x86 decoder (Zydis, vendored) | ✅ agrees with LLVM on all 532,837 reachable instructions |
-| Function discovery + CFG (recursive descent, switch tables, data-as-code validation) | ✅ 9,199 functions, 553 jump tables |
-| Lifter → C++, slice 1 (leaf functions: integer, scalar SSE, jump tables) | ✅ 1,243 functions, differentially tested against the original x86 under Unicorn |
+| x86 decoder (Zydis, vendored) | ✅ agrees with LLVM on all 529,718 reachable instructions |
+| Function discovery + CFG (recursive descent, switch tables, data-as-code validation) | ✅ 9,197 functions, 553 jump tables |
+| Lifter → C++, slice 1 (leaf functions: integer, scalar SSE, jump tables) | ✅ 1,373 functions (game code + Rare libraries), differentially tested against the original x86 under Unicorn, also under UBSan |
 | Lifter slice 2 (calls) / slice 3 (x87) | next |
 | Runtime, HLE, Vulkan | later (see roadmap) |
 
 ## Building
 
-You need CMake ≥ 3.20 and a C++20 compiler (Clang, GCC or MSVC). There are no other dependencies.
+The whole project (recompiler, runtime and generated code) is **C++23**. You need CMake ≥ 3.25 and one of:
+
+| Compiler | Minimum | Notes |
+|---|---|---|
+| GCC | 14 | Debian 13 / Raspberry Pi OS (Trixie) and Ubuntu 24.04 (`g++-14`) have it |
+| Clang | 19 | Older Clang can't use libstdc++'s `std::expected` |
+| Apple Clang | Xcode 16 | |
+| MSVC | Visual Studio 2022 17.10 | |
+
+CMake stops with a clear message if the compiler is older. There are no other dependencies.
 
 ```sh
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
@@ -27,16 +36,18 @@ cmake --build build --parallel
 ctest --test-dir build --output-on-failure
 ```
 
-CI builds and tests on Linux x64, Linux ARM64, macOS ARM64 and Windows x64.
+CI builds and tests with warnings as errors on Linux x64 (GCC 14 and Clang 19), Linux ARM64 (GCC 14), macOS ARM64 and Windows x64 (MSVC).
 
 ## Using it
 
 ```sh
-build/qilin info  path/to/default.xbe            # header, sections, XDK libraries, kernel imports (JSON)
-build/qilin cfg   path/to/default.xbe --json cfg.json   # function discovery + control flow
-build/qilin insns path/to/default.xbe [--linear] -o listing.txt
-build/qilin suspects path/to/default.xbe          # kept functions with problems, for review
-build/qilin lift  path/to/default.xbe --out gen/  # lift to C++ (gen/ is gitignored: never commit it)
+build/qilin info     path/to/default.xbe                 # header, sections, XDK libraries, kernel imports (JSON)
+build/qilin cfg      path/to/default.xbe --json cfg.json # function discovery + control flow
+build/qilin insns    path/to/default.xbe [--linear] -o listing.txt
+build/qilin suspects path/to/default.xbe                 # kept functions with problems, for review
+build/qilin lift     path/to/default.xbe --out gen/      # lift to C++ (gen/ is gitignored: never commit it)
+
+Code that compiles lifted C++ must link the `qilin_runtime` CMake target (or pass `-ffp-contract=off`): SSE results are only bit-exact without fused multiply-add.
 ```
 
 ### Full check against your copy of the game
@@ -45,7 +56,7 @@ build/qilin lift  path/to/default.xbe --out gen/  # lift to C++ (gen/ is gitigno
 tools/check/check_xbe.sh path/to/default.xbe
 ```
 
-This runs the unit tests and the CFG pass, then cross-checks Zydis against LLVM's disassembler. Finally it runs the differential test, which compares each lifted function with the original x86 code run in the Unicorn emulator. It needs Python 3, `libLLVM` (Debian/Ubuntu: `apt install libllvm18`) and `pip install unicorn`. The decoder check is:
+This runs the unit tests and the CFG pass, then cross-checks Zydis against LLVM's disassembler. Finally it runs the differential test, which compares each lifted function with the original x86 code run in the Unicorn emulator. It needs Python 3, `libLLVM` (Debian/Ubuntu: `apt install libllvm18`) and `pip install unicorn`. Set `CXX` to a C++23 compiler for the differential test, which builds the lifted code at `-O2` with warnings as errors. Pass `--sanitize` to `tools/difftest/difftest.py` for an UndefinedBehaviorSanitizer build. The decoder check is:
 
 - **Strict on every reachable instruction:** same length and same mnemonic.
 - **Strict on a linear sweep of every code section too**, except for three classes it reports instead of failing, because they only occur in data bytes:

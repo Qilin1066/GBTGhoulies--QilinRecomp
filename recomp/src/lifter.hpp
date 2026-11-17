@@ -1,8 +1,9 @@
 // x86 -> C++ lifter.
 //
 // Each guest function becomes one C++ function `void fn_XXXXXXXX(Context&)`:
-//   - guest registers are host locals (loaded at entry, stored at every exit),
-//     so the host compiler can register-allocate them;
+//   - guest registers are host locals (loaded at entry; only the ones the
+//     function modifies are stored back at its exits), so the host compiler
+//     can register-allocate them;
 //   - EFLAGS are individual bools, and a flag is only computed where a later
 //     instruction can read it (backward liveness over the function's CFG);
 //   - basic blocks are labels, branches are gotos, jump tables are switches;
@@ -13,36 +14,47 @@
 #pragma once
 
 #include <cstdint>
-#include <map>
+#include <expected>
 #include <string>
-#include <vector>
 
 #include "cfg.hpp"
 #include "decoder.hpp"
-#include "xbe.hpp"
 
 namespace qilin {
 
-struct LiftResult {
-    bool ok = false;
-    std::string error;  // first problem found, with address
-    std::string code;   // C++ definition when ok
+struct LiftFailure {
+    enum class Kind : uint8_t {
+        NotLeaf,           // calls / tail jumps / unresolved indirect jumps (slice 2)
+        Fragment,          // not a whole function (unbalanced stack, flags live on entry)
+        Unsupported,       // an instruction the lifter doesn't handle yet
+        X87,               // x87 (slice 3)
+        UndefinedFlag,     // reads a flag the previous writer leaves undefined
+        Implausible,       // an instruction retail MSVC code never contains
+        BadControlFlow,    // branch outside the function, missing target...
+    };
+    Kind kind;
+    uint32_t addr = 0;      // offending instruction (or the function start)
+    std::string insn;       // its text, when there is one
+    std::string mnemonic;   // its mnemonic, when there is one
+    std::string detail;
+
+    std::string message() const;    // "0001234A mov ...: detail"
+    std::string category() const;   // stable bucket for reports, e.g. "unsupported [pushfd]"
 };
 
 class Lifter {
 public:
-    Lifter(const Xbe& xbe, Decoder& dec, const Cfg& cfg) : xbe_(xbe), dec_(dec), cfg_(cfg) {}
+    explicit Lifter(Decoder& dec) : dec_(dec) {}
 
-    // Lifts one function. Slice 1 handles leaf functions (no calls, no tail
-    // jumps, no indirect branches other than resolved jump tables) without x87.
-    LiftResult lift(const Function& f);
+    // Lifts one function to a C++ definition. Slice 1 handles leaf functions
+    // (no calls, no tail jumps, no indirect branches other than resolved jump
+    // tables) without x87.
+    std::expected<std::string, LiftFailure> lift(const Function& f);
 
     static std::string name(uint32_t addr);
 
 private:
-    const Xbe& xbe_;
     Decoder& dec_;
-    const Cfg& cfg_;
 };
 
 }  // namespace qilin

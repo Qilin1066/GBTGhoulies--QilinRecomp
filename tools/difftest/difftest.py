@@ -16,7 +16,7 @@ must trap as well. Trials that run past the instruction budget are skipped.
 
 Usage:
   difftest.py --qilin build/qilin --xbe default.xbe [--work /tmp/qd]
-              [--trials 24] [--only ADDR] [--cxx c++]
+              [--trials 24] [--only ADDR] [--cxx g++-14] [--sanitize]
 
 Exit status 1 if any function mismatches. Needs: pip install unicorn
 """
@@ -101,8 +101,13 @@ def build(args, work):
     print(subprocess.run(cmd, check=True, capture_output=True, text=True).stdout.splitlines()[0])
     srcs = sorted(os.path.join(gen, f) for f in os.listdir(gen) if f.endswith(".cpp"))
     srcs.append(os.path.join(HERE, "harness.cpp"))
-    flags = ["-std=c++20", "-O1", "-fPIC", "-ffp-contract=off", "-fno-strict-aliasing", "-w",
+    # Production optimisation level and FP rules; warnings are errors, so a
+    # generator regression that produces sloppy C++ fails here too.
+    flags = ["-std=c++23", "-O2", "-fPIC", "-ffp-contract=off", "-Wall", "-Wextra", "-Werror",
              "-DQILIN_CHECKED_MEMORY", "-DQILIN_TRACE_WRITES", "-I", os.path.join(ROOT, "recomp", "runtime")]
+    if args.sanitize:
+        # Undefined behaviour in generated code (shifts, overflow, bad casts) aborts the run.
+        flags += ["-fsanitize=undefined", "-fno-sanitize-recover=undefined"]
     objs = []
 
     def cc(src):
@@ -113,7 +118,8 @@ def build(args, work):
     with cf.ThreadPoolExecutor(os.cpu_count() or 2) as ex:
         objs = list(ex.map(cc, srcs))
     lib = os.path.join(work, "libdifftest.so")
-    subprocess.run([args.cxx, "-shared", "-o", lib, *objs], check=True)
+    link = ["-fsanitize=undefined"] if args.sanitize else []
+    subprocess.run([args.cxx, "-shared", *link, "-o", lib, *objs], check=True)
     return img, lib
 
 
@@ -306,6 +312,7 @@ def main():
     ap.add_argument("--limit", type=int, default=0, help="test only the first N functions")
     ap.add_argument("--jobs", type=int, default=os.cpu_count() or 1)
     ap.add_argument("--fn-seconds", type=float, default=3.0, help="time cap per function per variant")
+    ap.add_argument("--sanitize", action="store_true", help="build the lifted code with UBSan (use GCC)")
     args = ap.parse_args()
     os.makedirs(args.work, exist_ok=True)
     img, lib = build(args, args.work)
@@ -333,7 +340,7 @@ def main():
     for f in failing[:60]:
         d, regs = first_fail[f]
         print(f"  {f:08X}: {d}")
-        print(f"            initial regs: " + " ".join(f"{n}={v:08X}" for n, v in zip(GPRS, regs)))
+        print("            initial regs: " + " ".join(f"{n}={v:08X}" for n, v in zip(GPRS, regs)))
     sys.exit(1 if failing else 0)
 
 

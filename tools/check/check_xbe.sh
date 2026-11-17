@@ -23,7 +23,8 @@ trap 'rm -rf "$OUT"' EXIT
 "$BUILD/qilin" insns "$XBE" --linear -o "$OUT/linear.txt"
 python3 "$HERE/verify_decoder.py" --reachable "$OUT/reach.txt" --linear "$OUT/linear.txt"
 if python3 -c "import unicorn" 2>/dev/null; then
-    python3 "$HERE/../difftest/difftest.py" --qilin "$BUILD/qilin" --xbe "$XBE" --work "$OUT/difftest" --trials 8 --variants 2
+    python3 "$HERE/../difftest/difftest.py" --qilin "$BUILD/qilin" --xbe "$XBE" --work "$OUT/difftest" \
+        --cxx "${CXX:-c++}" --trials 8 --variants 2
 else
     echo "skipping differential test: pip install unicorn"
 fi

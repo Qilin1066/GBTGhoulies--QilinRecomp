@@ -4,7 +4,7 @@
 
 ## Targets
 - **Platforms:** Windows, Linux, macOS (Apple Silicon), ARM64 Linux (Raspberry Pi 4 as minimum spec).
-- **Language:** **C++20** throughout (recompiler, generated code and runtime). No DirectX anywhere.
+- **Language:** **C++23** throughout (recompiler, generated code and runtime). Minimum compilers: GCC 14, Clang 19, Xcode 16, Visual Studio 2022 17.10. No DirectX anywhere.
 - **Graphics API:** **Vulkan only**, restricted to the feature set supported by the Pi 4's Mesa v3dv driver, so one render path works everywhere (MoltenVK on macOS).
 - **Reference:** xemu running the original game is ground truth for behaviour and visuals. The existing Windows-only Ghoulies PC Recomp (xboxrecomp-based, D3D11) is a second behavioural reference; its known-issue list doubles as a regression checklist (see `prior-art.md`).
 - **Enhancement example target:** 3440×1440 (21:9) at 144 Hz.
@@ -35,7 +35,7 @@ All enhancements live behind a settings file with presets, e.g.:
 
 ## Roadmap
 1. **Analysis** ✅ headers, sections, kernel imports, XDK versions; function discovery, CFG, library boundaries, instruction profile, raw NV2A usage, asset formats.
-2. **Recompiler core (C++):** 🔨 in progress, repo `Tecboy1066/GBTG-Qilincomp`. ✅ XBE loader, ✅ Zydis decoder (100% agreement with LLVM on every reachable instruction), ✅ CFG port + data-as-code validation (9,199 functions), ✅ lifter slice 1: leaf functions, integer + scalar SSE (1,243 functions), ✅ differential test against the original x86 under Unicorn (9,944 trials, 0 mismatches), ✅ CI on Linux x64/ARM64, macOS ARM64, Windows. Next: slice 2 (calls, function table, indirect-call trap), slice 3 (x87), fold epilogue fragments into their parents. See `recompiler-core.md`.
+2. **Recompiler core (C++23):** 🔨 in progress, repo `Tecboy1066/GBTG-Qilincomp`. ✅ XBE loader, ✅ Zydis decoder (100% agreement with LLVM on every reachable instruction), ✅ CFG port + data-as-code validation (9,197 functions), ✅ lifter slice 1: leaf functions, integer + scalar SSE (1,373 functions across game code and Rare libraries), ✅ differential test against the original x86 under Unicorn (10,984 trials at -O2 plus a UBSan run, 0 mismatches), ✅ CI with warnings as errors on Linux x64 (GCC 14, Clang 19), Linux ARM64, macOS ARM64, Windows. Next: slice 2 (calls, function table, indirect-call trap), slice 3 (x87), fold epilogue fragments into their parents. See `recompiler-core.md`.
 3. **Runtime skeleton:** memory map, function table + trap, kernel/XAPI HLE stubs, threads, file system over the extracted disc.
 4. **Boot to first frame:** run the entry point natively, push the first Clear/Present through Vulkan.
 5. **Playable at original spec:** 640×480, 4:3, original frame rate; matches xemu; tested on Pi 4 at every milestone.
