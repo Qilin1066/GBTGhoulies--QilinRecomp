@@ -1,6 +1,6 @@
 # GBTG-Qilincomp
 
-A static recompilation of **Grabbed by the Ghoulies** (Rare, original Xbox, 2003) into portable C++23 with a Vulkan renderer, aimed at 64-bit Windows, Linux and macOS (Apple Silicon), on x86-64 or ARM64. Anything with a Vulkan driver is in scope; Apple Silicon is covered through MoltenVK. Efficiency is the first priority: a Raspberry Pi 4–class board is our reference for typical low-end hardware, not a floor.
+A static recompilation of **Grabbed by the Ghoulies** (Rare, original Xbox, 2003) into portable C++23 with a Vulkan 1.3 renderer, aimed at 64-bit Windows, Linux and macOS (Apple Silicon), on x86-64 or ARM64. Anything with a Vulkan 1.3 driver is in scope, including the Raspberry Pi 4 (Mesa 24.3+); Apple Silicon is covered through MoltenVK. Efficiency is the first priority: a Raspberry Pi 4–class board is our reference for typical low-end hardware, not a floor.
 
 > **No game data is included, and none ever will be.** You need your own copy of the game. The tools read `default.xbe` and the disc files from a path you give them. `.gitignore` keeps game files, and anything generated from them, out of the repo.
 
@@ -86,7 +86,7 @@ This runs the unit tests and the CFG pass, then cross-checks Zydis against LLVM'
 
 - **Efficiency and reliability come first.** Every choice is judged by whether it makes the game cheaper to run on low-end hardware, and whether it fails loudly instead of misbehaving quietly.
 - **Static recompilation, x86 → C++, compiled ahead of time.** No interpreter and no JIT. Hand-written C++ can override any lifted function.
-- **No DirectX.** D3D8 is translated at API level to Vulkan, using a deliberately small baseline feature set so one render path runs on everything from low-end ARM GPUs upwards. macOS runs through MoltenVK.
+- **No DirectX.** D3D8 is translated at API level to Vulkan 1.3, using a deliberately small baseline feature set (1.3 core plus what the Pi 4's driver offers) so one render path runs on everything from low-end ARM GPUs upwards. macOS runs through MoltenVK.
 - **XDK libraries are replaced natively**, not recompiled: XAPI, CRT, D3D8, DSOUND, XACT, XPP, WMADEC and Bink.
 - **Ground truth is xemu** running the original game.
 

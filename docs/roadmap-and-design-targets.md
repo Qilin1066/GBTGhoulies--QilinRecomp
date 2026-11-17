@@ -5,7 +5,7 @@
 ## Targets
 - **Platforms:** 64-bit Windows, Linux and macOS (Apple Silicon), on x86-64 or ARM64, with Vulkan. See *Hardware scope* below.
 - **Language:** **C++23** throughout (recompiler, generated code and runtime). Minimum compilers: GCC 14, Clang 19, Xcode 16, Visual Studio 2022 17.10. No DirectX anywhere.
-- **Graphics API:** **Vulkan only**, restricted to a small baseline feature set (today: what Mesa's v3dv driver on a Pi 4 supports), so one render path works everywhere (MoltenVK on macOS).
+- **Graphics API:** **Vulkan 1.3, and only Vulkan.** We require the 1.3 core API, and only the optional features and limits that Mesa's v3dv driver on a Pi 4 provides, so one render path works everywhere (MoltenVK on macOS). See *Vulkan baseline* below.
 - **Reference:** xemu running the original game is ground truth for behaviour and visuals. The existing Windows-only Ghoulies PC Recomp (xboxrecomp-based, D3D11) is a second behavioural reference; its known-issue list doubles as a regression checklist (see `prior-art.md`).
 - **Enhancement example target:** 3440×1440 (21:9) at 144 Hz.
 
@@ -29,14 +29,29 @@
 - **Portability rules:** no inline asm or x86 intrinsics in the runtime; ARM64 Linux builds from day one.
 
 ## Hardware scope
-**Supported: 64-bit hosts with a Vulkan driver.** In practice that means:
+**Supported: 64-bit hosts with a Vulkan 1.3 driver.** In practice that means:
 - **Windows and Linux** on x86-64 or ARM64 with a Vulkan-capable GPU and driver;
 - **macOS on Apple Silicon**, through MoltenVK (Vulkan on top of Metal);
-- **ARM boards** with Vulkan drivers, e.g. Raspberry Pi 4 and newer (Mesa v3dv).
+- **ARM boards** with Vulkan 1.3 drivers, e.g. Raspberry Pi 4 and newer (Mesa v3dv, Mesa 24.3 or later).
 
-**Out of scope:** anything without Vulkan (or, on Apple, a Vulkan translation layer), and 32-bit hosts. That rules out the Raspberry Pi 1–3 and Zero (OpenGL ES 2 only), and Intel Macs aren't a target. Because of this there is one renderer (Vulkan) and one memory model: the Xbox's 4 GB address space mapped flat into a 64-bit host's address space, with no windowing cost on memory accesses.
+**Out of scope:** anything without Vulkan 1.3 (or, on Apple, a Vulkan translation layer that provides it), and 32-bit hosts. That rules out the Raspberry Pi 1–3 and Zero (OpenGL ES 2 only), and Intel Macs aren't a target. Because of this there is one renderer (Vulkan) and one memory model: the Xbox's 4 GB address space mapped flat into a 64-bit host's address space, with no windowing cost on memory accesses.
 
-**Low-end reference:** a Raspberry Pi 4–class board is our reference for typical low-end hardware. It's what we measure efficiency against and test on. It is not a floor: anything Vulkan-capable that's slower is fair game if the efficiency work gets us there. The Vulkan feature set we use is kept small (today: what v3dv on a Pi 4 supports) so the one render path runs on all of it.
+### Vulkan baseline: 1.3
+The renderer targets **Vulkan 1.3** as its minimum API version, chosen for how widely it's supported:
+- **Raspberry Pi 4 and 5:** Mesa's v3dv driver is Vulkan 1.3 conformant from Mesa 24.3.
+- **macOS:** MoltenVK supports Vulkan 1.3 from v1.3.0.
+- **Windows and Linux:** current desktop GPU drivers (AMD, Intel, NVIDIA, Mesa) all ship 1.3.
+
+1.3 makes several things core that would otherwise be extensions to probe for, and the renderer is designed around them:
+- **Dynamic rendering:** no render pass or framebuffer objects. That suits D3D8's free-form render-target switching.
+- **Synchronization2:** simpler, less error-prone barriers.
+- **Extended dynamic state:** cull mode, depth test and write, compare op, topology and stencil can be set per draw. That cuts down how many pipelines D3D8's render states need, which matters for the prebuilt pipeline cache.
+- **Timeline semaphores** (core since 1.2): CPU–GPU pacing for frame timing.
+- **Others:** `maintenance4`, inline uniform blocks, and pipeline creation cache control.
+
+1.3 core is the floor, but optional features and device limits aren't: v3dv is the reference for those. The renderer checks the features it uses at startup and fails with a clear message if one is missing, rather than taking a fallback path. Nothing beyond 1.3 core and the v3dv feature set is used without a decision recorded here. Vulkan 1.4 is out of scope for the baseline.
+
+**Low-end reference:** a Raspberry Pi 4–class board is our reference for typical low-end hardware. It's what we measure efficiency against and test on. It is not a floor: anything with Vulkan 1.3 that's slower is fair game if the efficiency work gets us there. The Vulkan feature set we use is kept small (1.3 core, plus what v3dv on a Pi 4 supports) so the one render path runs on all of it.
 
 ## Settings, not platform branches
 All enhancements live behind a settings file with presets, e.g.:
