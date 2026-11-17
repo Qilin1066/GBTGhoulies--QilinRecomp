@@ -15,6 +15,7 @@
 # Anything derived from the game binary: listings, CFG dumps, lifted code.
 /analysis-out/
 /generated/
+/gen/
 *.insns.txt
 cfg.json
 cfg.json.gz

@@ -39,7 +39,13 @@ struct Insn {
     uint32_t addr = 0;
     uint8_t len = 0;
     ZydisMnemonic mnem = ZYDIS_MNEMONIC_INVALID;
-    uint32_t attributes_lo = 0;  // low 32 bits of ZydisInstructionAttributes (prefixes)
+    ZydisInstructionAttributes attributes = 0;  // prefixes, privileged, ...
+    uint8_t opcode = 0;          // primary opcode byte
+    uint8_t opcode_map = 0;      // ZydisOpcodeMap (0 = default, 1 = 0F, ...)
+    uint8_t modrm_reg = 0;       // ModRM.reg (opcode extension for group opcodes)
+    uint8_t address_width = 32;
+    ZydisISAExt isa_ext = ZYDIS_ISA_EXT_INVALID;
+    uint8_t operand_width = 32;
     ZydisBranchType branch = ZYDIS_BRANCH_TYPE_NONE;
     uint8_t nops = 0;            // visible operands
     std::array<Operand, 4> op{};
@@ -53,6 +59,13 @@ struct Insn {
     bool is_call() const { return mnem == ZYDIS_MNEMONIC_CALL; }
     bool is_cond_branch() const;  // jcc, jcxz/jecxz, loop*
     bool is_pad() const { return mnem == ZYDIS_MNEMONIC_INT3 || mnem == ZYDIS_MNEMONIC_NOP; }
+    bool has_rep() const { return attributes & (ZYDIS_ATTRIB_HAS_REP | ZYDIS_ATTRIB_HAS_REPE); }
+    bool has_repne() const { return attributes & ZYDIS_ATTRIB_HAS_REPNE; }
+    bool has_lock() const { return attributes & ZYDIS_ATTRIB_HAS_LOCK; }
+    // Something retail game code compiled by MSVC never contains: far control
+    // flow, privileged/port I/O, undocumented aliases, BCD, segment loads,
+    // 16-bit addressing. Seeing one means data is being decoded as code.
+    const char* implausible_reason() const;
 };
 
 class Decoder {

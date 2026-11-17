@@ -12,7 +12,8 @@
 //      heuristic).
 //   3. Extra seeding rounds: clean data pointers, orphans, immediates that
 //      point at code, and 16-aligned starts in remaining gaps.
-//   4. Prune seeds whose entry falls inside another function's instruction.
+//   4. Validation: drop seeds that are data decoded as code (entry inside
+//      another instruction, decode failures, implausible instructions).
 #pragma once
 
 #include <cstdint>
@@ -30,7 +31,9 @@ struct JumpTable {
     uint32_t at = 0;     // the jmp [4*reg + table]
     uint32_t table = 0;  // table address
     std::string how;     // "cmp", "cmp+bytetable", "heuristic"
-    std::vector<uint32_t> targets;
+    std::vector<uint32_t> targets;  // unique, sorted
+    std::vector<uint32_t> entries;  // table contents in index order (0 = not a code address)
+    bool bounded = false;           // index range proven by a cmp
 };
 
 struct IndirectSite {
@@ -62,6 +65,11 @@ struct CfgConfig {
     std::string gap_section = ".text";
 };
 
+struct Suspect {
+    uint32_t start = 0;
+    std::string why;
+};
+
 struct Gap {
     uint32_t addr = 0;
     uint32_t size = 0;
@@ -75,6 +83,8 @@ public:
     const std::map<uint32_t, Function>& functions() const { return funcs_; }
     const std::map<std::string, std::vector<Gap>>& gaps() const { return gaps_; }
     std::string summary() const;
+    const std::vector<Suspect>& suspects() const { return suspects_; }
+    const std::vector<uint32_t>& conflicts() const { return conflicts_; }
     std::string to_json() const;
 
     // All reachable instruction addresses, sorted.
@@ -92,6 +102,7 @@ private:
     void add_cand(uint32_t v) { cand_.insert(v); }
     void compute_gaps();
     void prune_misaligned();
+    void validate();
 
     const Xbe& xbe_;
     Decoder& dec_;
@@ -106,6 +117,8 @@ private:
     std::map<std::string, std::vector<Gap>> gaps_;
     std::vector<uint32_t> pruned_;     // dropped: entry inside another function's instruction
     std::vector<uint32_t> conflicts_;  // call targets inside another function's instruction
+    std::vector<uint32_t> rejected_;   // dropped by validate()
+    std::vector<Suspect> suspects_;    // kept despite problems (call targets)
 };
 
 }  // namespace qilin

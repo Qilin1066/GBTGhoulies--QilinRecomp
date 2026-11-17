@@ -25,6 +25,50 @@ bool Insn::is_cond_branch() const {
     }
 }
 
+const char* Insn::implausible_reason() const {
+    if (branch == ZYDIS_BRANCH_TYPE_FAR) return "far control transfer";
+    if (attributes & ZYDIS_ATTRIB_IS_PRIVILEGED) return "privileged instruction";
+    if (address_width == 16) return "16-bit addressing";
+    switch (mnem) {
+        case ZYDIS_MNEMONIC_INT1: case ZYDIS_MNEMONIC_INTO: case ZYDIS_MNEMONIC_INT:
+        case ZYDIS_MNEMONIC_IRET: case ZYDIS_MNEMONIC_IRETD:
+            return "interrupt instruction";
+        case ZYDIS_MNEMONIC_BOUND: case ZYDIS_MNEMONIC_ARPL: case ZYDIS_MNEMONIC_SALC:
+            return "obsolete instruction";
+        case ZYDIS_MNEMONIC_IN: case ZYDIS_MNEMONIC_OUT: case ZYDIS_MNEMONIC_INSB: case ZYDIS_MNEMONIC_INSW:
+        case ZYDIS_MNEMONIC_INSD: case ZYDIS_MNEMONIC_OUTSB: case ZYDIS_MNEMONIC_OUTSW: case ZYDIS_MNEMONIC_OUTSD:
+            return "port I/O";
+        case ZYDIS_MNEMONIC_AAA: case ZYDIS_MNEMONIC_AAD: case ZYDIS_MNEMONIC_AAM: case ZYDIS_MNEMONIC_AAS:
+        case ZYDIS_MNEMONIC_DAA: case ZYDIS_MNEMONIC_DAS:
+            return "BCD arithmetic";
+        case ZYDIS_MNEMONIC_LDS: case ZYDIS_MNEMONIC_LES: case ZYDIS_MNEMONIC_LFS: case ZYDIS_MNEMONIC_LGS:
+        case ZYDIS_MNEMONIC_LSS:
+            return "far pointer load";
+        default:
+            break;
+    }
+    // Writes to a segment register (mov sreg, pop sreg).
+    if (nops >= 1 && op[0].kind == Operand::Kind::Reg && op[0].reg >= ZYDIS_REGISTER_ES && op[0].reg <= ZYDIS_REGISTER_GS &&
+        (mnem == ZYDIS_MNEMONIC_MOV || mnem == ZYDIS_MNEMONIC_POP))
+        return "segment register write";
+    // Undocumented shift alias: C0/C1/D0-D3 with ModRM.reg = 6 (SAL /6).
+    if (opcode_map == ZYDIS_OPCODE_MAP_DEFAULT && (opcode == 0xC0 || opcode == 0xC1 || (opcode >= 0xD0 && opcode <= 0xD3)) &&
+        modrm_reg == 6)
+        return "undocumented SAL /6";
+    // Undocumented TEST alias: F6/F7 /1.
+    if (opcode_map == ZYDIS_OPCODE_MAP_DEFAULT && (opcode == 0xF6 || opcode == 0xF7) && modrm_reg == 1)
+        return "undocumented TEST /1";
+    // Instructions the Xbox's Pentium III (SSE1, no SSE2) cannot execute.
+    switch (isa_ext) {
+        case ZYDIS_ISA_EXT_BASE: case ZYDIS_ISA_EXT_X87: case ZYDIS_ISA_EXT_MMX: case ZYDIS_ISA_EXT_SSE:
+        case ZYDIS_ISA_EXT_PAUSE:
+            break;
+        default:
+            return "instruction set the Pentium III lacks";
+    }
+    return nullptr;
+}
+
 Decoder::Decoder(const Xbe& xbe) : xbe_(xbe) {
     ZydisDecoderInit(&dec_, ZYDIS_MACHINE_MODE_LEGACY_32, ZYDIS_STACK_WIDTH_32);
     ZydisFormatterInit(&fmt_, ZYDIS_FORMATTER_STYLE_INTEL);
@@ -54,7 +98,13 @@ const Insn* Decoder::decode(uint32_t va) {
     ins.addr = va;
     ins.len = zi.length;
     ins.mnem = zi.mnemonic;
-    ins.attributes_lo = uint32_t(zi.attributes);
+    ins.attributes = zi.attributes;
+    ins.opcode = zi.opcode;
+    ins.opcode_map = uint8_t(zi.opcode_map);
+    ins.modrm_reg = zi.raw.modrm.reg;
+    ins.address_width = zi.address_width;
+    ins.isa_ext = zi.meta.isa_ext;
+    ins.operand_width = zi.operand_width;
     ins.branch = zi.meta.branch_type;
     std::memcpy(ins.bytes.data(), img.data() + off, zi.length);
     ins.nops = std::min<uint8_t>(zi.operand_count_visible, uint8_t(ins.op.size()));

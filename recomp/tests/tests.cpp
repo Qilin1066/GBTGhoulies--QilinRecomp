@@ -6,6 +6,7 @@
 
 #include "cfg.hpp"
 #include "decoder.hpp"
+#include "lifter.hpp"
 #include "xbe.hpp"
 
 using namespace qilin;
@@ -102,6 +103,22 @@ int main() {
             CHECK((fn.jtabs[0].targets == std::vector<uint32_t>{0x11020, 0x11023, 0x11026}));
         }
         CHECK(fn.insns.size() == 10);
+    }
+
+    // Lifter: the jump-table function lifts to a switch; the caller (not a leaf) is refused.
+    Lifter lifter(x, dec, cfg);
+    if (f.count(0x11010)) {
+        LiftResult r = lifter.lift(f.at(0x11010));
+        CHECK(r.ok);
+        CHECK(r.code.find("switch (eax)") != std::string::npos);
+        CHECK(r.code.find("case 2: goto L_00011026;") != std::string::npos);
+        // cmp eax, 2 feeds only ja: CF and ZF are computed, OF/SF/AF are not.
+        CHECK(r.code.find("cf = a < b;") != std::string::npos);
+        CHECK(r.code.find("of = ((") == std::string::npos);
+    }
+    if (f.count(0x11000)) {
+        LiftResult r = lifter.lift(f.at(0x11000));
+        CHECK(!r.ok && r.error.find("not a leaf") != std::string::npos);
     }
 
     // Malformed input must throw, not misbehave.

@@ -32,8 +32,9 @@ add_library(qilin_core STATIC
     recomp/src/xbe.cpp
     recomp/src/decoder.cpp
     recomp/src/cfg.cpp
+    recomp/src/lifter.cpp
 )
-target_include_directories(qilin_core PUBLIC recomp/src)
+target_include_directories(qilin_core PUBLIC recomp/src recomp/runtime)
 target_link_libraries(qilin_core PUBLIC Zydis)
 target_compile_options(qilin_core PRIVATE ${QILIN_WARNINGS})
 

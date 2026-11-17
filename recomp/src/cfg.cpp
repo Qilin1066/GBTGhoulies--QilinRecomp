@@ -128,6 +128,7 @@ void Cfg::resolve_jt(const Insn& jmp, ZydisRegister reg, uint32_t table, const s
     }
     uint32_t lo = sec.va, hi = sec.va + sec.rsize;
     uint32_t limit = count ? *count : 512;
+    out.bounded = count.has_value();
     std::set<uint32_t> tg;
     for (uint32_t i = 0; i < limit; ++i) {
         uint32_t a = table + 4 * i;
@@ -135,8 +136,10 @@ void Cfg::resolve_jt(const Insn& jmp, ZydisRegister reg, uint32_t table, const s
         uint32_t v = xbe_.u32(a);
         if (!(v >= lo && v < hi)) {
             if (!count) break;
+            out.entries.push_back(0);
             continue;
         }
+        out.entries.push_back(v);
         tg.insert(v);
     }
     out.targets.assign(tg.begin(), tg.end());
@@ -188,7 +191,10 @@ Cfg::Explored Cfg::explore(uint32_t f, uint32_t bound) {
                         j.table = uint32_t(m.disp);
                         resolve_jt(*ins, m.index, j.table, hist, *sec_f, j);
                         if (bound) {
-                            std::erase_if(j.targets, [&](uint32_t t) { return !(t >= f && t < bound); });
+                            auto outside = [&](uint32_t t) { return !(t >= f && t < bound); };
+                            std::erase_if(j.targets, outside);
+                            for (auto& e : j.entries)
+                                if (e && outside(e)) e = 0;
                         }
                         for (uint32_t t : j.targets) {
                             r.leaders.insert(t);
@@ -434,29 +440,76 @@ void Cfg::run() {
         run_queue(std::vector<uint32_t>(fresh.rbegin(), fresh.rend()), "gap" + std::to_string(it));
         ranges = jt_ranges();
     }
-    prune_misaligned();
+    validate();
     compute_gaps();
 }
 
-// A function whose entry lies strictly inside an instruction owned by another
-// function was seeded from a value that merely looks like a code pointer (a
-// constant that happens to be 16-aligned, a CC byte inside an address...).
-// Drop such functions unless they are direct call targets; repeat until stable.
+// Remove functions that are data decoded as code, repeating until stable:
+//   - entry inside another function's instruction (prune_misaligned), and
+//   - decode failures, self-overlapping instructions, or instructions no
+//     MSVC-compiled retail code contains (Insn::implausible_reason),
+// unless the function is the entry point or a direct call/jump target of a
+// surviving function. Problems in such kept functions are recorded in
+// suspects_ (expected only in the XDK library code that gets replaced).
+void Cfg::validate() {
+    for (;;) {
+        prune_misaligned();
+        std::set<uint32_t> targets{xbe_.entry};
+        for (auto& [_, fn] : funcs_) {
+            targets.insert(fn.calls.begin(), fn.calls.end());
+            targets.insert(fn.tails.begin(), fn.tails.end());
+        }
+        std::vector<uint32_t> drop;
+        suspects_.clear();
+        for (auto& [start, fn] : funcs_) {
+            std::string why;
+            if (!fn.bad.empty()) why = "decode failure";
+            else if (!fn.overlap.empty()) why = "overlapping instructions";
+            else
+                for (uint32_t a : fn.insns)
+                    if (const char* r = dec_.decode(a)->implausible_reason()) {
+                        char b[96];
+                        std::snprintf(b, sizeof b, "%s at %08X", r, a);
+                        why = b;
+                        break;
+                    }
+            if (why.empty()) continue;
+            if (targets.count(start)) suspects_.push_back({start, why});
+            else drop.push_back(start);
+        }
+        if (drop.empty()) break;
+        for (uint32_t d : drop) {
+            funcs_.erase(d);
+            rejected_.push_back(d);
+        }
+        owned_.clear();
+        for (auto& [_, fn] : funcs_) owned_.insert(fn.insns.begin(), fn.insns.end());
+    }
+    std::sort(rejected_.begin(), rejected_.end());
+}
+
+// A function whose entry lies strictly inside an instruction of another
+// function means one of the two is data decoded as code. Drop the one with
+// the weaker evidence: a seed that only looked like a code pointer, or else a
+// host function that was itself only an orphan/heuristic seed. If both are
+// reachable, record a conflict for review. Repeat until stable.
 void Cfg::prune_misaligned() {
     for (;;) {
-        std::map<uint32_t, uint32_t> ends;  // insn start -> end, over all functions
-        for (auto& [_, fn] : funcs_)
-            for (uint32_t a : fn.insns) ends.emplace(a, dec_.decode(a)->end());
-        std::vector<uint32_t> drop;
+        struct Owner { uint32_t end, func; };
+        std::map<uint32_t, Owner> ends;  // insn start -> end + owning function
+        for (auto& [start, fn] : funcs_)
+            for (uint32_t a : fn.insns) ends.emplace(a, Owner{dec_.decode(a)->end(), start});
+        std::set<uint32_t> drop;
         conflicts_.clear();
         for (auto& [start, fn] : funcs_) {
             auto it = ends.lower_bound(start);
             if (it == ends.begin()) continue;
             --it;
-            if (it->first < start && it->second > start) {
-                if (fn.tag == "reachable") conflicts_.push_back(start);
-                else drop.push_back(start);
-            }
+            if (!(it->first < start && it->second.end > start)) continue;
+            const Function& host = funcs_.at(it->second.func);
+            if (fn.tag != "reachable") drop.insert(start);           // the seed is the misaligned one
+            else if (host.tag != "reachable") drop.insert(host.start); // the host is data decoded as code
+            else conflicts_.push_back(start);
         }
         if (drop.empty()) break;
         for (uint32_t d : drop) {
@@ -550,6 +603,10 @@ std::string Cfg::summary() const {
     out += b;
     std::snprintf(b, sizeof b, "pruned misaligned seeds: %zu  call targets inside another function's instruction: %zu\n",
                   pruned_.size(), conflicts_.size());
+    out += b;
+    std::snprintf(b, sizeof b, "rejected as data decoded as code: %zu\n", rejected_.size());
+    out += b;
+    std::snprintf(b, sizeof b, "suspect call targets kept (see `qilin suspects`): %zu\n", suspects_.size());
     out += b;
     return out;
 }

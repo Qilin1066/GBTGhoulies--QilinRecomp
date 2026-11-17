@@ -12,8 +12,9 @@ Roadmap step 2, **recompiler core**, is in progress.
 |---|---|
 | XBE loader (headers, certificate, sections, libraries, kernel thunks, flat image) | ✅ output identical to the Python prototype |
 | x86 decoder (Zydis, vendored) | ✅ agrees with LLVM on all 532,837 reachable instructions |
-| Function discovery + CFG (recursive descent, switch tables) | ✅ ported from the prototype: 9,286 functions, 558 jump tables |
-| Lifter → C++ | next |
+| Function discovery + CFG (recursive descent, switch tables, data-as-code validation) | ✅ 9,199 functions, 553 jump tables |
+| Lifter → C++, slice 1 (leaf functions: integer, scalar SSE, jump tables) | ✅ 1,243 functions, differentially tested against the original x86 under Unicorn |
+| Lifter slice 2 (calls) / slice 3 (x87) | next |
 | Runtime, HLE, Vulkan | later (see roadmap) |
 
 ## Building
@@ -34,6 +35,8 @@ CI builds and tests on Linux x64, Linux ARM64, macOS ARM64 and Windows x64.
 build/qilin info  path/to/default.xbe            # header, sections, XDK libraries, kernel imports (JSON)
 build/qilin cfg   path/to/default.xbe --json cfg.json   # function discovery + control flow
 build/qilin insns path/to/default.xbe [--linear] -o listing.txt
+build/qilin suspects path/to/default.xbe          # kept functions with problems, for review
+build/qilin lift  path/to/default.xbe --out gen/  # lift to C++ (gen/ is gitignored: never commit it)
 ```
 
 ### Full check against your copy of the game
@@ -42,7 +45,7 @@ build/qilin insns path/to/default.xbe [--linear] -o listing.txt
 tools/check/check_xbe.sh path/to/default.xbe
 ```
 
-This runs the unit tests and the CFG pass, then cross-checks Zydis against LLVM's disassembler. It needs Python 3 and `libLLVM` (Debian/Ubuntu: `apt install libllvm18`). The check is:
+This runs the unit tests and the CFG pass, then cross-checks Zydis against LLVM's disassembler. Finally it runs the differential test, which compares each lifted function with the original x86 code run in the Unicorn emulator. It needs Python 3, `libLLVM` (Debian/Ubuntu: `apt install libllvm18`) and `pip install unicorn`. The decoder check is:
 
 - **Strict on every reachable instruction:** same length and same mnemonic.
 - **Strict on a linear sweep of every code section too**, except for three classes it reports instead of failing, because they only occur in data bytes:
@@ -54,10 +57,12 @@ This runs the unit tests and the CFG pass, then cross-checks Zydis against LLVM'
 
 | Path | What |
 |---|---|
-| `recomp/src/` | Recompiler core: `xbe` loader, `decoder` (Zydis wrapper), `cfg` (function discovery + control flow), `main` (CLI) |
+| `recomp/src/` | Recompiler core: `xbe` loader, `decoder` (Zydis wrapper), `cfg` (function discovery + control flow), `lifter` (x86 → C++), `main` (CLI) |
 | `recomp/tests/` | Unit tests on a synthetic in-memory XBE, so they need no game files |
 | `tools/analysis/` | The original Python analysis prototype, using LLVM via ctypes. Kept as the reference the C++ port is checked against |
+| `recomp/runtime/` | Runtime header the generated C++ includes (guest memory, flag and float helpers) |
 | `tools/check/` | The LLVM decoder cross-check and the full local check script |
+| `tools/difftest/` | Differential test: lifted C++ against the original x86 under Unicorn |
 | `third_party/` | Vendored dependencies: Zydis and Zycore, MIT licensed. See `third_party/README.md` |
 | `docs/` | Design notes |
 
