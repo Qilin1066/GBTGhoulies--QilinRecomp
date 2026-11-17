@@ -1,6 +1,7 @@
 // Self-contained tests: build a tiny synthetic XBE in memory and run the
 // loader, decoder, CFG and lifter over it, and exercise the runtime helpers.
 // No game files required (runs in CI).
+#include <algorithm>
 #include <cmath>
 #include <cstring>
 #include <limits>
@@ -54,7 +55,7 @@ std::vector<uint8_t> make_xbe() {
         put32(d, o + 20, kBase + name);
     };
     sect(0, 6, 0x11000, 0x400, 0x1000, 0x300);
-    sect(1, 2, 0x12000, 0x10, 0x1400, 0x308);
+    sect(1, 2, 0x12000, 0x100, 0x1400, 0x308);
     std::memcpy(&d[0x300], ".text", 6);
     std::memcpy(&d[0x308], ".rdata", 7);
     put32(d, 0x408, 0x4D530053);
@@ -104,6 +105,36 @@ std::vector<uint8_t> make_xbe() {
     // 11130: an epilogue fragment (pops its own return address)
     d[0x1130] = 0x5B;  // pop ebx
     d[0x1131] = 0xC3;  // ret
+
+    std::memset(&d[0x1298], 0xCC, 0x1400 - 0x1298);  // int3 padding between functions
+    // 112A0: reached only through a data pointer. A 16-aligned loop head at
+    // 112B0 behind `jmp short` over MSVC alignment filler: a label, not a function.
+    const uint8_t loop[] = {
+        0x85, 0xC9,                    // 112A0 test ecx, ecx
+        0x74, 0x0C,                    // 112A2 jz 112B0
+        0xB8, 0x01, 0x00, 0x00, 0x00,  // 112A4 mov eax, 1
+        0xEB, 0x05,                    // 112A9 jmp 112B0
+        0x8D, 0x49, 0x00,              // 112AB lea ecx, [ecx+0]   (filler)
+        0x8B, 0xFF,                    // 112AE mov edi, edi        (filler)
+        0x49,                          // 112B0 dec ecx
+        0x75, 0xFD,                    // 112B1 jnz 112B0
+        0xC3,                          // 112B3 ret
+    };
+    std::memcpy(&d[0x12A0], loop, sizeof loop);
+    put32(d, 0x1410, 0x112A0);  // .rdata: the pointer
+
+    // C++ EH: FuncInfo at 12040 with one unwind action (funclet 112E0), and the
+    // __ehhandler stub at 112D0: mov eax, &FuncInfo; jmp __CxxFrameHandler.
+    put32(d, 0x1440, 0x19930520);  // magic
+    put32(d, 0x1444, 1);           // maxState
+    put32(d, 0x1448, 0x12060);     // pUnwindMap
+    put32(d, 0x1460, 0xFFFFFFFF);  // toState
+    put32(d, 0x1464, 0x112E0);     // action
+    const uint8_t stub[] = {0xB8, 0x40, 0x20, 0x01, 0x00, 0xE9, 0x00, 0x00, 0x00, 0x00};
+    std::memcpy(&d[0x12D0], stub, sizeof stub);
+    put32(d, 0x12D6, 0x11130 - 0x112DA);  // jmp 11130 (stands in for __CxxFrameHandler)
+    const uint8_t funclet[] = {0xDF, 0xF1, 0x8D, 0x4D, 0xFC, 0xC3};  // fcomip st1; lea ecx, [ebp-4]; ret
+    std::memcpy(&d[0x12E0], funclet, sizeof funclet);
     return d;
 }
 
@@ -161,7 +192,23 @@ int main() {
     cfg.run();
     auto& f = cfg.functions();
     CHECK(f.contains(0x11000) && f.contains(0x11010) && f.contains(0x11100) && f.contains(0x11130));
-    CHECK(f.size() == 4);  // nothing seeded inside the jump/index tables
+    CHECK(f.contains(0x112A0));  // after int3 padding, and pointed to from .rdata
+    CHECK(!f.contains(0x112B0));  // loop head behind alignment filler is a label
+    if (f.contains(0x112A0)) CHECK(std::ranges::binary_search(f.at(0x112A0).insns, 0x112B0u));
+    CHECK(f.contains(0x112D0) && f.at(0x112D0).origin == Origin::Eh);  // __ehhandler stub
+    CHECK(f.contains(0x112E0));  // unwind funclet
+    CHECK(f.size() == 7);  // nothing seeded inside the jump/index tables or the filler
+    {
+        const Insn* fc = dec.decode(0x112E0);  // fcomip: ZF, PF, CF set; OF, SF, AF cleared
+        CHECK(fc && fc->flags_written == 63 && fc->flags_defined == 63 && fc->flags_read == 0);
+    }
+    {
+        auto cov = cfg.coverage();
+        uint64_t unknown = 0;
+        for (auto& r : cov)
+            if (r.lifted) unknown += r.unknown;
+        CHECK(unknown == 0);
+    }
     if (f.contains(0x11010)) {
         auto& fn = f.at(0x11010);
         CHECK(fn.jtabs.size() == 1);
@@ -184,6 +231,10 @@ int main() {
 
     // ---------------------------------------------------------------- lifter
     Lifter lifter(dec);
+    if (f.contains(0x112A0)) {
+        auto r = lifter.lift(f.at(0x112A0));  // the label is lifted as part of its function
+        CHECK(r.has_value() && r->contains("L_000112B0"));
+    }
     if (f.contains(0x11010)) {
         auto r = lifter.lift(f.at(0x11010));
         CHECK(r.has_value());

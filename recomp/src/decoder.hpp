@@ -60,6 +60,9 @@ struct Insn {
     ZydisBranchType branch : 8 = ZYDIS_BRANCH_TYPE_NONE;
     ZydisISAExt isa_ext : 8 = ZYDIS_ISA_EXT_INVALID;
     ZydisInstructionAttributes attributes = 0;  // prefixes, privileged, ...
+    // Status flags per Zydis, as CF=1 PF=2 AF=4 ZF=8 SF=16 OF=32: read,
+    // overwritten (any value), overwritten with a defined value.
+    uint8_t flags_read = 0, flags_written = 0, flags_defined = 0;
     std::array<Operand, kMaxOperands> op{};
 
     uint32_t end() const { return addr + len; }

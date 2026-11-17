@@ -11,9 +11,9 @@ Roadmap step 2, **recompiler core**, is in progress.
 | Piece | State |
 |---|---|
 | XBE loader (headers, certificate, sections, libraries, kernel thunks, flat image) | ✅ output identical to the Python prototype |
-| x86 decoder (Zydis, vendored) | ✅ agrees with LLVM on all 529,718 reachable instructions |
-| Function discovery + CFG (recursive descent, switch tables, data-as-code validation) | ✅ 9,197 functions, 553 jump tables |
-| Lifter → C++, slice 1 (leaf functions: integer, scalar SSE, jump tables) | ✅ 1,373 functions (game code + Rare libraries), differentially tested against the original x86 under Unicorn, also under UBSan |
+| x86 decoder (Zydis, vendored) | ✅ agrees with LLVM on every reachable instruction |
+| Function discovery + CFG (recursive descent, switch tables, C++ EH tables, data-as-code validation) | ✅ 8,843 functions, 558 jump tables; **100% of the lifted code accounted for** (`qilin coverage`: 0 unknown bytes in the game code, Rare libraries and EH funclets) |
+| Lifter → C++, slice 1 (leaf functions: integer, scalar SSE, jump tables) | ✅ 1,276 functions (game code + Rare libraries), differentially tested against the original x86 under Unicorn, also under UBSan: 0 mismatches |
 | Lifter slice 2 (calls) / slice 3 (x87) | next |
 | Runtime, HLE, Vulkan | later (see roadmap) |
 
@@ -49,6 +49,7 @@ build/qilin info     path/to/default.xbe                 # header, sections, XDK
 build/qilin cfg      path/to/default.xbe --json cfg.json # function discovery + control flow
 build/qilin insns    path/to/default.xbe [--linear] -o listing.txt
 build/qilin suspects path/to/default.xbe                 # kept functions with problems, for review
+build/qilin coverage path/to/default.xbe [--list]        # every byte: code, table, padding or unknown (exit 3 if lifted code has unknown bytes)
 build/qilin lift     path/to/default.xbe --out gen/      # lift to C++ (gen/ is gitignored: never commit it)
 
 Code that compiles lifted C++ must link the `qilin_runtime` CMake target (or pass `-ffp-contract=off`): SSE results are only bit-exact without fused multiply-add.

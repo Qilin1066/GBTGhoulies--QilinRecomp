@@ -11,7 +11,35 @@ Each release is a git tag (`vX.Y.Z`) with a matching GitHub release. The version
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-11-17
+Every byte of the lifted code is accounted for.
+
+### Added
+- **`qilin coverage <xbe> [--list]`** sorts every byte of each text region into code, tables, padding or unknown. It exits with code 3 while any byte of a lifted region is unknown. Today there are none: the game code, the Rare libraries and the C++ EH funclets are at 100%, down from 15,198 unknown bytes in the game code.
+- **C++ exception handling tables are parsed** (`FuncInfo`, unwind maps, try blocks, catch handlers and `__ehhandler` stubs): 70 tables, 68 stubs, 147 unwind funclets and 20 catch continuations. The funclets have their own lifted region, `0x1707B0–0x171020`.
+- **Function discovery rules grounded in MSVC's layout:**
+  - 16-byte function alignment in the game and Rare library regions;
+  - strong evidence (calls, entry point, EH tables, tail jumps that land after `int3` padding) versus weak evidence (data values, immediates);
+  - merging of fragments back into their parent functions (2,834 merged);
+  - dropping labels that were mistaken for tail-call targets, including loop heads behind `jmp short` over alignment filler;
+  - data and immediate pointers that take over the weaker seeds inside them;
+  - a fixpoint that repeats all of this until nothing changes.
+- **Switch tables:** `and reg, 2^k - 1` bounds, index-register tracking through `movzx` and `mov`, byte index tables clipped against their dword table, and no table entry landing on another function's start. 558 tables in all.
+- `qilin --version`.
+- Unit tests for the alignment-filler label case, EH stub and funclet discovery, Zydis flag effects and zero-unknown coverage.
+
 ### Changed
+- **The CFG pass takes about 4 s.** Fragment merging carries on in place after each merge rather than rescanning every function.
+- **The lifter takes the flag effects of instructions it doesn't list from Zydis's tables.** Before, those instructions (`fcomi`, `bt`, `bsf`, rotates and so on) were treated as leaving flags alone. The hand table was checked against Zydis at every decodable address: it agrees, or is deliberately stricter.
+- `pushfd` is reported as an unsupported instruction rather than as a read of undefined flags.
+
+### Fixed
+- **Every "function" that was really a fragment of another is gone:** 61 in v0.3.0, 0 now. The lift report lists only instruction classes still to be implemented.
+- **Misaligned overlaps drop the weaker side.** Before, the inner seed always lost. A real function at `0xD3310` was thrown away because a jump table in front of it had been decoded as an orphan function.
+- **Memory displacements (`[ecx + 0x1AAB0]`) are no longer taken as function addresses,** which had created a false function over a byte table.
+- **Jump-table bound search** could pick up a `cmp` on a register that had been overwritten since.
+
+### Documentation
 - **Docs:** hardware scope decided. Supported hosts are 64-bit machines with Vulkan, with macOS on Apple Silicon covered through MoltenVK. Hardware without Vulkan, and 32-bit hosts, are out of scope, so there is one renderer and one flat memory model. The Raspberry Pi 4 is described as a reference point for typical low-end hardware, not a minimum spec.
 - **Docs:** naming convention for `qilin` (see `docs/naming.md`).
 - **Docs:** `recompiler-core.md` explains that function and jump-table counts are discoveries, not known totals, and defines the checks that mean everything is recompiled.
@@ -92,7 +120,8 @@ Recompiler core foundations.
 ### Fixed
 - **CI:** use `macos-latest` (the `macos-14` image was retired).
 
-[Unreleased]: https://github.com/Tecboy1066/GBTG-Qilincomp/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/Tecboy1066/GBTG-Qilincomp/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/Tecboy1066/GBTG-Qilincomp/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/Tecboy1066/GBTG-Qilincomp/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/Tecboy1066/GBTG-Qilincomp/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/Tecboy1066/GBTG-Qilincomp/releases/tag/v0.1.0

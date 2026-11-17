@@ -36,6 +36,7 @@ struct JumpTable {
     bool bounded = false;           // index range proven by a cmp
     uint32_t index_table = 0;       // byte index table (movzx reg, byte [idx + T]), 0 if none
     uint32_t index_count = 0;       // its length in bytes
+    std::vector<uint32_t> dropped;  // targets beyond the function's bound (candidates for absorb_fragments)
 };
 
 struct IndirectSite {
@@ -44,7 +45,7 @@ struct IndirectSite {
 };
 
 // How a function was found, strongest evidence first.
-enum class Origin : uint8_t { Reachable, DataPtr, Orphan, ImmPtr, Gap };
+enum class Origin : uint8_t { Reachable, DataPtr, Orphan, ImmPtr, Gap, Eh };
 
 struct Function {
     uint32_t start = 0;
@@ -62,7 +63,7 @@ struct Function {
     uint32_t bytes = 0;
     uint32_t lo = 0, hi = 0;
 
-    std::string tag() const;         // "reachable", "dataptr0", "orphan", "imm-ptr", "gap0", ...
+    std::string tag() const;         // "reachable", "dataptr0", "orphan", "imm-ptr", "gap0", "eh", ...
 };
 
 struct CfgConfig {
@@ -71,6 +72,24 @@ struct CfgConfig {
     uint32_t dataptr_lo = 0x11000;
     uint32_t dataptr_hi = 0x165C00;
     std::string gap_section = ".text";
+    // Regions where every function entry is aligned (MSVC /Gy + the game's
+    // build settings): Ghoulies game code and Rare libs, 16 bytes. Verified:
+    // all 4,041 directly-called functions there are 16-byte aligned. A
+    // misaligned entry in these regions needs a direct call to count.
+    std::vector<std::pair<uint32_t, uint32_t>> aligned_regions = {{0x11000, 0x14A895}, {0x152780, 0x165C00}};
+    uint32_t alignment = 16;
+    // Regions of .text for the coverage report (docs/code-analysis.md);
+    // other code sections are reported per section, as replaced libraries.
+    struct Region {
+        std::string name;
+        uint32_t lo, hi;
+        bool lifted;
+    };
+    std::vector<Region> text_regions = {
+        {"game", 0x11000, 0x14A895, true},       {"xapi", 0x14A895, 0x152780, false},
+        {"rare-libs", 0x152780, 0x165C00, true}, {"crt", 0x165C00, 0x1707B0, false},
+        {"eh-funclets", 0x1707B0, 0x171020, true},
+    };
 };
 
 struct Gap {
@@ -86,6 +105,19 @@ struct SectionGaps {
 struct Suspect {
     uint32_t start = 0;
     std::string why;
+};
+
+// MSVC alignment filler (mov r, r / lea r, [r + 0]); semantically a no-op.
+bool is_pad_filler(const Insn& i);
+
+// Byte-level accounting of a code range: every byte is code, a known table,
+// padding, or unknown. "Done" means unknown == 0 in every lifted region.
+struct CoverageRegion {
+    std::string name;
+    uint32_t lo = 0, hi = 0;
+    bool lifted = false;               // recompiled (vs replaced by native code)
+    uint64_t code = 0, table = 0, padding = 0, unknown = 0;
+    std::vector<Gap> unknown_spans{};
 };
 
 // Set of addresses inside the code sections, as a bitmap (O(1), 1 bit/byte).
@@ -115,6 +147,8 @@ public:
     const std::vector<uint32_t>& conflicts() const { return conflicts_; }
     std::string summary() const;
     std::string to_json() const;
+    // Per-region byte accounting (see CoverageRegion).
+    std::vector<CoverageRegion> coverage();
 
     // All reachable instruction addresses, sorted.
     std::vector<uint32_t> all_instructions() const { return owned_.to_vector(); }
@@ -126,9 +160,22 @@ private:
     void linear_seeds();
     void run_queue(std::vector<uint32_t> q, Origin origin, uint8_t round = 0);
     bool clean_seed(uint32_t v);
+    bool displaces_weak_seed(uint32_t v);
+    bool take_over(uint32_t v, Origin origin);
+    bool jumps_over_filler(const Function& g, uint32_t c) const;
+    bool drop_labels();
     uint32_t bound_of(uint32_t f) const;
     void rebuild_owned();
     void validate();
+    bool absorb_fragments();
+    bool imm_round();
+    bool reexplore_all();
+    void scan_eh_tables();
+    Function make_function(uint32_t f, Origin origin, uint8_t round, struct Explored& r);
+    bool plausible(const Function& f) const;
+    // Can `a` be a function entry on evidence other than a direct call?
+    bool entry_ok(uint32_t a);
+    bool in_aligned_region(uint32_t a) const;
     void prune_misaligned();
     void compute_gaps();
 
@@ -142,6 +189,17 @@ private:
     std::map<uint32_t, Function> funcs_;
     AddrSet owned_;
     std::set<uint32_t> imm_seeds_;
+    std::set<uint32_t> dptr_;          // 16-aligned code pointers found in .rdata/.data
+    std::set<uint32_t> evidence_;      // addresses with independent evidence of being a function entry
+    size_t absorbed_ = 0;              // fragments merged back into their parent
+    // MSVC C++ exception metadata (FuncInfo in .rdata): unwind funclets are
+    // functions of their own; catch handlers and the continuations they return
+    // are extra entry points *inside* their parent function, reached only via
+    // the C++ runtime. Explored as part of whichever function contains them.
+    std::set<uint32_t> eh_unwind_;
+    std::set<uint32_t> eh_roots_;
+    size_t eh_funcinfos_ = 0;
+    size_t eh_stubs_ = 0;
     std::vector<SectionGaps> gaps_;
     std::vector<uint32_t> pruned_;     // entry inside another function's instruction
     std::vector<uint32_t> conflicts_;  // call targets inside another function's instruction

@@ -128,8 +128,20 @@ FlagFx flag_fx(const Insn& i) {
             return {0, CF, CF};
         case ZYDIS_MNEMONIC_CMC:
             return {CF, CF, CF};
-        default:
+        case ZYDIS_MNEMONIC_PUSHF: case ZYDIS_MNEMONIC_PUSHFD:
+            // Copies every flag, defined or not, to the stack (CPUID probes):
+            // rejected as unsupported, not as a read of an undefined flag.
             return {};
+        default:
+            // Everything else (fcomi/fucomi, bt*, bsf/bsr, shld/shrd, rotates,
+            // cmpxchg, xadd, scas/cmps, popfd, ...): Zydis' flag table. Variable
+            // counts that may be zero leave flags untouched, so for those only
+            // the read side is trusted.
+            if (m == ZYDIS_MNEMONIC_ROL || m == ZYDIS_MNEMONIC_ROR || m == ZYDIS_MNEMONIC_RCL || m == ZYDIS_MNEMONIC_RCR ||
+                m == ZYDIS_MNEMONIC_SHLD || m == ZYDIS_MNEMONIC_SHRD)
+                return {i.flags_read, 0, 0};
+            if (i.has_rep()) return {i.flags_read, 0, 0};  // rep with ecx = 0 executes nothing
+            return {i.flags_read, i.flags_written, i.flags_defined};
     }
 }
 

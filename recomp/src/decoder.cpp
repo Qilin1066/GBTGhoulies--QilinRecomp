@@ -106,6 +106,15 @@ bool Decoder::decode_uncached(uint32_t va, Insn& ins) const {
     ins.len = zi.length;
     ins.mnem = zi.mnemonic;
     ins.attributes = zi.attributes;
+    if (const ZydisAccessedFlags* f = zi.cpu_flags) {
+        auto pack = [](uint32_t z) {
+            return uint8_t((z & ZYDIS_CPUFLAG_CF ? 1 : 0) | (z & ZYDIS_CPUFLAG_PF ? 2 : 0) | (z & ZYDIS_CPUFLAG_AF ? 4 : 0) |
+                           (z & ZYDIS_CPUFLAG_ZF ? 8 : 0) | (z & ZYDIS_CPUFLAG_SF ? 16 : 0) | (z & ZYDIS_CPUFLAG_OF ? 32 : 0));
+        };
+        ins.flags_read = pack(f->tested);
+        ins.flags_defined = pack(f->modified | f->set_0 | f->set_1);
+        ins.flags_written = uint8_t(ins.flags_defined | pack(f->undefined));
+    }
     ins.opcode = zi.opcode;
     ins.opcode_map = uint8_t(zi.opcode_map);
     ins.modrm_reg = zi.raw.modrm.reg;

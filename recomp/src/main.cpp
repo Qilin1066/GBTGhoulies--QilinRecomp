@@ -7,6 +7,7 @@
 //   qilin lift     <default.xbe> --out <dir> [--range lo-hi] [--only addr]
 //                                                    lift to C++ (generated code: never commit it)
 //   qilin image    <default.xbe> <out.bin>           flat guest image (for the differential tests)
+//   qilin coverage <default.xbe> [--list]            byte accounting: code / tables / padding / unknown
 //
 // Exit status is non-zero on any error; nothing fails silently.
 #include <algorithm>
@@ -60,6 +61,7 @@ int usage() {
                "  qilin insns    <xbe> [--linear] [-o out.txt]\n"
                "  qilin lift     <xbe> --out <dir> [--range lo-hi] [--only addr]\n"
                "  qilin image    <xbe> <out.bin>\n"
+               "  qilin coverage <xbe> [--list]   (exit 3 while any lifted byte is unaccounted for)\n"
                "  qilin --version\n");
     return 2;
 }
@@ -234,6 +236,23 @@ int run(std::string_view cmd, const std::string& path, std::span<const std::stri
             for (uint32_t a : cfg.all_instructions()) emit(out.get(), dec, *dec.decode(a));
         }
         return 0;
+    }
+    if (cmd == "coverage") {
+        Cfg cfg(xbe, dec);
+        cfg.run();
+        const bool list = flag(args, "--list");
+        std::println("{:<12} {:>7} {:>9} {:>8} {:>8} {:>8}  {:>8}", "region", "lifted", "code", "tables", "padding", "UNKNOWN", "accounted");
+        uint64_t lifted_unknown = 0;
+        for (auto& r : cfg.coverage()) {
+            const uint64_t total = r.code + r.table + r.padding + r.unknown;
+            std::println("{:<12} {:>7} {:>9} {:>8} {:>8} {:>8}  {:>8.3f}%", r.name, r.lifted ? "yes" : "no", r.code, r.table,
+                         r.padding, r.unknown, 100.0 * double(total - r.unknown) / double(std::max<uint64_t>(1, total)));
+            if (r.lifted) lifted_unknown += r.unknown;
+            if (list && r.lifted)
+                for (auto& g : r.unknown_spans) std::println("    unknown {:08x} +{}", g.addr, g.size);
+        }
+        std::println("unknown bytes in lifted regions: {}", lifted_unknown);
+        return lifted_unknown ? 3 : 0;
     }
     if (cmd == "lift") return cmd_lift(xbe, dec, args);
     return usage();

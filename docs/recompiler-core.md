@@ -46,18 +46,20 @@ An earlier version of this note said 238 in total. That count was taken before t
 The naming differences between the two libraries are mapped explicitly in the script. Examples: `fcomip`/`fcompi`, `popad`/`popal`, and Zydis's `ret far` versus LLVM's `retf`.
 
 ### Function discovery + CFG (`recomp/src/cfg.*`)
-This is a C++ port of `tools/analysis/cfg.py` and `analyze.py`. It works on Zydis's structured operands instead of disassembly text. It runs in about **1.1 s with a 127 MB peak**, down from 1.9 s and 288 MB before the review. Reachable instructions are tracked in a bitmap.
+This is a C++ port of `tools/analysis/cfg.py` and `analyze.py`. It works on Zydis's structured operands instead of disassembly text. It runs in about **4 s**, including the fixpoint passes described under "Complete coverage" below. Reachable instructions are tracked in a bitmap.
 
-| | Python prototype | C++ port |
-|---|---|---|
-| Functions | 9,402 | 9,197 |
-| Reachable instructions | 530,764 | 529,718 |
-| `.text` coverage of non-padding bytes | 97.7% | 97.8% |
-| Jump tables resolved | 556 | 553 (310 cmp, 199 cmp + byte table, 44 heuristic) |
-| Unresolved indirect jumps | 24 | 26 |
-| Indirect calls | ~1,960 | 1,980 |
+| | Python prototype | C++ port, v0.3.0 | C++ port, v0.4.0 |
+|---|---|---|---|
+| Functions | 9,402 | 9,197 | 8,843 |
+| Reachable instructions | 530,764 | 529,718 | 530,444 |
+| Lifted code accounted for (game, Rare libraries, EH funclets) | — | — | **100%**, 0 unknown bytes |
+| Jump tables resolved | 556 | 553 | 558 (307 cmp, 202 cmp + byte table, 3 `and` mask, 46 heuristic) |
+| Unresolved indirect jumps | 24 | 26 | 26 (7 in lifted code, all indirect tail calls) |
+| Indirect calls | ~1,960 | 1,980 | 1,930 |
 
-**Where the two disagree, the port is better in every case examined:**
+There are fewer functions in v0.4.0 because 2,834 fragments of real functions were merged back into their parents, while about 1,300 functions were newly found.
+
+**Where the prototype and the port disagree, the port is better in every case examined:**
 - **Indexed table addresses are no longer code-pointer seeds.** The prototype's text regex treated the table address in `jmp [4*reg + table]` as a possible function pointer, so jump tables were decoded as code.
 - **Misaligned seeds are pruned.** Some data values are 16-aligned and look like code pointers, but land inside another function's instruction. For example, `0x80000` is the `CC` byte inside `mov ecx, [0x4275CC]`.
 - **Fewer split functions.** 146 of the prototype's 154 extra "functions" are instructions inside a larger function in the port. The one checked by hand, `0x26F60`, is an ordinary branch target that the prototype split off because of its seeding order. Three of the remaining eight were checked and are mid-instruction starts.
@@ -79,17 +81,42 @@ This pass removes functions that are really data decoded as code, and repeats un
 Functions that are the entry point, or direct call/jump targets of surviving functions, are kept but listed by `qilin suspects`.
 
 **Result:**
-- 9,197 functions.
+- 8,843 functions.
 - 0 decode failures and 0 overlaps.
-- 136 data-as-code functions dropped: 54 misaligned seeds and 82 that failed the checks above.
+- 119 data-as-code functions dropped: 46 misaligned seeds and 73 that failed the checks above.
 - 7 suspects remain. All are hardware code in XAPI (`int 0x2D`, far jump, `cli`/`sti`), D3D (`wbinvd`, port I/O) and XPP (`cli`/`sti`). Those libraries get replaced, so none of this is lifted.
+
+### Complete coverage (v0.4.0)
+`qilin coverage <xbe> [--list]` sorts every byte of each text region into code, tables (jump and byte index tables), padding (`int3`, `nop` and MSVC's alignment filler), or unknown. The exit code is 3 while any byte of a lifted region is unknown, so CI can hold the line.
+
+| Region | Range | Lifted | Code | Tables | Padding | Unknown |
+|---|---|---|---|---|---|---|
+| Game | `0x11000–0x14A895` | yes | 1,215,701 | 24,907 | 43,637 | **0** |
+| Rare engine libraries | `0x152780–0x165C00` | yes | 75,308 | 444 | 3,224 | **0** |
+| C++ EH funclets | `0x1707B0–0x171020` | yes | 2,043 | 0 | 117 | **0** |
+
+XAPI, the CRT and the XDK library sections (D3D, DSOUND, BINK and so on) aren't lifted: they get replaced. Their coverage is reported but doesn't gate anything.
+
+The game code went from 15,198 unknown bytes to 0. These are the rules that got it there, each grounded in how MSVC lays out code:
+
+- **Function alignment.** Every function in the game and Rare library regions starts on a 16-byte boundary. A candidate entry that isn't aligned there is rejected.
+- **C++ exception handling tables.** `FuncInfo` records (magic `0x19930520`–`22`) in `.rdata` and `.data` lead to unwind funclets, catch handlers, and `__ehhandler` stubs (`mov eax, &FuncInfo; jmp __CxxFrameHandler`). A catch handler returns its continuation address as `mov eax, imm32; ret`, so those continuations become entry points of their parent's code. This found 70 tables, 68 stubs, 147 funclets and 20 continuations.
+- **Evidence strength.** A direct call, the entry point and the EH tables are strong evidence that an address is a function. A 16-aligned value in a data section, or an immediate operand, is weak evidence: a constant can look like an address. A tail jump to an address that follows `int3` padding is strong, because MSVC pads with `int3` only between functions.
+- **Fragment merging.** A function is cut short when exploration stops at a false candidate. If function G jumps past such candidates and none of them has strong evidence, they are labels inside G: they are dropped and G is re-explored. Weak evidence stands unless G's own code falls through into the candidate, or jumps to it over alignment filler. 2,834 fragments were merged this way.
+- **Labels.** A "function" whose entry is an instruction of an earlier function, reached only by jumps (no call, no EH entry, no pointer), is a label that an earlier, shorter exploration mistook for a tail call. The same goes for a 16-aligned loop head that its function reaches with `jmp short` over alignment filler.
+- **Takeover.** An aligned data or immediate pointer whose code runs through weaker functions' entries (orphan or gap seeds) takes them over: those entries are labels inside it.
+- **Misaligned overlaps.** When one function's entry falls inside another's instruction, the one with weaker evidence goes. Before v0.4.0 the inner seed always lost, which threw away a real function at `0xD3310` in favour of a jump table decoded as an orphan.
+- **Switch bounds.** The backward search for a jump table's bound follows the index register through `movzx` and `mov reg, reg` and stops when the register is overwritten. It accepts `and reg, 2^k - 1` as a bound. A table entry may not land on another function's start, and byte index tables are clipped against their dword table.
+- **Fixpoint.** Immediate seeding, fragment merging, validation, label dropping and re-exploration repeat until nothing changes (at most 8 rounds).
+
+**Lift check.** The lift report has no fragments left: every failure is an instruction class still to be implemented (calls for slice 2, x87 for slice 3, `std`, `pushfd`). In v0.3.0, 61 lift failures were fragments.
 
 ### Lifter, slice 1 (`recomp/src/lifter.*`, runtime `recomp/runtime/guest.hpp`)
 Each guest function becomes `void fn_XXXXXXXX(rt::Context&)`. `Lifter::lift` returns `std::expected<std::string, LiftFailure>`, where the failure carries a kind (not a leaf, fragment, unsupported instruction, x87, undefined flag, implausible, bad control flow), the address and the instruction.
 
 Inside a lifted function:
 - **Registers:** guest registers are host locals. The prologue declares only the registers the function references. Each exit stores back only the registers it modifies: the compiler can't drop those stores itself, because guest memory writes may alias the context.
-- **Flags:** EFLAGS are separate bools. A backward liveness pass means a flag is computed only where something can read it. Reading a flag the previous instruction left undefined is a lift error, including OF/AF after a shift by `cl`.
+- **Flags:** EFLAGS are separate bools. A backward liveness pass means a flag is computed only where something can read it. Reading a flag the previous instruction left undefined is a lift error, including OF/AF after a shift by `cl`. Instructions the lifter's own table doesn't list take their flag effects from Zydis's tables. Before, those were taken to touch no flags, so `fcomi`, `bt`, `bsf` and the rotates looked transparent. A check over every decodable address in the image found that the hand table agrees with Zydis everywhere, or is deliberately stricter: shift counts that may be zero, `rep` with ecx = 0, and AF after `sbb`.
 - **Control flow:** blocks become labels and gotos. Jump tables become `switch` with a trap for an unknown index.
 - **Integer ops:**
   - mov/movzx/movsx/lea/xchg;
@@ -109,15 +136,17 @@ Inside a lifted function:
   `guest.hpp` turns off multiply-add contraction for Clang and MSVC and refuses `-ffast-math`. The `qilin_runtime` CMake target adds `-ffp-contract=off` for GCC.
 - **Stack-balance check:** a forward esp/ebp analysis rejects "functions" that are fragments of other functions: they return with esp off balance or pop their own return address.
 
-**Coverage today:** `qilin lift` covers the game code (`0x11000–0x14A895`) and the Rare engine libraries (`0x152780–0x165C00`), 6,102 functions in all.
+**Coverage today:** `qilin lift` covers the game code (`0x11000–0x14A895`) and the Rare engine libraries (`0x152780–0x165C00`), 5,748 functions in all.
 
 | | Functions |
 |---|---|
-| **Lifted** | **1,373** |
-| Not leaves (need calls: slice 2) | 4,615 |
-| Fragments of other functions | 61 |
-| Use x87 (slice 3) | 49 |
-| One-offs (`pushfd`/`popfd`, `popad`) | 4 |
+| **Lifted** | **1,276** |
+| Not leaves (need calls: slice 2) | 4,422 |
+| Use x87 (slice 3) | 48 |
+| One-offs (`std`, `pushfd`) | 2 |
+| Fragments of other functions | **0** (61 in v0.3.0) |
+
+Fewer functions lift than in v0.3.0 (1,373) because merged fragments now belong to their parents, and most of those parents make calls.
 
 The generated code compiles with no warnings at `-Wall -Wextra` under GCC 14 for both x86-64 and ARM64.
 
@@ -132,17 +161,17 @@ The generated code compiles with no warnings at `-Wall -Wextra` under GCC 14 for
 
 **Results:**
 
-| | `-O2` run (8 trials per function, 2 heap images) | UBSan run (4 trials per function) |
+| | `-O2` run (24 trials per function, 3 heap images) | UBSan run (24 trials per function) |
 |---|---|---|
-| Functions tested | 1,373 | 1,373 |
-| Trials | 10,984 | 5,492 |
-| Completed | 6,585 | 3,258 |
-| Faulted in both versions | 4,235 | 2,159 |
-| Skipped (hit the budget, or wrote into code) | 164 | 75 |
+| Functions tested | 1,276 | 1,276 |
+| Trials | 30,624 | 30,624 |
+| Completed | 19,601 | 19,601 |
+| Faulted in both versions | 10,480 | 10,480 |
+| Skipped (hit the budget, or wrote into code) | 543 | 543 |
 | **Mismatches** | **0** | **0**, and no undefined behaviour |
-| Functions with at least one completed, matching trial | 1,235 | 1,170 |
+| Functions with at least one completed, matching trial | 1,258 | 1,258 |
 
-138 functions faulted on every random state in the `-O2` run, typically because they follow a chain of pointers. They need structured inputs to be exercised; they aren't known to be wrong.
+18 functions faulted on every random state in the `-O2` run, typically because they follow a chain of pointers. They need structured inputs to be exercised; they aren't known to be wrong.
 
 **Bugs found by the harness, now fixed:**
 - **Epilogue fragments** mistaken for functions. The fix is the stack-balance check.
@@ -173,16 +202,16 @@ The generated code compiles with no warnings at `-Wall -Wextra` under GCC 14 for
 ## How we'll know everything is recompiled
 The function and jump-table counts are **what we have found so far, not totals read from the game**. A retail XBE has no symbol table: nothing in the file says how many functions or switch tables there are. The real totals are fixed by the binary, but we can only approach them by accounting for every byte. So "done" is defined by these checks rather than by reaching a number:
 
-1. **Every byte of the code we lift is accounted for.** It is either an instruction of a function, or a known kind of data: a jump table, a byte index table, alignment padding, or a constant. Today `.text` is 97.8% decoded, with 928 gaps totalling 37,646 bytes still unexplained; that figure includes XAPI and the CRT, which aren't lifted. Each gap gets explained or turned into code.
-2. **Every switch has a proven size.** Of the 553 jump tables, 44 are sized heuristically. They need a bounding `cmp`, or the lifter must trap on any index outside the table, which it already does.
-3. **Every indirect jump is resolved.** 26 are unresolved today.
-4. **Every function lifts.** The lift report must show zero failures. Today 1,373 of 6,102 functions in the game code and Rare libraries lift; the rest are waiting on calls (slice 2) and x87 (slice 3), or are fragments to fold back into their parents.
+1. **Every byte of the code we lift is accounted for.** It is either an instruction of a function, or a known kind of data: a jump table, a byte index table, alignment padding, or a constant. ✅ **Done in v0.4.0:** 0 unknown bytes in the game code, the Rare libraries and the EH funclets (`qilin coverage`). The 97.8% quoted before was for all of `.text`, including XAPI and the CRT, which aren't lifted.
+2. **Every switch has a proven size.** Of the 558 jump tables, 46 are sized heuristically. They need a bounding `cmp`, or the lifter must trap on any index outside the table, which it already does.
+3. **Every indirect jump is resolved.** 7 remain in lifted code, and all are indirect tail calls through function pointers (`jmp [eax+0x14]`, `jmp eax`, `jmp [0x304EC4]`), not switches. Slice 2's indirect-call dispatcher handles them.
+4. **Every function lifts.** The lift report must show zero failures. Today 1,276 of 5,748 functions in the game code and Rare libraries lift. The rest are waiting on calls (slice 2), x87 (slice 3) or two one-off instructions; none is a fragment.
 5. **Nothing turns up at runtime.** An indirect call to an address we don't have a function for traps with the address logged. A full playthrough (and the attract mode, menus and every level) with no such trap closes the list. The Ghoulies PC Recomp's seed list of functions found during play is an extra cross-check.
 
 Checks 1–4 are static and will be reported by `qilin` itself. Check 5 needs the runtime (roadmap step 3) and a playable build.
 
 ## Known issues
-1. **61 "functions" are fragments of other functions.** That's 49 that pop their own return address, 9 that read flags on entry and 3 with unbalanced stacks. The lifter rejects them, but the CFG should fold them back into their parent functions. They are seeded as call targets or data pointers by the linear pass, so the seeding should be checked against direct-call evidence.
+1. **Static analysis can't prove that no function is missing from a region that is fully accounted for.** A function nobody calls directly, sitting where the CFG put another function's code, would only show up at runtime. Check 5 above (the indirect-call trap during a playthrough) is the backstop.
 2. **The ARM64 host has not been differentially tested.** The generated code and the analysis are byte-identical across hosts, but the difftest runs on x86-64. NaN payloads differ on ARM: the default NaN is `0x7FC00000` there, not `0xFFC00000`. The fix is to canonicalise NaN results in `rt::` helpers where the game could observe them, and to run the difftest on an ARM host.
 3. **MXCSR is assumed to be the default** (round-to-nearest, no flush-to-zero). This must be confirmed against what the game or XDK sets at boot.
 4. **Library sections have low coverage** (DSOUND 35%, WMADEC 36%). They get replaced, so this doesn't block anything.
@@ -191,5 +220,4 @@ Checks 1–4 are static and will be reported by `qilin` itself. Check 5 needs th
 ## Next
 1. **Slice 2: calls.** Direct calls become C++ calls, with full register state passed through the context. That needs the generated function table and an indirect-call trap on unknown targets, plus tail jumps.
 2. **Slice 3: x87.** Use host `double`, and honour precision control where the game sets it.
-3. **Fold epilogue fragments** back into their parent functions in the CFG.
-4. **SEH/C++ EH strategy** for the 63 `fs:` sites.
+3. **SEH/C++ EH strategy** for the 63 `fs:` sites.
