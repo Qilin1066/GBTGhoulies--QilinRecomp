@@ -35,7 +35,7 @@ All enhancements live behind a settings file with presets, e.g.:
 
 ## Roadmap
 1. **Analysis** ✅ headers, sections, kernel imports, XDK versions; function discovery, CFG, library boundaries, instruction profile, raw NV2A usage, asset formats.
-2. **Recompiler core (C++):** XBE loader → decoder (LLVM-verified) → CFG → lifter → C++ output; prove on leaf functions by differential testing against an x86 reference.
+2. **Recompiler core (C++):** 🔨 in progress, repo `Tecboy1066/GBTG-Qilincomp`. ✅ XBE loader, ✅ Zydis decoder (100% agreement with LLVM on 532,837 reachable instructions), ✅ CFG port (9,286 functions, 558 jump tables), ✅ CI on Linux x64/ARM64, macOS ARM64, Windows. Next: validation pass (drop data-as-code seeds), then lifter → C++ output, proven on leaf functions by differential testing against an x86 reference. See `recompiler-core.md`.
 3. **Runtime skeleton:** memory map, function table + trap, kernel/XAPI HLE stubs, threads, file system over the extracted disc.
 4. **Boot to first frame:** run the entry point natively, push the first Clear/Present through Vulkan.
 5. **Playable at original spec:** 640×480, 4:3, original frame rate; matches xemu; tested on Pi 4 at every milestone.
