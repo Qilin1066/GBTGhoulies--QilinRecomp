@@ -1,5 +1,6 @@
 cmake_minimum_required(VERSION 3.25)
-project(GBTGQilincomp LANGUAGES C CXX)
+# The single source of the version number (see CHANGELOG.md for the scheme).
+project(GBTGQilincomp VERSION 0.3.0 LANGUAGES C CXX)
 
 # ---- Language: C++23 everywhere (recompiler, runtime, generated code) ----
 set(CMAKE_CXX_STANDARD 23)
@@ -78,6 +79,7 @@ target_link_libraries(qilin_core PUBLIC Zydis qilin_runtime PRIVATE qilin_warnin
 
 add_executable(qilin recomp/src/main.cpp)
 target_link_libraries(qilin PRIVATE qilin_core qilin_warnings)
+target_compile_definitions(qilin PRIVATE QILIN_VERSION="${PROJECT_VERSION}")
 
 # ---- Tests (no game files needed) ----
 enable_testing()

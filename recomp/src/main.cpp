@@ -30,6 +30,10 @@
 #include "lifter.hpp"
 #include "xbe.hpp"
 
+#ifndef QILIN_VERSION
+#define QILIN_VERSION "unknown"
+#endif
+
 using namespace qilin;
 
 namespace {
@@ -48,13 +52,15 @@ struct Failure {
 
 int usage() {
     std::print(stderr,
+               "qilin " QILIN_VERSION "\n"
                "usage:\n"
                "  qilin info     <xbe> [--json out.json]\n"
                "  qilin cfg      <xbe> [--json out.json]\n"
                "  qilin suspects <xbe>\n"
                "  qilin insns    <xbe> [--linear] [-o out.txt]\n"
                "  qilin lift     <xbe> --out <dir> [--range lo-hi] [--only addr]\n"
-               "  qilin image    <xbe> <out.bin>\n");
+               "  qilin image    <xbe> <out.bin>\n"
+               "  qilin --version\n");
     return 2;
 }
 
@@ -236,6 +242,10 @@ int run(std::string_view cmd, const std::string& path, std::span<const std::stri
 }  // namespace
 
 int main(int argc, char** argv) {
+    if (argc == 2 && (std::string_view(argv[1]) == "--version" || std::string_view(argv[1]) == "version")) {
+        std::println("qilin {}", QILIN_VERSION);
+        return 0;
+    }
     if (argc < 3) return usage();
     const std::vector<std::string_view> args(argv + 3, argv + argc);
     try {

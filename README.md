@@ -17,6 +17,10 @@ Roadmap step 2, **recompiler core**, is in progress.
 | Lifter slice 2 (calls) / slice 3 (x87) | next |
 | Runtime, HLE, Vulkan | later (see roadmap) |
 
+## Versions and changes
+
+Releases are tagged `vX.Y.Z` on GitHub, and every release is recorded in [`CHANGELOG.md`](CHANGELOG.md). Past entries are kept, never rewritten. The version lives in one place, `project(... VERSION ...)` in `CMakeLists.txt`, and `qilin --version` prints it. While the recompiler is being built, a minor bump (0.**x**) marks a milestone and a patch bump (0.x.**y**) a fix. 1.0.0 will be the first build that plays the game.
+
 ## Building
 
 The whole project (recompiler, runtime and generated code) is **C++23**. You need CMake ≥ 3.25 and one of:
