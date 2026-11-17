@@ -1,6 +1,6 @@
 # Recompiler core: status (roadmap step 2)
 
-Last updated 2026-11-17 (C++23 migration and code review, validation pass, lifter slice 1, differential test).
+Last updated 2026-11-17 (v0.4.0: every byte of the lifted code accounted for; earlier: C++23 migration and code review, validation pass, lifter slice 1, differential test).
 
 ## Language and toolchain
 Everything is **C++23**: the recompiler, the runtime header and the generated code. The C++23 features in use are `std::expected` (XBE loader and lifter results), `std::print`/`std::format`, `std::ranges` algorithms, `std::string::contains`, `std::unreachable` and `std::bit_cast`.
