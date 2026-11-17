@@ -1,6 +1,6 @@
 # GBTG-Qilincomp
 
-A static recompilation of **Grabbed by the Ghoulies** (Rare, original Xbox, 2003) into portable C++23 with a Vulkan renderer, aimed at Windows, Linux, macOS (Apple Silicon) and ARM64 Linux, with a Raspberry Pi 4 as the minimum spec.
+A static recompilation of **Grabbed by the Ghoulies** (Rare, original Xbox, 2003) into portable C++23 with a Vulkan renderer, aimed at Windows, Linux, macOS (Apple Silicon) and ARM64 Linux. Efficiency is the first priority: a Raspberry Pi 4–class board is our reference for typical low-end hardware, not a floor, and the aim is to run well below it if the engineering allows.
 
 > **No game data is included, and none ever will be.** You need your own copy of the game. The tools read `default.xbe` and the disc files from a path you give them. `.gitignore` keeps game files, and anything generated from them, out of the repo.
 
@@ -83,9 +83,9 @@ This runs the unit tests and the CFG pass, then cross-checks Zydis against LLVM'
 
 ## Design targets (short version)
 
-- **Efficiency and reliability come first.** Every choice is judged by whether it's fast on a Pi 4, and whether it fails loudly instead of misbehaving quietly.
+- **Efficiency and reliability come first.** Every choice is judged by whether it makes the game cheaper to run on low-end hardware, and whether it fails loudly instead of misbehaving quietly.
 - **Static recompilation, x86 → C++, compiled ahead of time.** No interpreter and no JIT. Hand-written C++ can override any lifted function.
-- **No DirectX.** D3D8 is translated at API level to Vulkan, using only the feature set the Pi 4's v3dv driver supports. macOS runs through MoltenVK.
+- **No DirectX.** D3D8 is translated at API level to Vulkan, using a deliberately small baseline feature set so one render path runs on everything from low-end ARM GPUs upwards. macOS runs through MoltenVK.
 - **XDK libraries are replaced natively**, not recompiled: XAPI, CRT, D3D8, DSOUND, XACT, XPP, WMADEC and Bink.
 - **Ground truth is xemu** running the original game.
 

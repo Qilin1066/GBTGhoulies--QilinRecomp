@@ -1,6 +1,6 @@
 # Prior art: original-Xbox recompilation & decompilation (researched 2026-11-17)
 
-What exists, what each project chose, and what it means for our project (Vulkan, C++, cross-platform incl. Raspberry Pi 4, efficiency and reliability first).
+What exists, what each project chose, and what it means for our project (Vulkan, C++, cross-platform incl. low-end ARM boards, efficiency and reliability first).
 
 ## 1. Ghoulies PC Recomp (SeveerJ) — same game, already playable
 - v0.1 beta "test build for playtesters" (story dated 2026-11-06); README says the game is playable incl. cutscenes, challenges and the Reaper. US release only.
@@ -12,7 +12,7 @@ What exists, what each project chose, and what it means for our project (Vulkan,
 - Licences: xboxrecomp MIT; xemu-derived files LGPL-2.1+; ImGui MIT.
 - PCGamingWiki also lists a second effort, **gbtg_recomp** (C++, made with XboxXBERecomp, in development).
 
-**Takeaways for us:** this port proves the game can be recompiled and played, but its approach (GPU emulated at NV2A level, runtime shader compilation, D3D11, Windows-only) is heavy. Its own issue list shows modern PCs struggling to hold 60 fps, which rules that approach out for a Pi 4. Our differentiators stand: Vulkan, cross-platform/ARM, D3D8 replaced at API level, shaders and pipelines built ahead of time. It is also a second behavioural reference next to xemu, and its seed addresses are a free cross-check for our function discovery. The "real-time frame timing" note and 60 fps/uncapped option at correct speed suggest the game may tolerate variable frame time, which could make our 144 Hz goal much easier than render interpolation. Investigate the main loop's timing early.
+**Takeaways for us:** this port proves the game can be recompiled and played, but its approach (GPU emulated at NV2A level, runtime shader compilation, D3D11, Windows-only) is heavy. Its own issue list shows modern PCs struggling to hold 60 fps, which rules that approach out for low-end hardware. Our differentiators stand: Vulkan, cross-platform/ARM, D3D8 replaced at API level, shaders and pipelines built ahead of time. It is also a second behavioural reference next to xemu, and its seed addresses are a free cross-check for our function discovery. The "real-time frame timing" note and 60 fps/uncapped option at correct speed suggest the game may tolerate variable frame time, which could make our 144 Hz goal much easier than render interpolation. Investigate the main loop's timing early.
 
 ## 2. xboxrecomp (sp00nznet) — the general toolkit behind #1
 - v0.17.0. Python pipeline: XBE parser → disassembler (**Capstone**) → func_id (CRT/D3D/vtables/game; optional Ghidra FidDb naming) → ABI analysis (calling conventions; otherwise everything falls back to cdecl) → recompiler emitting C (`recomp_NNNN.c`, `recomp_dispatch.c`).

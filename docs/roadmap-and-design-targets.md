@@ -1,11 +1,11 @@
 # Grabbed by the Ghoulies — Recomp Roadmap & Design Targets
 
-**Guiding principle: efficiency and reliability come first.** Every design choice is judged on whether it's fast on a Raspberry Pi 4 and whether it fails loudly and predictably instead of silently misbehaving.
+**Guiding principle: efficiency and reliability come first.** Every design choice is judged on whether it makes the game cheaper to run on low-end hardware and whether it fails loudly and predictably instead of silently misbehaving.
 
 ## Targets
-- **Platforms:** Windows, Linux, macOS (Apple Silicon), ARM64 Linux (Raspberry Pi 4 as minimum spec).
+- **Platforms:** Windows, Linux, macOS (Apple Silicon), ARM64 Linux. See *Hardware scope* below.
 - **Language:** **C++23** throughout (recompiler, generated code and runtime). Minimum compilers: GCC 14, Clang 19, Xcode 16, Visual Studio 2022 17.10. No DirectX anywhere.
-- **Graphics API:** **Vulkan only**, restricted to the feature set supported by the Pi 4's Mesa v3dv driver, so one render path works everywhere (MoltenVK on macOS).
+- **Graphics API:** **Vulkan only**, restricted to a small baseline feature set (today: what Mesa's v3dv driver on a Pi 4 supports), so one render path works everywhere (MoltenVK on macOS).
 - **Reference:** xemu running the original game is ground truth for behaviour and visuals. The existing Windows-only Ghoulies PC Recomp (xboxrecomp-based, D3D11) is a second behavioural reference; its known-issue list doubles as a regression checklist (see `prior-art.md`).
 - **Enhancement example target:** 3440×1440 (21:9) at 144 Hz.
 
@@ -28,9 +28,16 @@
 - **Threads:** audio mixing and Vulkan submission off the game thread.
 - **Portability rules:** no inline asm or x86 intrinsics in the runtime; ARM64 Linux builds from day one.
 
+## Hardware scope
+A **Raspberry Pi 4–class board is the reference for "typical low-end hardware"**: it's what we measure efficiency against and test on. It is not a floor and not the goal. The goal is the cheapest possible game, and if the engineering gets us below the Pi 4, so much the better.
+
+Going below it would mean extra work in two places. Neither is ruled out:
+- **Graphics.** Vulkan needs a Vulkan driver. On Raspberry Pis that means Pi 4 or newer; Pi 1–3 (VideoCore IV) only have OpenGL ES 2. Supporting them would need a second, OpenGL ES 2 renderer behind the same D3D8-translation layer.
+- **32-bit hosts.** The runtime maps the Xbox's whole 4 GB address space flat, which needs a 64-bit OS. A Pi 1 or Zero (32-bit ARMv6) would need a windowed memory model. That's feasible, since the Xbox only has 64 MB of RAM, but it costs some speed on every memory access.
+
 ## Settings, not platform branches
 All enhancements live behind a settings file with presets, e.g.:
-- *Pi 4:* 1× resolution, no AF, no MSAA, original aspect and frame rate.
+- *Low-end:* 1× resolution, no AF, no MSAA, original aspect and frame rate.
 - *Desktop:* scaled resolution, 16× AF, MSAA, widescreen, interpolated high refresh rate.
 
 ## Roadmap
@@ -38,7 +45,7 @@ All enhancements live behind a settings file with presets, e.g.:
 2. **Recompiler core (C++23):** 🔨 in progress, repo `Tecboy1066/GBTG-Qilincomp`. ✅ XBE loader, ✅ Zydis decoder (100% agreement with LLVM on every reachable instruction), ✅ CFG port + data-as-code validation (9,197 functions), ✅ lifter slice 1: leaf functions, integer + scalar SSE (1,373 functions across game code and Rare libraries), ✅ differential test against the original x86 under Unicorn (10,984 trials at -O2 plus a UBSan run, 0 mismatches), ✅ CI with warnings as errors on Linux x64 (GCC 14, Clang 19), Linux ARM64, macOS ARM64, Windows. Next: slice 2 (calls, function table, indirect-call trap), slice 3 (x87), fold epilogue fragments into their parents. See `recompiler-core.md`.
 3. **Runtime skeleton:** memory map, function table + trap, kernel/XAPI HLE stubs, threads, file system over the extracted disc.
 4. **Boot to first frame:** run the entry point natively, push the first Clear/Present through Vulkan.
-5. **Playable at original spec:** 640×480, 4:3, original frame rate; matches xemu; tested on Pi 4 at every milestone.
+5. **Playable at original spec:** 640×480, 4:3, original frame rate; matches xemu; tested on low-end reference hardware at every milestone.
 6. **Resolution / AF / MSAA:** scaled render targets (decide per render-to-texture target), HUD half-pixel fixups, CPU framebuffer readback handling.
 7. **Widescreen 16:9 → 21:9:** patch the projection (Hor+), widen the culling frustum, re-anchor the HUD, pillarbox 2D/FMV, per-scene aspect caps where the extra view reveals unfinished geometry.
 8. **High refresh rate:** ✅ investigated (`frame-timing.md`). The game is variable-timestep by design (dt = vblanks since last present / 60, clamped to 5 frames, plus a 300 Hz tick accumulator, computed in `0xFC030`). Plan: override `0xFC030` to feed real elapsed time, replace the busy-wait loops (`0x32680`/`0x32700`) with sleeps, pace frames from the Vulkan swapchain. Playtest 30/60/144/240 Hz against xemu; optional fixed-step + interpolation mode kept only as a fallback for systems that assume dt ≥ 1/60.

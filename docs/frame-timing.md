@@ -19,7 +19,7 @@ Found 2026-11-17 by static analysis (`tools/cfg.py` + LLVM disassembly). Address
 ## Busy-wait loops (replace for efficiency)
 - **`0x32680`** spins on `QueryPerformanceCounter` until a target time. It burns a full CPU core.
 - **`0x32700`** (called from 8 game functions, likely loading/transition screens) loops at 50/60 Hz using that spin-wait.
-- In the port these become real sleeps (`std::this_thread::sleep_until` with a short final spin), important on Pi 4 and laptops.
+- In the port these become real sleeps (`std::this_thread::sleep_until` with a short final spin), important on low-end boards and laptops.
 
 ## Consequences for the port
 1. **High refresh rate (144 Hz etc.)**: override `0xFC030` with host C++ that sets `dt` from real elapsed time (high-resolution clock), keeps the 5-frame clamp and runs the same 300 Hz tick accumulator. No render interpolation needed for the common case. The existing Windows Ghoulies recomp also runs at 60 fps/uncapped at correct speed after replacing its frame timer, which supports this.

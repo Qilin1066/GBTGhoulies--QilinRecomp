@@ -170,6 +170,17 @@ The generated code compiles with no warnings at `-Wall -Wextra` under GCC 14 for
   - the loader no longer keeps a second copy of the file;
   - the harness looks functions up by binary search and runs at `-O2` rather than `-O1`.
 
+## How we'll know everything is recompiled
+The function and jump-table counts are **what we have found so far, not totals read from the game**. A retail XBE has no symbol table: nothing in the file says how many functions or switch tables there are. The real totals are fixed by the binary, but we can only approach them by accounting for every byte. So "done" is defined by these checks rather than by reaching a number:
+
+1. **Every byte of the code we lift is accounted for.** It is either an instruction of a function, or a known kind of data: a jump table, a byte index table, alignment padding, or a constant. Today `.text` is 97.8% decoded, with 928 gaps totalling 37,646 bytes still unexplained; that figure includes XAPI and the CRT, which aren't lifted. Each gap gets explained or turned into code.
+2. **Every switch has a proven size.** Of the 553 jump tables, 44 are sized heuristically. They need a bounding `cmp`, or the lifter must trap on any index outside the table, which it already does.
+3. **Every indirect jump is resolved.** 26 are unresolved today.
+4. **Every function lifts.** The lift report must show zero failures. Today 1,373 of 6,102 functions in the game code and Rare libraries lift; the rest are waiting on calls (slice 2) and x87 (slice 3), or are fragments to fold back into their parents.
+5. **Nothing turns up at runtime.** An indirect call to an address we don't have a function for traps with the address logged. A full playthrough (and the attract mode, menus and every level) with no such trap closes the list. The Ghoulies PC Recomp's seed list of functions found during play is an extra cross-check.
+
+Checks 1–4 are static and will be reported by `qilin` itself. Check 5 needs the runtime (roadmap step 3) and a playable build.
+
 ## Known issues
 1. **61 "functions" are fragments of other functions.** That's 49 that pop their own return address, 9 that read flags on entry and 3 with unbalanced stacks. The lifter rejects them, but the CFG should fold them back into their parent functions. They are seeded as call targets or data pointers by the linear pass, so the seeding should be checked against direct-call evidence.
 2. **The ARM64 host has not been differentially tested.** The generated code and the analysis are byte-identical across hosts, but the difftest runs on x86-64. NaN payloads differ on ARM: the default NaN is `0x7FC00000` there, not `0xFFC00000`. The fix is to canonicalise NaN results in `rt::` helpers where the game could observe them, and to run the difftest on an ARM host.

@@ -11,6 +11,10 @@ Each release is a git tag (`vX.Y.Z`) with a matching GitHub release. The version
 
 ## [Unreleased]
 
+### Changed
+- **Docs:** the Raspberry Pi 4 is described as a reference point for typical low-end hardware, not a minimum spec. A new *Hardware scope* section in the roadmap says what going lower would take (an OpenGL ES 2 renderer for Pi 1–3, and a windowed memory model for 32-bit hosts).
+- **Docs:** `recompiler-core.md` explains that function and jump-table counts are discoveries, not known totals, and defines the checks that mean everything is recompiled.
+
 ## [0.3.0] - 2026-11-17
 C++23 migration and full code review.
 
