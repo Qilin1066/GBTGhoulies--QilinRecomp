@@ -547,6 +547,10 @@ Function Cfg::make_function(uint32_t f, Origin origin, uint8_t round, Explored& 
     fn.leaders = std::move(r.leaders);
     fn.calls = r.calls;
     fn.tails = r.tails;
+    // A branch recorded as a tail call while a (since dropped) candidate stood
+    // at its target, when the function's own code also reaches that target:
+    // it's a label, not a tail call.
+    std::erase_if(fn.tails, [&](uint32_t t) { return r.insns.contains(t); });
     fn.icalls = std::move(r.icalls);
     fn.ijmps = std::move(r.ijmps);
     fn.jtabs = std::move(r.jtabs);
@@ -596,6 +600,15 @@ bool Cfg::jumps_over_filler(const Function& g, uint32_t c) const {
     return false;
 }
 
+// G's instruction just before f ends at f and continues into it (not a
+// ret, jmp or int3).
+bool Cfg::falls_into(const Function& g, uint32_t f) const {
+    auto it = std::ranges::lower_bound(g.insns, f);
+    if (it == g.insns.begin() || it == g.insns.end() || *it != f) return false;
+    const Insn* p = dec_.decode(*std::prev(it));
+    return p->end() == f && !p->is_ret() && !p->is_jmp() && p->mnem != ZYDIS_MNEMONIC_INT3;
+}
+
 // A function whose entry is an instruction of an earlier function G, reached
 // only by jumps (no call, no EH table, no pointer to it anywhere), is a label
 // inside G that an earlier, shorter exploration of G mistook for a tail call.
@@ -609,7 +622,11 @@ bool Cfg::drop_labels() {
         if (!plausible(g)) continue;
         for (auto jt = std::next(it); jt != funcs_.end() && !g.insns.empty() && jt->first <= g.insns.back(); ++jt) {
             const uint32_t f = jt->first;
-            if (called.contains(f) || (evidence_.contains(f) && !jumps_over_filler(g, f))) continue;
+            if (called.contains(f)) continue;
+            // Weak evidence (a data value or immediate equal to f) doesn't make
+            // f an entry when G's previous instruction falls into it, or G
+            // jumps to it over alignment filler: no function starts that way.
+            if (evidence_.contains(f) && !jumps_over_filler(g, f) && !falls_into(g, f)) continue;
             if (xbe_.u8(f - 1) == 0xCC) continue;  // after int3 padding: an entry
             if (std::ranges::binary_search(g.insns, f) || jumps_over_filler(g, f)) drop.push_back(f);
         }

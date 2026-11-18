@@ -14,6 +14,12 @@ of pointers / small ints / floats), then:
 If the original faults (unmapped access, divide error, int3), the lifted code
 must trap as well. Trials that run past the instruction budget are skipped.
 
+Calls: the original runs its whole call tree in Unicorn. The lifted function
+calls lifted callees directly; a callee with no lifted body (library code,
+or game code that doesn't lift yet) is run from its original bytes in a
+second Unicorn instance that shares the lifted side's memory. So every
+lifted function in a call tree is compared, whatever its callees are.
+
 Usage:
   difftest.py --qilin build/qilin --xbe default.xbe [--work /tmp/qd]
               [--trials 24] [--only ADDR] [--cxx g++-14] [--sanitize]
@@ -23,20 +29,24 @@ Exit status 1 if any function mismatches. Needs: pip install unicorn
 import argparse
 import concurrent.futures as cf
 import ctypes as C
+import mmap
 import os
 import random
+import resource
 import struct
 import subprocess
 import sys
+import threading
 import time
 from collections import Counter
 
-from unicorn import (UC_ARCH_X86, UC_ERR_WRITE_PROT, UC_HOOK_INTR, UC_HOOK_MEM_WRITE, UC_MODE_32, UC_PROT_EXEC,
-                     UC_PROT_READ, Uc, UcError)
+from unicorn import (UC_ARCH_X86, UC_ERR_WRITE_PROT, UC_HOOK_INTR, UC_HOOK_MEM_WRITE, UC_MODE_32, UC_PROT_ALL,
+                     UC_PROT_EXEC, UC_PROT_READ, Uc, UcError)
 from unicorn.x86_const import (UC_X86_REG_CR0, UC_X86_REG_CR4, UC_X86_REG_EAX, UC_X86_REG_EBP,
                                UC_X86_REG_EBX, UC_X86_REG_ECX, UC_X86_REG_EDI, UC_X86_REG_EDX,
-                               UC_X86_REG_EFLAGS, UC_X86_REG_ESI, UC_X86_REG_ESP, UC_X86_REG_MXCSR,
-                               UC_X86_REG_XMM0)
+                               UC_X86_REG_EFLAGS, UC_X86_REG_EIP, UC_X86_REG_ESI, UC_X86_REG_ESP,
+                               UC_X86_REG_FP0, UC_X86_REG_FPCW, UC_X86_REG_FPSW, UC_X86_REG_FPTAG,
+                               UC_X86_REG_MXCSR, UC_X86_REG_XMM0)
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(os.path.dirname(HERE))
@@ -101,10 +111,12 @@ def build(args, work):
     print(subprocess.run(cmd, check=True, capture_output=True, text=True).stdout.splitlines()[0])
     srcs = sorted(os.path.join(gen, f) for f in os.listdir(gen) if f.endswith(".cpp"))
     srcs.append(os.path.join(HERE, "harness.cpp"))
+    srcs.append(os.path.join(ROOT, "recomp", "runtime", "dispatch.cpp"))
     # Production optimisation level and FP rules; warnings are errors, so a
     # generator regression that produces sloppy C++ fails here too.
     flags = ["-std=c++23", "-O2", "-fPIC", "-ffp-contract=off", "-Wall", "-Wextra", "-Werror",
-             "-DQILIN_CHECKED_MEMORY", "-DQILIN_TRACE_WRITES", "-I", os.path.join(ROOT, "recomp", "runtime")]
+             "-DQILIN_CHECKED_MEMORY", "-DQILIN_TRACE_WRITES", "-DQILIN_TEST_HOOKS",
+             "-I", os.path.join(ROOT, "recomp", "runtime")]
     if args.sanitize:
         # Undefined behaviour in generated code (shifts, overflow, bad casts) aborts the run.
         flags += ["-fsanitize=undefined", "-fno-sanitize-recover=undefined"]
@@ -123,6 +135,26 @@ def build(args, work):
     return img, lib
 
 
+CB_UNLIFTED = C.CFUNCTYPE(C.c_int, C.POINTER(Context), C.c_uint32, C.c_uint32)
+
+
+def reset_fp(uc):
+    """FNINIT + default MXCSR, and zeroed x87 registers: the original and the
+    callee emulator start every trial from the same floating-point state."""
+    uc.reg_write(UC_X86_REG_FPCW, 0x037F)
+    uc.reg_write(UC_X86_REG_FPSW, 0)
+    uc.reg_write(UC_X86_REG_FPTAG, 0xFFFF)  # all empty
+    for k in range(8):
+        uc.reg_write(UC_X86_REG_FP0 + k, (0, 0))
+    uc.reg_write(UC_X86_REG_MXCSR, 0x1F80)
+
+
+def enable_sse(uc):
+    # CR0.EM=0, CR0.MP=1; CR4.OSFXSR | OSXMMEXCPT.
+    uc.reg_write(UC_X86_REG_CR0, (uc.reg_read(UC_X86_REG_CR0) & ~4) | 2)
+    uc.reg_write(UC_X86_REG_CR4, uc.reg_read(UC_X86_REG_CR4) | 0x600)
+
+
 class Runner:
     def __init__(self, image_path, lib_path, base=0x10000):
         self.image = open(image_path, "rb").read()
@@ -131,13 +163,14 @@ class Runner:
         self.lib.qd_call.argtypes = [C.c_uint32, C.POINTER(Context), C.c_char_p, C.c_int]
         self.lib.qd_writes.argtypes = [C.POINTER(C.c_uint32), C.c_int]
         self.lib.qd_function_addr.restype = C.c_uint32
+        self.lib.qd_set_unlifted.argtypes = [CB_UNLIFTED]
         assert self.lib.qd_context_size() == C.sizeof(Context), "Context layout mismatch"
-        self.hmem = (C.c_uint8 * MEM_SIZE)()
+        # Lifted side's guest memory: page-aligned, so the callee emulator can map it directly.
+        self.mm = mmap.mmap(-1, MEM_SIZE)
+        self.hmem = (C.c_uint8 * MEM_SIZE).from_buffer(self.mm)
         self.uc = Uc(UC_ARCH_X86, UC_MODE_32)
         self.uc.mem_map(0, MEM_SIZE)
-        # Enable SSE: CR0.EM=0, CR0.MP=1; CR4.OSFXSR | OSXMMEXCPT.
-        self.uc.reg_write(UC_X86_REG_CR0, (self.uc.reg_read(UC_X86_REG_CR0) & ~4) | 2)
-        self.uc.reg_write(UC_X86_REG_CR4, self.uc.reg_read(UC_X86_REG_CR4) | 0x600)
+        enable_sse(self.uc)
         self.uc_writes = []
         self.uc.hook_add(UC_HOOK_MEM_WRITE, lambda uc, acc, a, sz, v, ud: self.uc_writes.append((a, sz)))
         self.intr = None
@@ -150,6 +183,87 @@ class Runner:
         # Code is read-only: a random pointer that would overwrite the running
         # code makes the trial meaningless (the lifted code can't see it).
         self.uc.mem_protect(CODE_LO, CODE_HI - CODE_LO, UC_PROT_READ | UC_PROT_EXEC)
+
+        # Callee emulator: runs the original bytes of callees that have no
+        # lifted body, on the lifted side's memory.
+        self.uc2 = Uc(UC_ARCH_X86, UC_MODE_32)
+        self.uc2.mem_map_ptr(0, MEM_SIZE, UC_PROT_ALL, C.addressof(self.hmem))
+        self.uc2.mem_protect(CODE_LO, CODE_HI - CODE_LO, UC_PROT_READ | UC_PROT_EXEC)
+        enable_sse(self.uc2)
+        self.uc2_writes = []
+        self.uc2.hook_add(UC_HOOK_MEM_WRITE, lambda uc, acc, a, sz, v, ud: self.uc2_writes.append((a, sz)))
+        self.intr2 = None
+
+        def on_intr2(uc, intno, ud):
+            self.intr2 = intno
+            uc.emu_stop()
+        self.uc2.hook_add(UC_HOOK_INTR, on_intr2)
+        self.unlifted_calls = 0
+        self.cb = CB_UNLIFTED(self.run_unlifted)  # keep a reference: ctypes doesn't
+        self.lib.qd_set_unlifted(self.cb)
+        # Clean CPU state (segments, control registers, x87, MXCSR) for both
+        # emulators, restored before every trial: a trial whose random
+        # pointers send the original into data can execute anything, and
+        # that must not leak into later trials.
+        reset_fp(self.uc)
+        reset_fp(self.uc2)
+        self.uc_clean = self.uc.context_save()
+        self.uc2_clean = self.uc2.context_save()
+
+    def run_unlifted(self, cp, target, tail_esp):
+        """rt::call_unlifted: run the callee's original bytes until it returns to its caller.
+
+        Called: [esp] is the return address. Tail-called (jmp): the target may
+        be the middle of an epilogue, with saved registers at [esp]; it returns
+        where the tail-calling function would have, to the return address at
+        that function's entry esp."""
+        try:
+            ctx = cp.contents
+            if not CODE_LO <= target < CODE_HI:
+                # A call through a null or random pointer: the original goes on to
+                # execute data, depending on CPU state (flags, segments) the lifted
+                # side doesn't carry. The trial says nothing about lifted code.
+                self.unlifted_fault = f"call into non-code at {target:08X}"
+                return 3
+            slot = tail_esp if tail_esp else ctx.esp
+            if slot + 4 > MEM_SIZE:
+                return 2
+            ret = struct.unpack_from("<I", self.mm, slot)[0]
+            uc = self.uc2
+            for name, r in zip(GPRS, UC_GPR):
+                uc.reg_write(r, getattr(ctx, name))
+            # EFLAGS aren't modelled across calls (DF clear); x87 and MXCSR state
+            # carry over from earlier callees in this trial, as in the original.
+            uc.reg_write(UC_X86_REG_EFLAGS, 0x202)
+            for k in range(8):
+                uc.reg_write(UC_X86_REG_XMM0 + k, sum(ctx.xmm[k].u[j] << (32 * j) for j in range(4)))
+            self.intr2 = None
+            self.unlifted_calls += 1
+            # Unicorn applies the stop address when it translates a block: a block
+            # cached by an earlier run with another stop address would run
+            # straight past this one. Drop any cached block at the stop address.
+            uc.ctl_remove_cache(ret, ret + 1)
+            try:
+                uc.emu_start(target, ret, timeout=UC_TIMEOUT_US, count=MAX_INSNS)
+            except UcError as e:
+                self.unlifted_fault = f"{target:08X}: {e} at {uc.reg_read(UC_X86_REG_EIP):08X}"
+                return 3 if e.errno == UC_ERR_WRITE_PROT else 2
+            if self.intr2 is not None:
+                self.unlifted_fault = f"{target:08X}: interrupt {self.intr2} at {uc.reg_read(UC_X86_REG_EIP):08X}"
+                return 2
+            if uc.reg_read(UC_X86_REG_EIP) != ret:
+                return 3
+            for name, r in zip(GPRS, UC_GPR):
+                setattr(ctx, name, uc.reg_read(r))
+            for k in range(8):
+                v = uc.reg_read(UC_X86_REG_XMM0 + k)
+                for j in range(4):
+                    ctx.xmm[k].u[j] = (v >> (32 * j)) & 0xFFFFFFFF
+            ctx.ret_to = ret
+            return 0
+        except Exception as e:  # never let an exception unwind through C++ frames
+            print(f"run_unlifted({target:08X}): {e!r}", file=sys.stderr)
+            return 2
 
     def write_both(self, addr, data):
         self.uc.mem_write(addr, data)  # mem_write ignores page protection
@@ -182,24 +296,28 @@ class Runner:
 
         # ---- original under Unicorn ----
         uc = self.uc
+        uc.context_restore(self.uc_clean)
+        self.uc2.context_restore(self.uc2_clean)
         for r, v in zip(UC_GPR, regs):
             uc.reg_write(r, v)
         uc.reg_write(UC_X86_REG_EFLAGS, 0x202)
-        uc.reg_write(UC_X86_REG_MXCSR, 0x1F80)
         for k in range(8):
             v = sum(xmm[k][j] << (32 * j) for j in range(4))
             uc.reg_write(UC_X86_REG_XMM0 + k, v)
         self.uc_writes = []
+        self.uc2_writes = []
+        self.unlifted_fault = ""
         self.intr = None
-        status = "ok"
+        status, why = "ok", ""
         try:
             uc.emu_start(addr, SENTINEL, timeout=UC_TIMEOUT_US, count=MAX_INSNS)
             if self.intr is not None:
-                status = "fault"
+                status, why = "fault", f"interrupt {self.intr} at {uc_eip(uc):08X}"
             elif uc_eip(uc) != SENTINEL:
                 status = "budget"
         except UcError as e:
             status = "budget" if e.errno == UC_ERR_WRITE_PROT else "fault"
+            why = f"{e} at {uc_eip(uc):08X}"
         if status == "budget":  # never run the lifted code on a state the original didn't finish
             self.restore(list(self.uc_writes) + [(STACK_TOP, len(stack))])
             return "skip", "", regs
@@ -221,22 +339,30 @@ class Runner:
         n = self.lib.qd_writes((C.c_uint32 * 2)(), 0)
         buf = (C.c_uint32 * (2 * max(1, n)))()
         self.lib.qd_writes(buf, n)
-        h_w = [(buf[2 * k], buf[2 * k + 1]) for k in range(n)]
+        h_w = [(buf[2 * k], buf[2 * k + 1]) for k in range(n)] + self.uc2_writes
 
         result, detail = "pass", ""
-        if rc == 0 and ctx.ret_to != SENTINEL:
+        if rc == 3:
+            result = "skip"  # an unlifted callee ran past the budget
+        elif rc == 4:
+            result, detail = "fail", err.value.decode()
+        elif rc == 0 and ctx.ret_to != SENTINEL:
             result, detail = "fail", f"returns to {ctx.ret_to:08X} instead of its caller (stack imbalance: not a whole function?)"
         elif status == "budget":
             result = "skip"
         elif status == "fault":
             if rc != 2:
-                result, detail = "fail", "original faulted but lifted code returned normally"
+                result, detail = "fail", f"original faulted ({why}) but lifted code returned normally"
             else:
                 result = "fault-both"
         elif rc != 0:
-            result, detail = "fail", f"lifted code trapped but original returned: {err.value.decode()}"
+            extra = f" ({self.unlifted_fault})" if "unlifted" in err.value.decode() else ""
+            result, detail = "fail", f"lifted code trapped but original returned: {err.value.decode()}{extra}"
         else:
-            diffs = []
+            # A difference where both sides hold a NaN (an xmm lane or an aligned
+            # memory word) is set aside: Unicorn propagates SSE NaNs by x87 rules
+            # (larger payload wins), real SSE and the lifted code by operand order.
+            diffs, nan_only = [], False
             for k, name in enumerate(GPRS):
                 hv = getattr(ctx, name)
                 if hv != uc_regs[k]:
@@ -244,22 +370,44 @@ class Runner:
             for k in range(8):
                 hv = sum(ctx.xmm[k].u[j] << (32 * j) for j in range(4))
                 if hv != uc_xmm[k]:
-                    diffs.append(f"xmm{k}: original {uc_xmm[k]:032X} lifted {hv:032X}")
+                    lanes = [((uc_xmm[k] >> (32 * j)) & 0xFFFFFFFF, (hv >> (32 * j)) & 0xFFFFFFFF) for j in range(4)]
+                    if all(u == h or (nan32(u) and nan32(h)) for u, h in lanes):
+                        nan_only = True
+                    else:
+                        diffs.append(f"xmm{k}: original {uc_xmm[k]:032X} lifted {hv:032X}")
             for a, sz in merge(uc_w + h_w):
                 ub = bytes(uc.mem_read(a, sz))
                 hb = bytes(self.hmem[a:a + sz])
-                if ub != hb:
+                if ub == hb:
+                    continue
+                real = False
+                for p in (p for p in range(sz) if ub[p] != hb[p]):
+                    w = (a + p) & ~3
+                    if w >= a and w + 4 <= a + sz:
+                        o = w - a
+                        u, h = struct.unpack_from("<I", ub, o)[0], struct.unpack_from("<I", hb, o)[0]
+                        if nan32(u) and nan32(h):
+                            nan_only = True
+                            continue
+                    real = True
+                    break
+                if real:
                     diffs.append(f"memory {a:08X}+{sz}: original {ub.hex()} lifted {hb.hex()}")
                     break
             if diffs:
                 result, detail = "fail", "; ".join(diffs[:4])
+            elif nan_only:
+                result = "pass-nan"
         self.restore(uc_w + h_w + [(STACK_TOP, len(stack))])
         return result, detail, regs
 
 
 def uc_eip(uc):
-    from unicorn.x86_const import UC_X86_REG_EIP
     return uc.reg_read(UC_X86_REG_EIP)
+
+
+def nan32(w):
+    return (w & 0x7FFFFFFF) > 0x7F800000
 
 
 def merge(ranges):
@@ -274,7 +422,18 @@ def merge(ranges):
 
 
 def worker(job):
-    """Run all trials for a slice of functions in this process."""
+    """Run all trials for a slice of functions in this process, on a thread
+    with a large stack: lifted code recurses on the host stack as deeply as
+    the guest does, and the harness stops runaway recursion at a fixed depth."""
+    threading.stack_size(512 << 20)
+    out = []
+    t = threading.Thread(target=lambda: out.append(worker_body(job)))
+    t.start()
+    t.join()
+    return out[0]
+
+
+def worker_body(job):
     img, lib, funcs, args, wid = job
     R = Runner(img, lib)
     per = {f: Counter() for f in funcs}
@@ -287,14 +446,17 @@ def worker(job):
             t0 = time.time()
             for k in range(per_variant):
                 rng = random.Random(f"{args.seed}:{f}:{v}:{k}")
+                before = R.unlifted_calls
                 res, detail, regs = R.trial(f, rng)
                 per[f][res] += 1
+                if res == "pass" and R.unlifted_calls != before:
+                    per[f]["pass-via-unlifted"] += 1  # passed through original code of an unlifted callee
                 if res == "fail" and f not in first_fail:
                     first_fail[f] = (detail, regs)
                 if time.time() - t0 > args.fn_seconds:
                     per[f]["timeout"] += 1
                     break
-            log.write(f"{f:08X} v{v} {dict(per[f])}\n")
+            log.write(f"{f:08X} v{v} {dict(per[f])} rss={resource.getrusage(resource.RUSAGE_SELF).ru_maxrss >> 10}MB\n")
             log.flush()
     return per, first_fail
 
@@ -306,7 +468,9 @@ def main():
     ap.add_argument("--work", default="/tmp/qilin-difftest")
     ap.add_argument("--trials", type=int, default=24)
     ap.add_argument("--variants", type=int, default=3, help="distinct scratch-heap images")
-    ap.add_argument("--only")
+    ap.add_argument("--only", help="lift only this function (its callees then run as original code)")
+    ap.add_argument("--test", help="comma-separated function addresses to test, from the full lift")
+    ap.add_argument("--reuse", action="store_true", help="reuse the library already built in --work")
     ap.add_argument("--cxx", default=os.environ.get("CXX", "c++"))
     ap.add_argument("--seed", type=int, default=1)
     ap.add_argument("--limit", type=int, default=0, help="test only the first N functions")
@@ -315,15 +479,24 @@ def main():
     ap.add_argument("--sanitize", action="store_true", help="build the lifted code with UBSan (use GCC)")
     args = ap.parse_args()
     os.makedirs(args.work, exist_ok=True)
-    img, lib = build(args, args.work)
+    lib = os.path.join(args.work, "libdifftest.so")
+    img = os.path.join(args.work, "image.bin")
+    if not (args.reuse and os.path.exists(lib) and os.path.exists(img)):
+        img, lib = build(args, args.work)
     probe = C.CDLL(lib)
     probe.qd_function_addr.restype = C.c_uint32
     funcs = [probe.qd_function_addr(i) for i in range(probe.qd_function_count())]
+    if args.test:
+        want = {int(x, 16) for x in args.test.split(",")}
+        funcs = [f for f in funcs if f in want]
     if args.limit:
         funcs = funcs[:args.limit]
-    jobs = [(img, lib, funcs[w::args.jobs], args, w) for w in range(args.jobs)]
+    # Chunks of functions, each in a fresh process: the emulators' translation
+    # caches grow with every function run, so long-lived workers run out of memory.
+    chunk = 120
+    jobs = [(img, lib, funcs[k:k + chunk], args, k // chunk) for k in range(0, len(funcs), chunk)]
     per, first_fail = {}, {}
-    with cf.ProcessPoolExecutor(args.jobs) as ex:
+    with cf.ProcessPoolExecutor(args.jobs, max_tasks_per_child=1) as ex:
         for p, ff in ex.map(worker, jobs):
             per.update(p)
             first_fail.update(ff)
@@ -333,8 +506,11 @@ def main():
     failing = sorted(f for f, c in per.items() if c["fail"])
     exercised = sum(1 for c in per.values() if c["pass"])
     only_fault = sum(1 for c in per.values() if not c["pass"] and not c["fail"])
-    print(f"functions: {len(funcs)}  trials: {sum(v for k, v in tot.items() if k != 'timeout')}  {dict(tot)}")
+    counted = ("pass", "pass-nan", "fail", "fault-both", "skip")
+    print(f"functions: {len(funcs)}  trials: {sum(tot[k] for k in counted)}  {dict(tot)}")
     print(f"functions with >=1 completed matching trial: {exercised}")
+    if tot["pass-nan"]:
+        print(f"trials matching except NaN against NaN (Unicorn's x87-style SSE NaN propagation): {tot['pass-nan']}")
     print(f"functions where every trial faulted or hit the budget (not exercised): {only_fault}")
     print(f"functions with a mismatch: {len(failing)}")
     for f in failing[:60]:

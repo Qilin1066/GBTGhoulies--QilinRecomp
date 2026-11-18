@@ -11,18 +11,50 @@ Each release is a git tag (`vX.Y.Z`) with a matching GitHub release. The version
 
 ## [Unreleased]
 
-### Documentation
-- **The renderer targets Vulkan 1.3.** It's widely supported: the Raspberry Pi 4 and 5 (Mesa v3dv, conformant from Mesa 24.3), macOS through MoltenVK 1.3, and current Windows and Linux drivers. 1.3 core is the floor; optional features and limits follow what v3dv on a Pi 4 provides. See `roadmap-and-design-targets.md`.
+## [0.5.0] - 2026-11-18
+Lifter slice 2 (calls), and every jump table in lifted code proven. 5,098 of the 5,747 functions in the game code and Rare libraries lift now (88.7%), up from 1,276.
 
 ### Added
 - **Value-range analysis for jump tables** (`recomp/src/vrange.*`). It tracks each register's possible values along every path through a function and narrows them at conditional branches. Every jump table in the game code and the Rare libraries now has a proven size: 35 by the new analysis, and the rest by a `cmp` or an `and` next to the jump. The 7 still sized by scanning are all in XDK libraries that get replaced. On the 311 tables already bounded by `cmp` or `and`, the analysis agrees.
 - **Jump tables with a negative first index,** for MSVC's `sub ecx, 4; jb` … `jmp [4*ecx + T]` form, used in `memcpy`.
 - Unit tests for a register-held bound a block away from the jump, adjacent tables, and a negative-index table, lifted to C++.
+- **Calls in lifted code.**
+  - **Direct calls** push the guest return address, store modified registers back to the Context, call `fn_T(c)` as a plain C++ call, reload the registers, and trap if the callee returned anywhere but the call site.
+  - **Tail calls:** a `jmp` or `jcc` out of the function.
+  - **Indirect calls and jumps** go through `rt::call` (`recomp/runtime/dispatch.cpp`). It binary-searches the generated function table and falls back to `rt::call_unlifted`, which the host provides: HLE in the runtime, original code in the difftest, otherwise a trap with the address.
+  - **Generated files:** `qilin lift` now writes `functions.hpp` (declarations) and `stubs.cpp`. That's one stub per call target without a lifted body, 699 in all: 448 game and Rare functions waiting on x87 or exception handling, and 251 library entry points. Those 251 are the first concrete list of what the runtime must replace (XAPI 71, D3D 87, CRT 36, XACT 25, D3DX 11, BINK 7, XPP 7, XGRPH 6, DSOUND 1).
+- **String instructions:** `movsw`, `stosw` and `cmps` with `repe`/`repne`. `cmps` leaves the flags untouched when ecx is 0, as the CPU does.
+- **Direction flag** tracked statically (`std` … `cld`), with backward `rep movs` for the Rare `memcpy`'s overlapping copies. DF must be clear at every call and exit.
+- **Scalar SSE arithmetic follows x86 NaN rules on every host** (`rt::addss` and friends): the first NaN operand propagates, quietened, and invalid operations give `0xFFC00000`. Before, the result depended on the host CPU and on the compiler's operand order. Unit tests cover the rules.
+- **Differential test with calls.**
+  - **Coverage:** whole call trees are compared. A callee without a lifted body runs from its original bytes in a second Unicorn instance that shares the lifted side's memory.
+  - **Results:** 5,098 functions, 40,784 trials, 0 mismatches, also under UBSan. 1,222 matching trials ran through original callee code.
+- **Test hooks** (`QILIN_TEST_HOOKS`, compiled out otherwise): a frame per lifted function and a tick per backward branch. The harness uses them to stop runaway recursion and loops, and to place tail-called callees' returns.
+- Difftest options `--test` (test chosen functions from the full lift) and `--reuse` (skip the rebuild).
+
+### Changed
+- **The difftest restores a saved CPU context in both emulators before every trial,** and runs each chunk of 120 functions in a fresh process.
+- **Trials whose only differences are NaN against NaN are counted as `pass-nan`:** Unicorn propagates SSE NaNs by x87 rules.
+- **Trials that call into non-code** (null or random pointers) are skipped.
+- **A flag read after a call is reported as a lift error,** since callee flags aren't modelled. No function in the game does this.
 
 ### Fixed
 - **Jump tables that were sized by scanning took in the next table.** 15 tables at `0x108xxx` were read as 10 slots instead of 5, and `0x16322D` as 14 instead of 10. That gave those functions phantom switch cases.
 - **Two jumps through tables of records in `.rdata`** (`0xD410B`, `0xD4179`) were treated as switches. They're indirect jumps now.
 - **String instructions were taken to overwrite every register** when searching backwards for a switch bound. They write only esi, edi, ecx (with `rep`) and, for `lods`, eax.
+- **A branch to the next instruction (`jnz $+2`)** left its label undefined in the generated code.
+- **`if ((sf == of))` in generated code** tripped Clang's `-Wparentheses-equality`. All generated code now compiles warning-free under GCC 14 and Clang 19.
+- **CFG:** tail-call entries for branch targets that are the function's own instructions are dropped.
+- **CFG:** a weakly evidenced "entry" that the previous instruction falls into is a label, not a function: `0x83540`, matched by a constant in `.rdata`, and `0xC4000`, a call's return address.
+- **Difftest:** CPU state leaked between trials after the original executed data (231 false mismatches).
+- **Difftest:** the two emulators kept separate x87/MXCSR state.
+- **Difftest:** Unicorn ignored a new stop address for blocks it had already translated.
+- **Difftest:** tail calls into shared SEH epilogues stopped at the wrong place.
+- **Difftest:** workers ran out of memory.
+
+
+### Documentation
+- **The renderer targets Vulkan 1.3.** It's widely supported: the Raspberry Pi 4 and 5 (Mesa v3dv, conformant from Mesa 24.3), macOS through MoltenVK 1.3, and current Windows and Linux drivers. 1.3 core is the floor; optional features and limits follow what v3dv on a Pi 4 provides. See `roadmap-and-design-targets.md`.
 
 ## [0.4.0] - 2026-11-17
 Every byte of the lifted code is accounted for.
@@ -133,7 +165,8 @@ Recompiler core foundations.
 ### Fixed
 - **CI:** use `macos-latest` (the `macos-14` image was retired).
 
-[Unreleased]: https://github.com/Tecboy1066/GBTG-Qilincomp/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/Tecboy1066/GBTG-Qilincomp/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/Tecboy1066/GBTG-Qilincomp/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/Tecboy1066/GBTG-Qilincomp/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/Tecboy1066/GBTG-Qilincomp/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/Tecboy1066/GBTG-Qilincomp/compare/v0.1.0...v0.2.0

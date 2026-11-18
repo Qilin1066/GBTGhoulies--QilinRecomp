@@ -1,6 +1,6 @@
 # Recompiler core: status (roadmap step 2)
 
-Last updated 2026-11-17 (every jump table in lifted code proven by value-range analysis; v0.4.0: every byte of the lifted code accounted for; earlier: C++23 migration and code review, validation pass, lifter slice 1, differential test).
+Last updated 2026-11-18 (v0.5.0: slice 2, calls; every jump table in lifted code proven by value-range analysis; v0.4.0: every byte of the lifted code accounted for; earlier: C++23 migration and code review, validation pass, lifter slice 1, differential test).
 
 ## Language and toolchain
 Everything is **C++23**: the recompiler, the runtime header and the generated code. The C++23 features in use are `std::expected` (XBE loader and lifter results), `std::print`/`std::format`, `std::ranges` algorithms, `std::string::contains`, `std::unreachable` and `std::bit_cast`.
@@ -48,16 +48,16 @@ The naming differences between the two libraries are mapped explicitly in the sc
 ### Function discovery + CFG (`recomp/src/cfg.*`)
 This is a C++ port of `tools/analysis/cfg.py` and `analyze.py`. It works on Zydis's structured operands instead of disassembly text. It runs in about **4 s**, including the fixpoint passes described under "Complete coverage" below. Reachable instructions are tracked in a bitmap.
 
-| | Python prototype | C++ port, v0.3.0 | C++ port, v0.4.0 |
+| | Python prototype | C++ port, v0.3.0 | C++ port, now |
 |---|---|---|---|
-| Functions | 9,402 | 9,197 | 8,843 |
+| Functions | 9,402 | 9,197 | 8,842 |
 | Reachable instructions | 530,764 | 529,718 | 530,444 |
 | Lifted code accounted for (game, Rare libraries, EH funclets) | — | — | **100%**, 0 unknown bytes |
 | Jump tables resolved | 556 | 553 | 556 (307 cmp, 202 cmp + byte table, 5 `and` mask, 35 value-range, 7 heuristic, none in lifted code) |
-| Unresolved indirect jumps | 24 | 26 | 28 (7 in lifted code, all indirect tail calls; 2 are jumps through tables of records in `.rdata`) |
+| Unresolved indirect jumps | 24 | 26 | 28 (9 in lifted code, all indirect tail calls, 2 of them through tables of records in `.rdata`) |
 | Indirect calls | ~1,960 | 1,980 | 1,930 |
 
-There are fewer functions in v0.4.0 because 2,834 fragments of real functions were merged back into their parents, while about 1,300 functions were newly found.
+There are fewer functions than in v0.3.0 because fragments of real functions were merged back into their parents (2,384 merges in the current pass order), while about 1,300 functions were newly found.
 
 **Where the prototype and the port disagree, the port is better in every case examined:**
 - **Indexed table addresses are no longer code-pointer seeds.** The prototype's text regex treated the table address in `jmp [4*reg + table]` as a possible function pointer, so jump tables were decoded as code.
@@ -81,7 +81,7 @@ This pass removes functions that are really data decoded as code, and repeats un
 Functions that are the entry point, or direct call/jump targets of surviving functions, are kept but listed by `qilin suspects`.
 
 **Result:**
-- 8,843 functions.
+- 8,842 functions.
 - 0 decode failures and 0 overlaps.
 - 119 data-as-code functions dropped: 46 misaligned seeds and 73 that failed the checks above.
 - 7 suspects remain. All are hardware code in XAPI (`int 0x2D`, far jump, `cli`/`sti`), D3D (`wbinvd`, port I/O) and XPP (`cli`/`sti`). Those libraries get replaced, so none of this is lifted.
@@ -102,7 +102,7 @@ The game code went from 15,198 unknown bytes to 0. These are the rules that got 
 - **Function alignment.** Every function in the game and Rare library regions starts on a 16-byte boundary. A candidate entry that isn't aligned there is rejected.
 - **C++ exception handling tables.** `FuncInfo` records (magic `0x19930520`–`22`) in `.rdata` and `.data` lead to unwind funclets, catch handlers, and `__ehhandler` stubs (`mov eax, &FuncInfo; jmp __CxxFrameHandler`). A catch handler returns its continuation address as `mov eax, imm32; ret`, so those continuations become entry points of their parent's code. This found 70 tables, 68 stubs, 147 funclets and 20 continuations.
 - **Evidence strength.** A direct call, the entry point and the EH tables are strong evidence that an address is a function. A 16-aligned value in a data section, or an immediate operand, is weak evidence: a constant can look like an address. A tail jump to an address that follows `int3` padding is strong, because MSVC pads with `int3` only between functions.
-- **Fragment merging.** A function is cut short when exploration stops at a false candidate. If function G jumps past such candidates and none of them has strong evidence, they are labels inside G: they are dropped and G is re-explored. Weak evidence stands unless G's own code falls through into the candidate, or jumps to it over alignment filler. 2,834 fragments were merged this way.
+- **Fragment merging.** A function is cut short when exploration stops at a false candidate. If function G jumps past such candidates and none of them has strong evidence, they are labels inside G: they are dropped and G is re-explored. Weak evidence stands unless G's own code falls through into the candidate, or jumps to it over alignment filler. 2,384 merges happen this way in the current pass order.
 - **Labels.** A "function" whose entry is an instruction of an earlier function, reached only by jumps (no call, no EH entry, no pointer), is a label that an earlier, shorter exploration mistook for a tail call. The same goes for a 16-aligned loop head that its function reaches with `jmp short` over alignment filler.
 - **Takeover.** An aligned data or immediate pointer whose code runs through weaker functions' entries (orphan or gap seeds) takes them over: those entries are labels inside it.
 - **Misaligned overlaps.** When one function's entry falls inside another's instruction, the one with weaker evidence goes. Before v0.4.0 the inner seed always lost, which threw away a real function at `0xD3310` in favour of a jump table decoded as an orphan.
@@ -129,13 +129,21 @@ A `cmp` or `and` directly above a table jump bounds most switches. For the rest,
 
 **Lift check.** The lift report has no fragments left: every failure is an instruction class still to be implemented (calls for slice 2, x87 for slice 3, `std`, `pushfd`). In v0.3.0, 61 lift failures were fragments.
 
-### Lifter, slice 1 (`recomp/src/lifter.*`, runtime `recomp/runtime/guest.hpp`)
-Each guest function becomes `void fn_XXXXXXXX(rt::Context&)`. `Lifter::lift` returns `std::expected<std::string, LiftFailure>`, where the failure carries a kind (not a leaf, fragment, unsupported instruction, x87, undefined flag, implausible, bad control flow), the address and the instruction.
+### Lifter, slices 1 and 2 (`recomp/src/lifter.*`, runtime `recomp/runtime/guest.hpp` and `dispatch.cpp`)
+Each guest function becomes `void fn_XXXXXXXX(rt::Context&)`. `Lifter::lift` returns `std::expected<std::string, LiftFailure>`, where the failure carries a kind (fragment, unsupported instruction, x87, undefined flag, implausible, bad control flow), the address and the instruction.
 
 Inside a lifted function:
 - **Registers:** guest registers are host locals. The prologue declares only the registers the function references. Each exit stores back only the registers it modifies: the compiler can't drop those stores itself, because guest memory writes may alias the context.
 - **Flags:** EFLAGS are separate bools. A backward liveness pass means a flag is computed only where something can read it. Reading a flag the previous instruction left undefined is a lift error, including OF/AF after a shift by `cl`. Instructions the lifter's own table doesn't list take their flag effects from Zydis's tables. Before, those were taken to touch no flags, so `fcomi`, `bt`, `bsf` and the rotates looked transparent. A check over every decodable address in the image found that the hand table agrees with Zydis everywhere, or is deliberately stricter: shift counts that may be zero, `rep` with ecx = 0, and AF after `sbb`.
 - **Control flow:** blocks become labels and gotos. Jump tables become `switch` with a trap for an unknown index.
+- **Calls (slice 2):**
+  - **Direct `call T`:** push the guest return address onto the guest stack, store the modified registers back to the Context (`writeback()`), call `fn_T(c)` as a plain C++ call, reload the registers the function uses (`reload()`), and check that the callee returned to the call site. A callee that returns anywhere else traps. The stack layout is exactly the original's, so arguments at `[esp+4]` and callees that move their return address (`__SEH_prolog`, `_chkstk`) work unchanged.
+  - **Tail calls:** a `jmp` or `jcc` out of the function writes back, calls `fn_T(c)` and returns.
+  - **Indirect calls and jumps** (`call [eax+0x14]`, `jmp eax`, the two record tables in `.rdata`) go through `rt::call(c, target)`. It binary-searches the generated function table, then falls back to `rt::call_unlifted`. That fallback belongs to whatever links the code: high-level replacements in the runtime, the original bytes in the differential test, otherwise a trap with the address.
+  - **Stubs:** every call or tail-call target without a lifted body gets a generated `fn_T` that forwards to `rt::call_unlifted`, so all direct calls link. There are 699: 448 game and Rare-library functions waiting on x87 or exception handling, and 251 library entry points the game calls directly. Those 251 are the first concrete list of what the runtime must replace: XAPI 71, D3D 87, CRT 36, XACT 25, D3DX 11, BINK 7, XPP 7, XGRPH 6, DSOUND 1.
+  - **Flags** aren't carried across calls. A flag read after a call before any write is a lift error, never a guess. No function in the game does this.
+  - **Direction flag:** tracked statically per instruction. It's clear on entry and after every call (the MSVC ABI), set by `std` and cleared by `cld`. String instructions run in that direction, and DF must be clear at every call and exit. The Rare `memcpy` uses `std; rep movsd; cld` for overlapping copies.
+  - **The stack-balance check** treats esp as unknown after a call, since a callee ending in `ret n` pops its arguments too.
 - **Integer ops:**
   - mov/movzx/movsx/lea/xchg;
   - add/sub/adc/sbb/cmp/and/or/xor/test/inc/dec/neg/not;
@@ -143,7 +151,7 @@ Inside a lifted function:
   - imul/mul/div/idiv (traps on #DE);
   - cdq/cwde, setcc/cmovcc, lahf/sahf;
   - push/pop/leave/ret.
-- **String ops:** `rep stos`/`rep movs` (with an F2 or F3 prefix) run as whole runs. They use `memset`/`memmove` where that's equivalent, and an element-wise forward copy only when the destination overlaps ahead of the source, which is exactly the CPU's pattern-replicating behaviour.
+- **String ops:** `rep stos`/`rep movs` (8, 16 and 32-bit, with an F2 or F3 prefix) run as whole runs. They use `memset`/`memmove` where that's equivalent, and an element-wise copy only when the destination overlaps the source run in the direction of copying, which is exactly the CPU's pattern-replicating behaviour. Backward copies (DF = 1) have their own helper. `cmps` with `repe`/`repne` updates the flags only if at least one element was compared, as the CPU does when ecx is 0.
 - **Scalar SSE**, bit-exact on lane 0:
   - movss/movaps/movups;
   - add/sub/mul/div/min/max/sqrtss;
@@ -151,50 +159,79 @@ Inside a lifted function:
   - comiss/ucomiss;
   - cvtsi2ss/cvt(t)ss2si, with x86 overflow semantics.
 
+  **NaN results follow x86 rules on every host.** A NaN operand propagates, quietened; if both are NaN, the first operand's. An invalid operation on non-NaN operands (inf − inf, 0 × inf, 0 / 0, the square root of a negative) gives the default NaN `0xFFC00000`. `rt::addss` and its siblings check the result with one compare, since NaN results are rare. Before, the result depended on the host: ARM's default NaN is `0x7FC00000`, and a C++ compiler may swap the operands of `a + b`, which changes which NaN propagates. Unit tests cover the rules.
+
   `guest.hpp` turns off multiply-add contraction for Clang and MSVC and refuses `-ffast-math`. The `qilin_runtime` CMake target adds `-ffp-contract=off` for GCC.
 - **Stack-balance check:** a forward esp/ebp analysis rejects "functions" that are fragments of other functions: they return with esp off balance or pop their own return address.
 
-**Coverage today:** `qilin lift` covers the game code (`0x11000–0x14A895`) and the Rare engine libraries (`0x152780–0x165C00`), 5,748 functions in all.
+**Coverage today:** `qilin lift` covers the game code (`0x11000–0x14A895`) and the Rare engine libraries (`0x152780–0x165C00`), 5,747 functions in all.
 
-| | Functions |
-|---|---|
-| **Lifted** | **1,276** |
-| Not leaves (need calls: slice 2) | 4,422 |
-| Use x87 (slice 3) | 48 |
-| One-offs (`std`, `pushfd`) | 2 |
-| Fragments of other functions | **0** (61 in v0.3.0) |
+| | v0.4.0 (slice 1) | v0.5.0 (slice 2) |
+|---|---|---|
+| **Lifted** | 1,276 | **5,098 (88.7%)** |
+| Not leaves (needed calls) | 4,422 | 0 |
+| Use x87 (slice 3) | 48 | 628 |
+| C++ exception frames (`fs:[0]`) | — | 20 |
+| One-off (`pushfd` in a CPU-ID probe) | 2 | 1 |
+| Fragments of other functions | 0 | 0 |
 
-Fewer functions lift than in v0.3.0 (1,373) because merged fragments now belong to their parents, and most of those parents make calls.
+Most x87 users used to be counted as "not a leaf", because they also make calls.
 
-The generated code compiles with no warnings at `-Wall -Wextra` under GCC 14 for both x86-64 and ARM64.
+The generated code compiles with no warnings at `-Wall -Wextra -Werror` under GCC 14 and Clang 19.
 
 ### Differential test (`tools/difftest/`)
 `difftest.py` lifts everything and builds a shared library from it. The build uses production settings (`-O2`, `-ffp-contract=off`, warnings as errors) plus bounds-checked, write-traced memory. It then runs each function in many trials.
 
 **Each trial:**
 1. Build one random guest state: registers, xmm registers, stack arguments, and a 4 MB scratch heap full of pointers, small ints and floats.
-2. Run the original x86 bytes in Unicorn, with the code pages read-only.
+2. Run the original x86 bytes in Unicorn, with the code pages read-only. The original runs its whole call tree.
 3. Run the lifted C++ on an identical copy of that state.
 4. Compare the results bit for bit: every general register, esp, all 8 xmm registers (all lanes), every written byte, and the return address. If the original faults, the lifted code must trap too.
 
-**Results:**
+**Calls.** Lifted callees are called directly. A callee with no lifted body (library code, or game code waiting on x87) runs from its original bytes in a second Unicorn instance that maps the lifted side's memory, so whole call trees are compared whatever their callees are. A called callee stops at the return address at `[esp]`. A tail-called one (marked in test builds, since it may be the middle of an epilogue with saved registers at `[esp]`) stops at the tail-calling function's own return address.
 
-| | `-O2` run (24 trials per function, 3 heap images) | UBSan run (24 trials per function) |
+**Isolation between trials:** both emulators restore a saved CPU context before every trial, covering segments, control registers, x87 and MXCSR. x87 and MXCSR state carry over between callees within a trial, as in the original. Each chunk of 120 functions runs in a fresh process.
+
+**Runaway guards** (`QILIN_TEST_HOOKS`, compiled out of normal builds): every lifted function opens a frame and every backward branch ticks. The harness stops a trial at a call depth of 4,096, at 2 million calls, 20 million loop iterations or 50,000 unlifted calls, or after 10 seconds, and reports it as a mismatch. The original's run is capped at 200,000 instructions, so a correct lifted run stays far below all of these.
+
+**Set aside, not failed:**
+- **NaN against NaN.** Unicorn propagates SSE NaNs by x87 rules (larger payload wins), real SSE by operand order. Trials whose only differences are NaN against NaN, in an xmm lane or an aligned memory word, are counted as `pass-nan`.
+- **Calls into non-code.** A call through a null or random pointer makes the original execute data, which depends on CPU state the lifted side doesn't carry (flags, segments). Those trials are skipped.
+
+**Mutation check:** a lifter with the post-call `reload()` removed was caught as mismatches in 17 of 100 sampled functions. Without the runaway guards, that build had crashed or hung the harness instead.
+
+**Results (v0.5.0, slice 2):**
+
+| | `-O2` run (8 trials per function, 2 heap images) | UBSan run (same trials) |
 |---|---|---|
-| Functions tested | 1,276 | 1,276 |
-| Trials | 30,624 | 30,624 |
-| Completed | 19,601 | 19,601 |
-| Faulted in both versions | 10,480 | 10,480 |
-| Skipped (hit the budget, or wrote into code) | 543 | 543 |
+| Functions tested | 5,098 | 5,098 |
+| Trials | 40,784 | 40,784 |
+| Completed and matching | 18,656 | 18,656 |
+| … of which ran through an unlifted callee's original code | 1,222 (in 373 functions) | 1,222 |
+| Matching except NaN against NaN | 1 | 1 |
+| Faulted in both versions | 19,920 | 19,920 |
+| Skipped (budget, a write into code, or a call into non-code) | 2,207 | 2,207 |
 | **Mismatches** | **0** | **0**, and no undefined behaviour |
-| Functions with at least one completed, matching trial | 1,258 | 1,258 |
+| Functions with at least one completed, matching trial | 3,923 | 3,923 |
 
-18 functions faulted on every random state in the `-O2` run, typically because they follow a chain of pointers. They need structured inputs to be exercised; they aren't known to be wrong.
+1,175 functions faulted or hit the budget on every random state. Most of them follow chains of pointers, or call deep into the engine. They need structured inputs to be exercised; they aren't known to be wrong.
+
+(v0.4.0, slice 1: 1,276 functions, 30,624 trials, 0 mismatches.)
 
 **Bugs found by the harness, now fixed:**
 - **Epilogue fragments** mistaken for functions. The fix is the stack-balance check.
 - **A test-setup problem:** random pointers let the original overwrite its own running code. The fix is read-only code pages in Unicorn.
 - **A `memcpy` from a null pointer** (0 bytes) in the harness itself, found by UBSan.
+- **Slice 2, in the lifter and the CFG:**
+  - a branch to the very next instruction (`jnz $+2`) left its label undefined;
+  - stale tail-call entries for branch targets that are the function's own instructions;
+  - two weak "entries" that the previous instruction falls into: `0x83540`, mid-function and matched by a constant in `.rdata`, and `0xC4000`, the return address of a call.
+- **Slice 2, in the harness:**
+  - CPU state leaked between trials (231 false mismatches). A trial whose random pointers send the original into data can change segment registers;
+  - the two emulators kept separate x87/MXCSR state;
+  - Unicorn's stop address was ignored for blocks it had already translated;
+  - tail calls into shared epilogues stopped at the wrong place;
+  - the worker processes ran out of memory as the emulators' translation caches grew.
 
 ## Code review (C++23 migration), fixes
 - **Jump-table extents used the number of unique targets instead of the table's length,** and byte index tables weren't recorded at all. Gap seeding could therefore start "functions" inside switch data. Two such functions (`0x6B850`, `0x12FC54`, both table bytes) are gone now.
@@ -222,20 +259,22 @@ The function and jump-table counts are **what we have found so far, not totals r
 
 1. **Every byte of the code we lift is accounted for.** It is either an instruction of a function, or a known kind of data: a jump table, a byte index table, alignment padding, or a constant. ✅ **Done in v0.4.0:** 0 unknown bytes in the game code, the Rare libraries and the EH funclets (`qilin coverage`). The 97.8% quoted before was for all of `.text`, including XAPI and the CRT, which aren't lifted.
 2. **Every switch has a proven size.** ✅ **Done for lifted code:** every jump table in the game code and Rare libraries is bounded by a `cmp`, an `and` mask or the value-range analysis. 7 tables are still sized by scanning, all in XDK libraries that get replaced. The lifter also traps on any index outside a table.
-3. **Every indirect jump is resolved.** 7 remain in lifted code, and all are indirect tail calls through function pointers (`jmp [eax+0x14]`, `jmp eax`, `jmp [0x304EC4]`), not switches. Slice 2's indirect-call dispatcher handles them.
-4. **Every function lifts.** The lift report must show zero failures. Today 1,276 of 5,748 functions in the game code and Rare libraries lift. The rest are waiting on calls (slice 2), x87 (slice 3) or two one-off instructions; none is a fragment.
+3. **Every indirect jump is resolved.** ✅ **Done for lifted code:** the 9 that aren't switches are indirect tail calls through function pointers (`jmp [eax+0x14]`, `jmp eax`, `jmp [0x304EC4]`, two record tables in `.rdata`). They go through the indirect-call dispatcher, which traps on an unknown target.
+4. **Every function lifts.** The lift report must show zero failures. Today 5,098 of 5,747 functions in the game code and Rare libraries lift (88.7%). The rest are 628 x87 users (slice 3), 20 functions with C++ exception frames, and one CPU-ID probe (`pushfd`) that the runtime will replace. None is a fragment.
 5. **Nothing turns up at runtime.** An indirect call to an address we don't have a function for traps with the address logged. A full playthrough (and the attract mode, menus and every level) with no such trap closes the list. The Ghoulies PC Recomp's seed list of functions found during play is an extra cross-check.
 
 Checks 1–4 are static and will be reported by `qilin` itself. Check 5 needs the runtime (roadmap step 3) and a playable build.
 
 ## Known issues
 1. **Static analysis can't prove that no function is missing from a region that is fully accounted for.** A function nobody calls directly, sitting where the CFG put another function's code, would only show up at runtime. Check 5 above (the indirect-call trap during a playthrough) is the backstop.
-2. **The ARM64 host has not been differentially tested.** The generated code and the analysis are byte-identical across hosts, but the difftest runs on x86-64. NaN payloads differ on ARM: the default NaN is `0x7FC00000` there, not `0xFFC00000`. The fix is to canonicalise NaN results in `rt::` helpers where the game could observe them, and to run the difftest on an ARM host.
-3. **MXCSR is assumed to be the default** (round-to-nearest, no flush-to-zero). This must be confirmed against what the game or XDK sets at boot.
-4. **Library sections have low coverage** (DSOUND 35%, WMADEC 36%). They get replaced, so this doesn't block anything.
-5. **The Ghoulies PC Recomp seed list hasn't been used yet** as a cross-check (see `prior-art.md`).
+2. **The ARM64 host has not been differentially tested.** The generated code and the analysis are byte-identical across hosts, but the difftest runs on x86-64. Scalar SSE arithmetic now follows x86 NaN rules explicitly (`rt::addss` and friends), which was the known ARM difference. The difftest still needs to run on an ARM host.
+3. **Unicorn propagates SSE NaNs by x87 rules,** so two-NaN cases can't be checked against it. Those trials are counted separately (`pass-nan`), and the rules are covered by unit tests instead.
+4. **MXCSR is assumed to be the default** (round-to-nearest, no flush-to-zero). This must be confirmed against what the game or XDK sets at boot.
+5. **Library sections have low coverage** (DSOUND 35%, WMADEC 36%). They get replaced, so this doesn't block anything.
+6. **The Ghoulies PC Recomp seed list hasn't been used yet** as a cross-check (see `prior-art.md`).
 
 ## Next
-1. **Slice 2: calls.** Direct calls become C++ calls, with full register state passed through the context. That needs the generated function table and an indirect-call trap on unknown targets, plus tail jumps.
-2. **Slice 3: x87.** Use host `double`, and honour precision control where the game sets it.
-3. **SEH/C++ EH strategy** for the 63 `fs:` sites.
+1. **Slice 3: x87.** 628 functions. Use host `double`, honour precision control where the game sets it, and keep x87 state in the Context across calls.
+2. **C++ exception frames:** 20 functions write `fs:[0]`. The strategy is still to be chosen: map to host C++ exceptions, or keep an explicit frame chain.
+3. **Indirect-call dispatch** is a binary search over 5,098 entries, about 13 steps. A direct-mapped table indexed by address (16-byte granularity in the aligned regions) would make it one lookup. Do this when the runtime measures it.
+4. **SEH/C++ EH strategy** for the 63 `fs:` sites.

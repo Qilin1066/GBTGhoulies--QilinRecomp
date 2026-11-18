@@ -24,7 +24,6 @@ namespace qilin {
 
 struct LiftFailure {
     enum class Kind : uint8_t {
-        NotLeaf,           // calls / tail jumps / unresolved indirect jumps (slice 2)
         Fragment,          // not a whole function (unbalanced stack, flags live on entry)
         Unsupported,       // an instruction the lifter doesn't handle yet
         X87,               // x87 (slice 3)
@@ -46,9 +45,15 @@ class Lifter {
 public:
     explicit Lifter(Decoder& dec) : dec_(dec) {}
 
-    // Lifts one function to a C++ definition. Slice 1 handles leaf functions
-    // (no calls, no tail jumps, no indirect branches other than resolved jump
-    // tables) without x87.
+    // Lifts one function to a C++ definition (no x87 yet: slice 3).
+    //
+    // Calls (slice 2): a direct `call T` pushes the guest return address,
+    // stores the modified registers to the Context, calls fn_T, reloads the
+    // registers and checks the callee returned to the call site. A jump out
+    // of the function is a tail call. Indirect calls and jumps go through
+    // rt::call (the generated function table, then rt::call_unlifted).
+    // Every fn_T a function calls must be defined: lifted, or a stub that
+    // forwards to rt::call_unlifted (qilin lift generates those).
     std::expected<std::string, LiftFailure> lift(const Function& f);
 
     static std::string name(uint32_t addr);

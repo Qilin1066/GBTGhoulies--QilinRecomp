@@ -12,9 +12,9 @@ Roadmap step 2, **recompiler core**, is in progress.
 |---|---|
 | XBE loader (headers, certificate, sections, libraries, kernel thunks, flat image) | ✅ output identical to the Python prototype |
 | x86 decoder (Zydis, vendored) | ✅ agrees with LLVM on every reachable instruction |
-| Function discovery + CFG (recursive descent, switch tables, C++ EH tables, data-as-code validation) | ✅ 8,843 functions, 556 jump tables (every one in lifted code has a proven size); **100% of the lifted code accounted for** (`qilin coverage`: 0 unknown bytes in the game code, Rare libraries and EH funclets) |
-| Lifter → C++, slice 1 (leaf functions: integer, scalar SSE, jump tables) | ✅ 1,276 functions (game code + Rare libraries), differentially tested against the original x86 under Unicorn, also under UBSan: 0 mismatches |
-| Lifter slice 2 (calls) / slice 3 (x87) | next |
+| Function discovery + CFG (recursive descent, switch tables, C++ EH tables, data-as-code validation) | ✅ 8,842 functions, 556 jump tables (every one in lifted code has a proven size); **100% of the lifted code accounted for** (`qilin coverage`: 0 unknown bytes in the game code, Rare libraries and EH funclets) |
+| Lifter → C++, slices 1–2 (integer, scalar SSE, jump tables, string ops; direct, indirect and tail calls) | ✅ 5,098 of 5,747 functions (88.7%, game code + Rare libraries), differentially tested against the original x86 under Unicorn, whole call trees included, also under UBSan: 0 mismatches |
+| Lifter slice 3 (x87: 628 functions), C++ exception frames (20) | next |
 | Runtime, HLE, Vulkan | later (see roadmap) |
 
 ## Versions and changes

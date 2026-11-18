@@ -176,6 +176,7 @@ private:
     bool displaces_weak_seed(uint32_t v);
     bool take_over(uint32_t v, Origin origin);
     bool jumps_over_filler(const Function& g, uint32_t c) const;
+    bool falls_into(const Function& g, uint32_t f) const;
     bool drop_labels();
     uint32_t bound_of(uint32_t f) const;
     void rebuild_owned();

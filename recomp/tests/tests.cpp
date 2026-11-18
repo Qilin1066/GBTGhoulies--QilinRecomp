@@ -171,6 +171,19 @@ std::vector<uint8_t> make_xbe() {
     put32(d, 0x133C, 0x1135C);
     put32(d, 0x1414, 0x11300);  // .rdata pointers to both
     put32(d, 0x1418, 0x11340);
+    // 11360: backward copy (std; rep movsd; cld), then repe cmpsb feeding jnz.
+    const uint8_t strops[] = {
+        0xFD,              // 11360 std
+        0xF3, 0xA5,        // 11361 rep movsd
+        0xFC,              // 11363 cld
+        0x33, 0xC0,        // 11364 xor eax, eax  (ZF = 1 if no byte is compared)
+        0xF3, 0xA6,        // 11366 repe cmpsb
+        0x75, 0x01,        // 11368 jnz 1136B
+        0x40,              // 1136A inc eax
+        0xC3,              // 1136B ret
+    };
+    std::memcpy(&d[0x1360], strops, sizeof strops);
+    put32(d, 0x141C, 0x11360);
     return d;
 }
 
@@ -233,7 +246,7 @@ int main() {
     if (f.contains(0x112A0)) CHECK(std::ranges::binary_search(f.at(0x112A0).insns, 0x112B0u));
     CHECK(f.contains(0x112D0) && f.at(0x112D0).origin == Origin::Eh);  // __ehhandler stub
     CHECK(f.contains(0x112E0));  // unwind funclet
-    CHECK(f.size() == 9);  // nothing seeded inside the jump/index tables or the filler
+    CHECK(f.size() == 10);  // nothing seeded inside the jump/index tables or the filler
     if (f.contains(0x11300) && f.at(0x11300).jtabs.size() == 1) {
         auto& t = f.at(0x11300).jtabs[0];  // proven by value ranges, not by a cmp next to the jump
         CHECK(t.how == "range" && t.bounded && t.first == 0);
@@ -276,8 +289,33 @@ int main() {
         }
     }
 
+    // ---------------------------------------------------------------- SSE NaN rules (x86, host-independent)
+    {
+        using namespace qilin::rt;
+        const uint32_t qa = 0x7FC00001u, qb = 0xFFC00002u, sa = 0x7F800003u;  // QNaN, QNaN, SNaN
+        CHECK(addss(qa, qb) == qa);                  // both NaN: the first operand's
+        CHECK(subss(qb, qa) == qb);
+        CHECK(mulss(0x3F800000u, qb) == qb);         // one NaN: that one
+        CHECK(divss(sa, 0x3F800000u) == 0x7FC00003u);  // SNaN: quietened
+        CHECK(addss(0x7F800000u, 0xFF800000u) == 0xFFC00000u);  // inf - inf: default NaN
+        CHECK(mulss(0u, 0x7F800000u) == 0xFFC00000u);          // 0 * inf
+        CHECK(divss(0u, 0u) == 0xFFC00000u);                   // 0 / 0
+        CHECK(sqrtss(0xBF800000u) == 0xFFC00000u);             // sqrt(-1)
+        CHECK(sqrtss(sa) == 0x7FC00003u);
+        CHECK(addss(0x3F800000u, 0x40000000u) == 0x40400000u);  // 1 + 2 = 3
+    }
+
     // ---------------------------------------------------------------- lifter
     Lifter lifter(dec);
+    if (f.contains(0x11360)) {
+        auto r = lifter.lift(f.at(0x11360));
+        CHECK(r.has_value());
+        if (r) {
+            CHECK(r->contains("rt::rep_movs_back(m, esi, edi, ecx, 4u, 0x11361u);"));  // DF = 1 after std
+            CHECK(r->contains("if (a != b) break;") && r->contains("if (ran) {") && r->contains("zf = r == 0;"));
+            CHECK(r->contains("esi += 1u; edi += 1u;"));  // DF = 0 again after cld
+        }
+    }
     if (f.contains(0x11340)) {
         auto r = lifter.lift(f.at(0x11340));  // negative cases: unsigned values of ecx
         CHECK(r.has_value() && r->contains("case 4294967292u: goto L_00011353;") &&
@@ -306,8 +344,19 @@ int main() {
         CHECK(r.has_value() && r->contains("switch (ecx)"));
     }
     if (f.contains(0x11000)) {
+        // Calls: push the guest return address, write back, call, reload, check the return.
         auto r = lifter.lift(f.at(0x11000));
-        CHECK(!r && r.error().kind == LiftFailure::Kind::NotLeaf);
+        CHECK(r.has_value());
+        if (r) {
+            CHECK(r->contains("esp -= 4u; rt::st32(m, esp, 0x11005u, 0x11000u); writeback(); fn_00011010(c); reload(); "
+                              "rt::check_return(c, 0x11005u, 0x11000u); }"));
+            CHECK(r->contains("fn_00011100(c);") && r->contains("fn_00011130(c);"));
+            CHECK(r->contains("auto reload = [&] { esp = c.esp; };"));
+        }
+    }
+    if (f.contains(0x112D0)) {
+        auto r = lifter.lift(f.at(0x112D0));  // __ehhandler stub: mov eax, &FuncInfo; jmp __CxxFrameHandler
+        CHECK(r.has_value() && r->contains("eax = 0x12040u;") && r->contains("writeback(); fn_00011130(c); return;  // tail call"));
     }
     if (f.contains(0x11130)) {
         auto r = lifter.lift(f.at(0x11130));

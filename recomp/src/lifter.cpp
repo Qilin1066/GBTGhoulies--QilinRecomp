@@ -19,7 +19,6 @@ std::string LiftFailure::message() const {
 
 std::string LiftFailure::category() const {
     switch (kind) {
-        case Kind::NotLeaf: return "not a leaf (calls, tail jumps or indirect jumps): slice 2";
         case Kind::Fragment: return "not a whole function: " + detail;
         case Kind::Unsupported: return std::format("instruction not supported yet [{}]", mnemonic);
         case Kind::X87: return std::format("x87 not supported yet (slice 3) [{}]", mnemonic);
@@ -60,8 +59,8 @@ std::optional<Cond> cond_of(ZydisMnemonic m) {
         case ZYDIS_MNEMONIC_JNS: case ZYDIS_MNEMONIC_SETNS: case ZYDIS_MNEMONIC_CMOVNS: return Cond{SF, "!sf"};
         case ZYDIS_MNEMONIC_JP: case ZYDIS_MNEMONIC_SETP: case ZYDIS_MNEMONIC_CMOVP: return Cond{PF, "pf"};
         case ZYDIS_MNEMONIC_JNP: case ZYDIS_MNEMONIC_SETNP: case ZYDIS_MNEMONIC_CMOVNP: return Cond{PF, "!pf"};
-        case ZYDIS_MNEMONIC_JL: case ZYDIS_MNEMONIC_SETL: case ZYDIS_MNEMONIC_CMOVL: return Cond{SF | OF, "(sf != of)"};
-        case ZYDIS_MNEMONIC_JNL: case ZYDIS_MNEMONIC_SETNL: case ZYDIS_MNEMONIC_CMOVNL: return Cond{SF | OF, "(sf == of)"};
+        case ZYDIS_MNEMONIC_JL: case ZYDIS_MNEMONIC_SETL: case ZYDIS_MNEMONIC_CMOVL: return Cond{SF | OF, "sf != of"};
+        case ZYDIS_MNEMONIC_JNL: case ZYDIS_MNEMONIC_SETNL: case ZYDIS_MNEMONIC_CMOVNL: return Cond{SF | OF, "sf == of"};
         case ZYDIS_MNEMONIC_JLE: case ZYDIS_MNEMONIC_SETLE: case ZYDIS_MNEMONIC_CMOVLE: return Cond{ZF | SF | OF, "(zf || sf != of)"};
         case ZYDIS_MNEMONIC_JNLE: case ZYDIS_MNEMONIC_SETNLE: case ZYDIS_MNEMONIC_CMOVNLE: return Cond{ZF | SF | OF, "(!zf && sf == of)"};
         default: return std::nullopt;
@@ -128,6 +127,13 @@ FlagFx flag_fx(const Insn& i) {
             return {0, CF, CF};
         case ZYDIS_MNEMONIC_CMC:
             return {CF, CF, CF};
+        case ZYDIS_MNEMONIC_CMPSB: case ZYDIS_MNEMONIC_CMPSW: case ZYDIS_MNEMONIC_CMPSD:
+            // rep: with ecx = 0 nothing runs and the flags pass through.
+            return i.has_rep() ? FlagFx{0, 0, 0} : FlagFx{0, ALLF, ALLF};
+        case ZYDIS_MNEMONIC_CALL:
+            // The callee's flags aren't modelled: any flag read after a call
+            // (before a write) is reported, never guessed.
+            return {0, ALLF, 0};
         case ZYDIS_MNEMONIC_PUSHF: case ZYDIS_MNEMONIC_PUSHFD:
             // Copies every flag, defined or not, to the stack (CPUID probes):
             // rejected as unsupported, not as a read of an undefined flag.
@@ -227,6 +233,14 @@ private:
         out_ += '\n';
     }
     void emit(const Insn& i, uint8_t live_out);
+    // Direction flag at instruction i (0 or 1; unknown is an error).
+    int direction(const Insn& i) const {
+        if (df_now_ > 1) unsupported(i, "direction flag not known statically");
+        return df_now_;
+    }
+    uint8_t df_now_ = 0;
+    // Backward branches (loops) tick in test builds, so a harness can stop a runaway loop.
+    static std::string tick(const Insn& i, uint32_t t) { return t <= i.addr ? "QILIN_TICK(); " : ""; }
     void emit_szp(uint8_t need, int w);
     void check_stack_balance(const std::vector<std::vector<size_t>>& succ);
 
@@ -236,6 +250,7 @@ private:
     std::unordered_map<uint32_t, size_t> idx_;
     uint16_t used_ = 0;     // bit g: GPR g referenced; bit 8+x: xmm x referenced
     uint16_t written_ = 0;  // same bits: modified
+    bool calls_ = false;    // has a call that returns here (needs reload())
     std::string out_;
 };
 
@@ -359,7 +374,10 @@ void FnEmitter::emit_szp(uint8_t need, int w) {
 void FnEmitter::emit(const Insn& i, uint8_t live_out) {
     const FlagFx fx = flag_fx(i);
     uint8_t need = live_out & fx.kill;
-    if (need & ~fx.defined) fail(i, LiftFailure::Kind::UndefinedFlag, "a later instruction reads a flag this one leaves undefined");
+    if (need & ~fx.defined)
+        fail(i, LiftFailure::Kind::UndefinedFlag,
+             i.is_call() ? "a flag is read after this call before being written (the callee's flags aren't modelled)"
+                         : "a later instruction reads a flag this one leaves undefined");
     if (is_shift(i.mnem) && shift_by_cl(i)) {
         // Count in cl may be 0 (flags unchanged) or > 1 (OF undefined): only CF/ZF/SF/PF are safe to model.
         if (live_out & (OF | AF)) fail(i, LiftFailure::Kind::UndefinedFlag, "OF/AF read after a shift by cl");
@@ -372,7 +390,9 @@ void FnEmitter::emit(const Insn& i, uint8_t live_out) {
 
     if (auto c = cond_of(M)) {
         if (i.is_cond_branch()) {
-            line(std::format("if ({}) goto L_{:08X};", c->expr, *i.rel_target()));
+            const uint32_t t = *i.rel_target();
+            if (idx_.contains(t)) line(std::format("if ({}) {{ {}goto L_{:08X}; }}", c->expr, tick(i, t), t));
+            else line(std::format("if ({}) {{ QILIN_TAIL(); writeback(); {}(c); return; }}  // conditional tail call", c->expr, Lifter::name(t)));
             return;
         }
         if (is_setcc(M)) {
@@ -388,7 +408,6 @@ void FnEmitter::emit(const Insn& i, uint8_t live_out) {
 
     switch (M) {
         case ZYDIS_MNEMONIC_NOP:
-        case ZYDIS_MNEMONIC_CLD:  // DF is assumed clear everywhere (MSVC ABI)
         case ZYDIS_MNEMONIC_PREFETCHNTA: case ZYDIS_MNEMONIC_PREFETCHT0: case ZYDIS_MNEMONIC_PREFETCHT1:
         case ZYDIS_MNEMONIC_PREFETCHT2:
             return;
@@ -603,6 +622,26 @@ void FnEmitter::emit(const Insn& i, uint8_t live_out) {
             mark(EBP);
             line(std::format("esp = ebp; ebp = rt::ld32(m, esp, 0x{:X}u); esp += 4u;", i.addr));
             return;
+        case ZYDIS_MNEMONIC_CALL: {
+            // The target operand is read before the push (`call [esp+4]` sees the old esp).
+            std::string target;
+            const auto t = i.rel_target();
+            if (!t) {
+                if (width(i, d) != 32) unsupported(i, "16-bit indirect call");
+                target = read(i, d, 32);
+            }
+            mark(ESP);
+            const uint32_t ret = i.end();
+            std::string code = "{ ";
+            if (!t) code += std::format("const uint32_t t = {}; ", target);
+            code += std::format("esp -= 4u; rt::st32(m, esp, 0x{:X}u, 0x{:X}u); writeback(); ", ret, i.addr);
+            code += t ? std::format("{}(c); ", Lifter::name(*t)) : std::string("rt::call(c, t); ");
+            if (idx_.contains(ret)) code += std::format("reload(); rt::check_return(c, 0x{:X}u, 0x{:X}u); }}", ret, i.addr);
+            else code += std::format("rt::trap(0x{:X}u, \"returned from a call the CFG took as no-return\"); }}", i.addr);
+            line(code);
+            calls_ = true;
+            return;
+        }
         case ZYDIS_MNEMONIC_RET: {
             const uint32_t n = i.nops >= 1 && d.kind == Operand::Kind::Imm ? uint32_t(d.imm & 0xFFFF) : 0;
             mark(ESP);
@@ -611,13 +650,20 @@ void FnEmitter::emit(const Insn& i, uint8_t live_out) {
         }
         case ZYDIS_MNEMONIC_JMP: {
             if (auto t = i.rel_target()) {
-                line(std::format("goto L_{:08X};", *t));
+                if (idx_.contains(*t)) line(std::format("{}goto L_{:08X};", tick(i, *t), *t));
+                else line(std::format("QILIN_TAIL(); writeback(); {}(c); return;  // tail call", Lifter::name(*t)));
                 return;
             }
             const auto jt = std::ranges::find(f_.jtabs, i.addr, &JumpTable::at);
-            if (jt == f_.jtabs.end())
-                fail(i, LiftFailure::Kind::BadControlFlow, "indirect jump that is not a resolved jump table");
+            if (jt == f_.jtabs.end()) {
+                // Indirect tail call (jmp eax, jmp [eax+0x14], jmp [0x304EC4]).
+                if (width(i, d) != 32) unsupported(i, "16-bit indirect jump");
+                line(std::format("{{ const uint32_t t = {}; QILIN_TAIL(); writeback(); rt::call(c, t); return; }}  // indirect tail call",
+                                 read(i, d, 32)));
+                return;
+            }
             use(gpr(d.index)->gpr);
+            if (std::ranges::any_of(jt->targets, [&](uint32_t x) { return x <= i.addr; })) line("QILIN_TICK();");
             line(std::format("switch ({}) {{", gpr(d.index)->name()));
             for (size_t k = 0; k < jt->entries.size(); ++k)
                 if (jt->entries[k])
@@ -626,33 +672,76 @@ void FnEmitter::emit(const Insn& i, uint8_t live_out) {
             line("}");
             return;
         }
-        // ---- string ops (DF = 0); F2 and F3 both mean rep for stos/movs ----
-        case ZYDIS_MNEMONIC_STOSB: case ZYDIS_MNEMONIC_STOSD: {
-            const bool b = M == ZYDIS_MNEMONIC_STOSB;
+        // ---- string ops. DF is tracked statically (df_now_); F2 and F3 both
+        // mean rep for stos/movs, F3 is repe and F2 repne for cmps ----
+        case ZYDIS_MNEMONIC_STD: case ZYDIS_MNEMONIC_CLD:
+            return;  // the direction is resolved per string instruction at lift time
+        case ZYDIS_MNEMONIC_STOSB: case ZYDIS_MNEMONIC_STOSW: case ZYDIS_MNEMONIC_STOSD: {
+            const int sz = M == ZYDIS_MNEMONIC_STOSB ? 1 : M == ZYDIS_MNEMONIC_STOSW ? 2 : 4;
+            if (direction(i) != 0) unsupported(i, "stos with the direction flag set");
             use(EAX);
             mark(EDI);
             if (i.has_rep()) {
                 mark(ECX);
-                line(std::format("rt::rep_stos{}(m, edi, ecx, eax, 0x{:X}u);", b ? 8 : 32, i.addr));
-            } else if (b) {
-                line(std::format("rt::st8(m, edi, uint8_t(eax), 0x{:X}u); edi += 1u;", i.addr));
+                line(std::format("rt::rep_stos{}(m, edi, ecx, eax, 0x{:X}u);", sz * 8, i.addr));
             } else {
-                line(std::format("rt::st32(m, edi, eax, 0x{:X}u); edi += 4u;", i.addr));
+                line(std::format("rt::st{0}(m, edi, uint{0}_t(eax), 0x{1:X}u); edi += {2}u;", sz * 8, i.addr, sz));
             }
             return;
         }
-        case ZYDIS_MNEMONIC_MOVSB: case ZYDIS_MNEMONIC_MOVSD: {
+        case ZYDIS_MNEMONIC_MOVSB: case ZYDIS_MNEMONIC_MOVSW: case ZYDIS_MNEMONIC_MOVSD: {
             if (M == ZYDIS_MNEMONIC_MOVSD && i.nops > 0) unsupported(i, "SSE2 movsd");  // (implausible on a P3 anyway)
-            const int sz = M == ZYDIS_MNEMONIC_MOVSB ? 1 : 4;
+            const int sz = M == ZYDIS_MNEMONIC_MOVSB ? 1 : M == ZYDIS_MNEMONIC_MOVSW ? 2 : 4;
+            const bool back = direction(i) == 1;
             mark(ESI);
             mark(EDI);
             if (i.has_rep()) {
                 mark(ECX);
-                line(std::format("rt::rep_movs(m, esi, edi, ecx, {}u, 0x{:X}u);", sz, i.addr));
-            } else if (sz == 1) {
-                line(std::format("rt::st8(m, edi, rt::ld8(m, esi, 0x{0:X}u), 0x{0:X}u); esi += 1u; edi += 1u;", i.addr));
+                line(std::format("rt::rep_movs{}(m, esi, edi, ecx, {}u, 0x{:X}u);", back ? "_back" : "", sz, i.addr));
             } else {
-                line(std::format("rt::st32(m, edi, rt::ld32(m, esi, 0x{0:X}u), 0x{0:X}u); esi += 4u; edi += 4u;", i.addr));
+                line(std::format("rt::st{0}(m, edi, rt::ld{0}(m, esi, 0x{1:X}u), 0x{1:X}u); esi {2}= {3}u; edi {2}= {3}u;", sz * 8,
+                                 i.addr, back ? '-' : '+', sz));
+            }
+            return;
+        }
+        case ZYDIS_MNEMONIC_CMPSB: case ZYDIS_MNEMONIC_CMPSW: case ZYDIS_MNEMONIC_CMPSD: {
+            if (M == ZYDIS_MNEMONIC_CMPSD && i.nops > 0) unsupported(i, "SSE2 cmpsd");
+            const int sz = M == ZYDIS_MNEMONIC_CMPSB ? 1 : M == ZYDIS_MNEMONIC_CMPSW ? 2 : 4;
+            const int w = sz * 8;
+            const char step = direction(i) == 1 ? '-' : '+';
+            mark(ESI);
+            mark(EDI);
+            // Flags of the last comparison: [esi] - [edi].
+            auto flags = [&](uint8_t want) {
+                line(std::format("[[maybe_unused]] uint32_t r = {};", masked("a - b", w)));
+                if (want & CF) line("cf = a < b;");
+                if (want & OF) line(std::format("of = ((a ^ b) & (a ^ r) & 0x{:X}u) != 0;", sign_of(w)));
+                if (want & AF) line("af = ((a ^ b ^ r) & 0x10u) != 0;");
+                emit_szp(want, w);
+            };
+            auto load = [&](const char* r) { return std::format("uint32_t(rt::ld{}(m, {}, 0x{:X}u))", w, r, i.addr); };
+            if (i.has_rep()) {
+                // repe: continue while equal; repne: while not equal. With ecx = 0
+                // nothing runs and the flags keep their values.
+                mark(ECX);
+                line("{");
+                line("uint32_t a = 0u, b = 0u; bool ran = false;");
+                line(std::format("while (ecx) {{ a = {}; b = {}; esi {}= {}u; edi {}= {}u; ecx -= 1u; ran = true; if (a {} b) break; }}",
+                                 load("esi"), load("edi"), step, sz, step, sz, i.has_repne() ? "==" : "!="));
+                if (live_out & ALLF) {
+                    line("if (ran) {");
+                    flags(live_out);
+                    line("}");
+                } else {
+                    line("(void)ran;");
+                }
+                line("}");
+            } else {
+                line("{");
+                line(std::format("const uint32_t a = {}, b = {}; esi {}= {}u; edi {}= {}u;", load("esi"), load("edi"), step, sz,
+                                 step, sz));
+                flags(need);
+                line("}");
             }
             return;
         }
@@ -676,9 +765,9 @@ void FnEmitter::emit(const Insn& i, uint8_t live_out) {
             return;
         }
         case ZYDIS_MNEMONIC_ADDSS: case ZYDIS_MNEMONIC_SUBSS: case ZYDIS_MNEMONIC_MULSS: case ZYDIS_MNEMONIC_DIVSS: {
-            const char* op = M == ZYDIS_MNEMONIC_ADDSS ? "+" : M == ZYDIS_MNEMONIC_SUBSS ? "-" : M == ZYDIS_MNEMONIC_MULSS ? "*" : "/";
+            const char* op = M == ZYDIS_MNEMONIC_ADDSS ? "addss" : M == ZYDIS_MNEMONIC_SUBSS ? "subss" : M == ZYDIS_MNEMONIC_MULSS ? "mulss" : "divss";
             const int x = xmm_dst(i, d);
-            line(std::format("xmm{0}.u[0] = rt::u32(rt::f32(xmm{0}.u[0]) {1} rt::f32({2}));", x, op, xmm_lane0(i, s)));
+            line(std::format("xmm{0}.u[0] = rt::{1}(xmm{0}.u[0], {2});", x, op, xmm_lane0(i, s)));
             return;
         }
         case ZYDIS_MNEMONIC_MINSS: case ZYDIS_MNEMONIC_MAXSS: {
@@ -688,7 +777,7 @@ void FnEmitter::emit(const Insn& i, uint8_t live_out) {
             return;
         }
         case ZYDIS_MNEMONIC_SQRTSS:
-            line(std::format("xmm{}.u[0] = rt::u32(std::sqrt(rt::f32({})));", xmm_dst(i, d), xmm_lane0(i, s)));
+            line(std::format("xmm{}.u[0] = rt::sqrtss({});", xmm_dst(i, d), xmm_lane0(i, s)));
             return;
         case ZYDIS_MNEMONIC_XORPS: case ZYDIS_MNEMONIC_ANDPS: case ZYDIS_MNEMONIC_ORPS: case ZYDIS_MNEMONIC_ANDNPS: {
             const int x = xmm_dst(i, d);
@@ -764,6 +853,11 @@ void FnEmitter::check_stack_balance(const std::vector<std::vector<size_t>>& succ
                 st.esp = st.ebp == UNK ? UNK : st.ebp + 4;
                 st.ebp = UNK;
                 break;
+            case ZYDIS_MNEMONIC_CALL:
+                // The callee pops its return address, and its arguments too
+                // if it ends in `ret n`: n isn't known here.
+                st.esp = UNK;
+                break;
             case ZYDIS_MNEMONIC_RET:
                 if (st.esp != UNK && st.esp != 0)
                     fail(i, LiftFailure::Kind::Fragment, std::format("stack not balanced at ret (esp {:+})", st.esp));
@@ -806,8 +900,6 @@ void FnEmitter::check_stack_balance(const std::vector<std::vector<size_t>>& succ
 }
 
 std::string FnEmitter::run() {
-    if (!f_.calls.empty() || !f_.tails.empty() || !f_.icalls.empty() || !f_.ijmps.empty())
-        throw Abort{{LiftFailure::Kind::NotLeaf, f_.start, {}, {}, "calls, tail jumps or unresolved indirect jumps"}};
     for (const uint32_t a : f_.insns) {
         idx_[a] = ins_.size();
         ins_.push_back(dec_.decode(a));
@@ -829,7 +921,7 @@ std::string FnEmitter::run() {
         if (i.is_ret() || i.mnem == ZYDIS_MNEMONIC_INT3) continue;
         if (i.is_jmp()) {
             if (auto t = i.rel_target()) {
-                succ[k].push_back(need_idx(i, *t));
+                if (idx_.contains(*t)) succ[k].push_back(idx_.at(*t));  // else a tail call: an exit
             } else if (auto jt = std::ranges::find(f_.jtabs, i.addr, &JumpTable::at); jt != f_.jtabs.end()) {
                 for (const uint32_t x : jt->targets) succ[k].push_back(need_idx(i, x));
             }
@@ -838,8 +930,11 @@ std::string FnEmitter::run() {
         if (i.is_cond_branch()) {
             auto t = i.rel_target();
             if (!t) fail(i, LiftFailure::Kind::BadControlFlow, "conditional branch without a target");
-            succ[k].push_back(need_idx(i, *t));
+            if (idx_.contains(*t)) succ[k].push_back(idx_.at(*t));  // else a conditional tail call
         }
+        // A call the CFG took as no-return (int3 or the end of the function
+        // follows) has no fallthrough; the generated code traps if it returns.
+        if (i.is_call() && !idx_.contains(i.end())) continue;
         falls[k] = true;
         succ[k].push_back(need_idx(i, i.end()));
     }
@@ -865,11 +960,50 @@ std::string FnEmitter::run() {
     if (live_in[idx_.at(f_.start)])
         throw Abort{{LiftFailure::Kind::Fragment, f_.start, {}, {}, "flags are read before being written"}};
 
+    // Direction flag, forward: clear on entry and after a call (MSVC ABI), set
+    // by std, cleared by cld; 2 = differs between paths. It must be clear at
+    // every call and exit.
+    std::vector<uint8_t> df(n, 0xFF);
+    {
+        std::vector<bool> has_pred(n, false);
+        for (size_t k = 0; k < n; ++k)
+            for (const size_t t : succ[k]) has_pred[t] = true;
+        std::vector<size_t> work;
+        for (size_t k = 0; k < n; ++k)
+            if (!has_pred[k] || ins_[k]->addr == f_.start) {
+                df[k] = 0;
+                work.push_back(k);
+            }
+        while (!work.empty()) {
+            const size_t k = work.back();
+            work.pop_back();
+            const ZydisMnemonic mn = ins_[k]->mnem;
+            const uint8_t out = mn == ZYDIS_MNEMONIC_STD ? 1 : (mn == ZYDIS_MNEMONIC_CLD || ins_[k]->is_call()) ? 0 : df[k];
+            for (const size_t t : succ[k]) {
+                const uint8_t v = df[t] == 0xFF ? out : (df[t] == out ? out : 2);
+                if (v != df[t]) {
+                    df[t] = v;
+                    work.push_back(t);
+                }
+            }
+        }
+        for (size_t k = 0; k < n; ++k) {
+            const Insn& i = *ins_[k];
+            const bool exits = i.is_call() || i.is_ret() || (i.is_jmp() && !(i.rel_target() && idx_.contains(*i.rel_target()))) ||
+                               (i.is_cond_branch() && i.rel_target() && !idx_.contains(*i.rel_target()));
+            if (exits && df[k] != 0 && df[k] != 0xFF) unsupported(i, "direction flag set at a call or exit");
+        }
+    }
+
     // Labels: every branch target and every non-adjacent fallthrough.
     std::set<uint32_t> labels;
-    for (size_t k = 0; k < n; ++k)
+    for (size_t k = 0; k < n; ++k) {
         for (const size_t s : succ[k])
             if (!(falls[k] && s == k + 1 && ins_[k]->end() == ins_[s]->addr)) labels.insert(ins_[s]->addr);
+        // A branch to the next instruction (jnz $+2) still names its target.
+        if (ins_[k]->is_cond_branch())
+            if (auto t = ins_[k]->rel_target(); t && idx_.contains(*t)) labels.insert(*t);
+    }
     if (ins_.front()->addr != f_.start) labels.insert(f_.start);
 
     if (ins_.front()->addr != f_.start) out_ += std::format("    goto L_{:08X};\n", f_.start);
@@ -877,6 +1011,7 @@ std::string FnEmitter::run() {
         const Insn& i = *ins_[k];
         if (labels.contains(i.addr)) out_ += std::format("L_{:08X}:;\n", i.addr);
         out_ += std::format("    // {:08X}  {}\n", i.addr, dec_.format(i));
+        df_now_ = df[k] == 0xFF ? 0 : df[k];
         emit(i, live_out[k]);
         if (falls[k] && !(k + 1 < n && ins_[k + 1]->addr == i.end())) out_ += std::format("    goto L_{:08X};\n", i.end());
     }
@@ -894,11 +1029,21 @@ std::string FnEmitter::run() {
     }
 
     std::string fn = std::format("void {}(rt::Context& c) {{\n", Lifter::name(f_.start));
+    fn += std::format("    QILIN_FRAME(0x{:X}u, c.esp);\n", f_.start);
     fn += "    [[maybe_unused]] const rt::Mem m{c.mem, c.mem_size};\n";
     if (!gprs.empty()) fn += std::format("    uint32_t {};\n", gprs);
     if (!xmms.empty()) fn += std::format("    rt::Xmm {};\n", xmms);
     fn += "    [[maybe_unused]] bool cf = false, pf = false, af = false, zf = false, sf = false, of = false;\n";
     fn += std::format("    [[maybe_unused]] auto writeback = [&] {{{} }};\n", wb);
+    if (calls_) {
+        // After a call: the callee may have changed any register.
+        std::string rl;
+        for (int g = 0; g < 8; ++g)
+            if (used_ & (1u << g)) rl += std::format(" {0} = c.{0};", kGpr[size_t(g)]);
+        for (int x = 0; x < 8; ++x)
+            if (used_ & (1u << (8 + x))) rl += std::format(" xmm{0} = c.xmm[{0}];", x);
+        fn += std::format("    [[maybe_unused]] auto reload = [&] {{{} }};\n", rl);
+    }
     fn += out_;
     fn += "}\n";
     return fn;
