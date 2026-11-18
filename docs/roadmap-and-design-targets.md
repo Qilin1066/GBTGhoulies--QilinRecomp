@@ -3,7 +3,7 @@
 **Guiding principle: efficiency and reliability come first.** Every design choice is judged on whether it makes the game cheaper to run on low-end hardware and whether it fails loudly and predictably instead of silently misbehaving.
 
 ## Targets
-- **Platforms:** 64-bit Windows, Linux and macOS (Apple Silicon), on x86-64 or ARM64, with Vulkan. See *Hardware scope* below.
+- **Platforms:** 64-bit Windows, Linux and macOS (Intel and Apple Silicon), on x86-64 or ARM64, with Vulkan. See *Hardware scope* below.
 - **Language:** **C++23** throughout (recompiler, generated code and runtime). Minimum compilers: GCC 14, Clang 19, Xcode 16, Visual Studio 2022 17.10. No DirectX anywhere.
 - **Graphics API:** **Vulkan 1.3, and only Vulkan.** We require the 1.3 core API, and only the optional features and limits that Mesa's v3dv driver on a Pi 4 provides, so one render path works everywhere (MoltenVK on macOS). See *Vulkan baseline* below.
 - **Reference:** xemu running the original game is ground truth for behaviour and visuals. The existing Windows-only Ghoulies PC Recomp (xboxrecomp-based, D3D11) is a second behavioural reference; its known-issue list doubles as a regression checklist (see `prior-art.md`).
@@ -31,15 +31,15 @@
 ## Hardware scope
 **Supported: 64-bit hosts with a Vulkan 1.3 driver.** In practice that means:
 - **Windows and Linux** on x86-64 or ARM64 with a Vulkan-capable GPU and driver;
-- **macOS on Apple Silicon**, through MoltenVK (Vulkan on top of Metal);
+- **macOS on Intel and Apple Silicon Macs**, through MoltenVK (Vulkan on top of Metal): any Mac with a Metal GPU running macOS 12 or later, the oldest release current MoltenVK supports (v1.4.2 raised its floor from 10.15 to 12). Builds target macOS 12 and CI builds both architectures;
 - **ARM boards** with Vulkan 1.3 drivers, e.g. Raspberry Pi 4 and newer (Mesa v3dv, Mesa 24.3 or later).
 
-**Out of scope:** anything without Vulkan 1.3 (or, on Apple, a Vulkan translation layer that provides it), and 32-bit hosts. That rules out the Raspberry Pi 1–3 and Zero (OpenGL ES 2 only), and Intel Macs aren't a target. Because of this there is one renderer (Vulkan) and one memory model: the Xbox's 4 GB address space mapped flat into a 64-bit host's address space, with no windowing cost on memory accesses.
+**Out of scope:** anything without Vulkan 1.3 (or, on Apple, a Vulkan translation layer that provides it), and 32-bit hosts. That rules out the Raspberry Pi 1–3 and Zero (OpenGL ES 2 only), the first Intel Macs (32-bit Core Duo, 2006, and no Metal), and Macs without a Metal GPU or that can't run macOS 12. Because of this there is one renderer (Vulkan) and one memory model: the Xbox's 4 GB address space mapped flat into a 64-bit host's address space, with no windowing cost on memory accesses.
 
 ### Vulkan baseline: 1.3
 The renderer targets **Vulkan 1.3** as its minimum API version, chosen for how widely it's supported:
 - **Raspberry Pi 4 and 5:** Mesa's v3dv driver is Vulkan 1.3 conformant from Mesa 24.3.
-- **macOS:** MoltenVK supports Vulkan 1.3 from v1.3.0.
+- **macOS:** MoltenVK supports Vulkan 1.3 from v1.3.0, on Intel and Apple GPUs alike. Older Intel GPUs may lack some of the v3dv feature set; the start-up check names what's missing.
 - **Windows and Linux:** current desktop GPU drivers (AMD, Intel, NVIDIA, Mesa) all ship 1.3.
 
 1.3 makes several things core that would otherwise be extensions to probe for, and the renderer is designed around them:
@@ -60,7 +60,7 @@ All enhancements live behind a settings file with presets, e.g.:
 
 ## Roadmap
 1. **Analysis** ✅ headers, sections, kernel imports, XDK versions; function discovery, CFG, library boundaries, instruction profile, raw NV2A usage, asset formats.
-2. **Recompiler core (C++23):** ✅ done, repo `Tecboy1066/GBTG-Qilincomp`. ✅ XBE loader, ✅ Zydis decoder (100% agreement with LLVM on every reachable instruction), ✅ CFG port + data-as-code validation (8,842 functions), ✅ every byte of the lifted code accounted for (`qilin coverage`), ✅ every jump table in lifted code has a proven size (value-range analysis), ✅ lifter slice 1: integer + scalar SSE, ✅ lifter slice 2: direct, indirect and tail calls, generated function table, indirect-call dispatch with a trap on unknown targets, ✅ lifter slice 3: x87 with precision control, ✅ C++ exception frames, ✅ every function lifts (all 5,743 across game code and Rare libraries; 3 Bink functions there are replaced with Bink; since v0.11.0 also the 265 C runtime functions that code can reach, 6,008 in all), ✅ differential test against the original x86 under Unicorn, whole call trees, x87 state and the exception chain included (45,959 trials at -O2 plus a UBSan run, 0 mismatches; v0.11.0 with the CRT: 36,048 trials over 6,008 functions, 12,631 more over the CRT, 3,000 `sprintf` format strings, 0 mismatches), ✅ CI with warnings as errors on Linux x64 (GCC 14, Clang 19), Linux ARM64, macOS ARM64, Windows. ✅ x87 transcendentals with the same bits on every host. See `recompiler-core.md`.
+2. **Recompiler core (C++23):** ✅ done, repo `Tecboy1066/GBTG-Qilincomp`. ✅ XBE loader, ✅ Zydis decoder (100% agreement with LLVM on every reachable instruction), ✅ CFG port + data-as-code validation (8,842 functions), ✅ every byte of the lifted code accounted for (`qilin coverage`), ✅ every jump table in lifted code has a proven size (value-range analysis), ✅ lifter slice 1: integer + scalar SSE, ✅ lifter slice 2: direct, indirect and tail calls, generated function table, indirect-call dispatch with a trap on unknown targets, ✅ lifter slice 3: x87 with precision control, ✅ C++ exception frames, ✅ every function lifts (all 5,743 across game code and Rare libraries; 3 Bink functions there are replaced with Bink; since v0.11.0 also the 265 C runtime functions that code can reach, 6,008 in all), ✅ differential test against the original x86 under Unicorn, whole call trees, x87 state and the exception chain included (45,959 trials at -O2 plus a UBSan run, 0 mismatches; v0.11.0 with the CRT: 36,048 trials over 6,008 functions, 12,631 more over the CRT, 3,000 `sprintf` format strings, 0 mismatches), ✅ CI with warnings as errors on Linux x64 (GCC 14, Clang 19), Linux ARM64, macOS ARM64 and x64, Windows. ✅ x87 transcendentals with the same bits on every host. See `recompiler-core.md`.
 3. **Runtime skeleton:** 🔨 in progress (`runtime.md`). ✅ `qilin_run` loads the XBE into 64 MB of guest RAM, sets up the stack, thread information block and kernel imports, and calls the lifted `main`; ✅ replacement registry that stops on anything unregistered, naming it and its caller; ✅ guest heap; ✅ first XAPI replacements; ✅ the C runtime lifted, its initializers run as XAPI ran them. To do: replacements for the rest of what the game calls (252 library entry points directly, plus kernel imports; `_CxxThrowException` stops with a diagnostic), next the kernel functions behind the C runtime's start-up (critical sections, TLS, heap); threads; file system over the extracted disc.
 4. **Boot to first frame:** run the entry point natively, push the first Clear/Present through Vulkan.
 5. **Playable at original spec:** 640×480, 4:3, original frame rate; matches xemu; tested on low-end reference hardware at every milestone.

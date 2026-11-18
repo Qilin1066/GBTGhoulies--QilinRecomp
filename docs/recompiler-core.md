@@ -7,11 +7,11 @@ Everything is **C++23**: the recompiler, the runtime header and the generated co
 
 Minimum compilers are GCC 14, Clang 19, Xcode 16 and Visual Studio 2022 17.10. CMake checks these at configure time. Clang 18 is excluded because it can't use libstdc++'s `std::expected`.
 
-CI builds with warnings as errors (`-Wall -Wextra -Wpedantic -Wshadow`, MSVC `/W4`) on five configurations:
+CI builds with warnings as errors (`-Wall -Wextra -Wpedantic -Wshadow`, MSVC `/W4`) on six configurations:
 - Linux x64 with GCC 14
 - Linux x64 with Clang 19
 - Linux ARM64 with GCC 14
-- macOS ARM64
+- macOS ARM64 and macOS x64 (Intel), both built for macOS 12
 - Windows x64 with MSVC
 
 The generated code also has to be warning-free at `-Wall -Wextra`. The differential test compiles it with `-Werror`.
