@@ -1,4 +1,11 @@
 cmake_minimum_required(VERSION 3.25)
+# macOS: what players run (the runtime, qilin_run) is built for macOS 10.15,
+# the oldest macOS a Vulkan 1.3 MoltenVK runs on; so it avoids std::format,
+# which Apple's libc++ only has from 13.3 (recomp/runtime/strf.hpp). The
+# developer tools (qilin, the tests) need 13.3 and are built for it.
+if(APPLE AND NOT CMAKE_OSX_DEPLOYMENT_TARGET)
+    set(CMAKE_OSX_DEPLOYMENT_TARGET 10.15 CACHE STRING "oldest macOS the runtime runs on")
+endif()
 # The single source of the version number (see CHANGELOG.md for the scheme).
 project(GBTGQilincomp VERSION 0.12.0 LANGUAGES C CXX)
 
@@ -67,25 +74,41 @@ else()
     target_compile_options(qilin_runtime INTERFACE -ffp-contract=off -fno-fast-math)
 endif()
 
+# Developer tools on macOS: macOS 13.3 or later (std::format).
+function(qilin_tool target)
+    if(APPLE)
+        target_compile_options(${target} PRIVATE -mmacosx-version-min=13.3)
+        target_link_options(${target} PRIVATE -mmacosx-version-min=13.3)
+    endif()
+endfunction()
+
+# ---- The XBE loader: runtime code too ----
+add_library(qilin_xbe STATIC recomp/src/xbe.cpp)
+target_include_directories(qilin_xbe PUBLIC recomp/src recomp/runtime)
+target_link_libraries(qilin_xbe PRIVATE qilin_warnings)
+
 # ---- Recompiler core ----
 add_library(qilin_core STATIC
-    recomp/src/xbe.cpp
+    recomp/src/xbe_json.cpp
     recomp/src/decoder.cpp
     recomp/src/cfg.cpp
     recomp/src/vrange.cpp
     recomp/src/lifter.cpp
 )
 target_include_directories(qilin_core PUBLIC recomp/src)
-target_link_libraries(qilin_core PUBLIC Zydis qilin_runtime PRIVATE qilin_warnings)
+target_link_libraries(qilin_core PUBLIC qilin_xbe Zydis qilin_runtime PRIVATE qilin_warnings)
+qilin_tool(qilin_core)
 
 add_executable(qilin recomp/src/main.cpp)
 target_link_libraries(qilin PRIVATE qilin_core qilin_warnings)
+qilin_tool(qilin)
 target_compile_definitions(qilin PRIVATE QILIN_VERSION="${PROJECT_VERSION}")
 
 # ---- Tests (no game files needed) ----
 enable_testing()
 add_executable(qilin_tests recomp/tests/tests.cpp)
 target_link_libraries(qilin_tests PRIVATE qilin_core qilin_warnings)
+qilin_tool(qilin_tests)
 add_test(NAME qilin_tests COMMAND qilin_tests)
 
 # x87 transcendentals: fast paths against slow paths on each CI platform's compiler and CPU.
@@ -109,5 +132,5 @@ if(QILIN_GEN_DIR)
     add_executable(qilin_run recomp/runtime/host/run.cpp recomp/runtime/dispatch.cpp ${QILIN_GEN_SOURCES})
     target_include_directories(qilin_run PRIVATE "${QILIN_GEN_DIR}")
     target_compile_definitions(qilin_run PRIVATE QILIN_CHECKED_MEMORY)  # bring-up: bad guest accesses stop with an address
-    target_link_libraries(qilin_run PRIVATE qilin_host qilin_core)
+    target_link_libraries(qilin_run PRIVATE qilin_host qilin_xbe)
 endif()

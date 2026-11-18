@@ -17,9 +17,8 @@
 #include <cstdlib>
 #include <memory>
 #include <string_view>
-#include <print>
 
-#include "cfg.hpp"
+#include "regions.hpp"
 #include "host.hpp"
 #include "xbe.hpp"
 
@@ -51,7 +50,7 @@ void run_table(rt::Context& c, uint32_t lo, uint32_t hi) {
         const uint32_t fn = rt::ld32(m, a, 0);
         if (fn == 0 || fn == 0xFFFFFFFFu) continue;
         if (!rt::is_lifted(fn)) {
-            std::println("qilin_run: initializer {:08X} ({}) skipped: its library is replaced natively", fn, host::describe(fn));
+            std::printf("qilin_run: initializer %08X (%s) skipped: its library is replaced natively\n", fn, host::describe(fn).c_str());
             continue;
         }
         call_guest(c, fn, {});
@@ -96,7 +95,7 @@ int main(int argc, char** argv) {
         if (a == "--ram-mb" && k + 1 < argc) {
             ram_mb = uint32_t(std::strtoul(argv[++k], nullptr, 10));
             if (ram_mb < host::kRetailRamMb || ram_mb > host::kMaxRamMb || ram_mb % 4) {
-                std::println(stderr, "qilin_run: --ram-mb takes a multiple of 4 from {} to {}", host::kRetailRamMb, host::kMaxRamMb);
+                std::fprintf(stderr, "qilin_run: --ram-mb takes a multiple of 4 from %u to %u\n", host::kRetailRamMb, host::kMaxRamMb);
                 return 2;
             }
         } else if (!path) {
@@ -107,7 +106,7 @@ int main(int argc, char** argv) {
         }
     }
     if (!path) {
-        std::println(stderr, "usage: qilin_run [--ram-mb N] <default.xbe>   (N: guest RAM in MB, {} by default, as the retail Xbox)",
+        std::fprintf(stderr, "usage: qilin_run [--ram-mb N] <default.xbe>   (N: guest RAM in MB, %u by default, as the retail Xbox)\n",
                      host::kRetailRamMb);
         return 2;
     }
@@ -115,12 +114,12 @@ int main(int argc, char** argv) {
     const host::MemoryMap& mm = host::memory_map();
     auto loaded = Xbe::load(path);
     if (!loaded) {
-        std::println(stderr, "qilin_run: {}", loaded.error());
+        std::fprintf(stderr, "qilin_run: %s\n", loaded.error().c_str());
         return 2;
     }
     const Xbe& xbe = *loaded;
     if (xbe.image_end() > mm.stack_bottom()) {
-        std::println(stderr, "qilin_run: the image ends at {:08X}, inside the stack", xbe.image_end());
+        std::fprintf(stderr, "qilin_run: the image ends at %08X, inside the stack\n", xbe.image_end());
         return 2;
     }
 
@@ -128,7 +127,7 @@ int main(int argc, char** argv) {
     // calloc: the host maps zeroed pages lazily, so RAM the guest never touches costs nothing.
     const std::unique_ptr<uint8_t, decltype(&std::free)> ram(static_cast<uint8_t*>(std::calloc(mm.ram_size, 1)), &std::free);
     if (!ram) {
-        std::println(stderr, "qilin_run: can't allocate {} MB of guest RAM", ram_mb);
+        std::fprintf(stderr, "qilin_run: can't allocate %u MB of guest RAM\n", ram_mb);
         return 2;
     }
     std::memcpy(ram.get() + xbe.base, xbe.image().data(), xbe.image().size());
@@ -155,7 +154,7 @@ int main(int argc, char** argv) {
 
     // Code regions, for naming what the game calls.
     std::vector<host::Region> regions;
-    for (const auto& r : CfgConfig{}.text_regions) regions.push_back({r.lo, r.hi, r.name});
+    for (const auto& r : kTextRegions) regions.push_back({r.lo, r.hi, r.name});
     for (const auto& s : xbe.sections)
         if (s.code && s.name != ".text") regions.push_back({s.va, s.va + s.vsize, s.name});
     host::set_regions(std::move(regions));
@@ -174,11 +173,11 @@ int main(int argc, char** argv) {
     push(c, host::kReturnSentinel);
     host::set_current(&c);
 
-    std::println("qilin_run: {} MB of guest RAM, {} replacements registered; starting XAPI and the C runtime", ram_mb, host::hle_count());
+    std::printf("qilin_run: %u MB of guest RAM, %zu replacements registered; starting XAPI and the C runtime\n", ram_mb, host::hle_count());
     crt_startup(c);
-    std::println("qilin_run: calling main at {:08X}", kGameMain);
+    std::printf("qilin_run: calling main at %08X\n", kGameMain);
     rt::call(c, kGameMain);
     if (c.ret_to != host::kReturnSentinel) rt::trap(kGameMain, "main returned somewhere else");
-    std::println("qilin_run: main returned {}", c.eax);
+    std::printf("qilin_run: main returned %u\n", c.eax);
     return 0;
 }

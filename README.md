@@ -40,7 +40,7 @@ cmake --build build --parallel
 ctest --test-dir build --output-on-failure
 ```
 
-CI builds and tests with warnings as errors on Linux x64 (GCC 14 and Clang 19), Linux ARM64 (GCC 14), macOS ARM64 and x64 (built for macOS 10.15) and Windows x64 (MSVC).
+CI builds and tests with warnings as errors on Linux x64 (GCC 14 and Clang 19), Linux ARM64 (GCC 14), macOS ARM64 and x64 (the runtime built for macOS 10.15) and Windows x64 (MSVC).
 
 ## Using it
 

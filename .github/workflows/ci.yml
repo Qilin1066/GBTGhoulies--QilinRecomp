@@ -13,9 +13,9 @@ jobs:
           - { name: linux-x64-gcc14,   os: ubuntu-24.04,     cc: gcc-14,   cxx: g++-14 }
           - { name: linux-x64-clang19, os: ubuntu-24.04,     cc: clang-19, cxx: clang++-19 }
           - { name: linux-arm64-gcc14, os: ubuntu-24.04-arm, cc: gcc-14,   cxx: g++-14 }
-          # macOS: built for 10.15 (Catalina), the oldest macOS a Vulkan 1.3 MoltenVK runs on, for Apple Silicon and Intel.
-          - { name: macos-arm64,       os: macos-latest,   osx: '10.15' }
-          - { name: macos-x64,         os: macos-15-intel, osx: '10.15' }
+          # macOS: the runtime is built for 10.15 (CMakeLists.txt's default), the tools for 13.3, on Apple Silicon and Intel.
+          - { name: macos-arm64,       os: macos-latest }
+          - { name: macos-x64,         os: macos-15-intel }
           - { name: windows-x64,       os: windows-2022 }
     name: ${{ matrix.name }}
     runs-on: ${{ matrix.os }}
@@ -31,9 +31,6 @@ jobs:
         shell: bash
         run: |
           args=()
-          if [ -n "${{ matrix.osx }}" ]; then
-            args+=(-DCMAKE_OSX_DEPLOYMENT_TARGET=${{ matrix.osx }})
-          fi
           if [ -n "${{ matrix.cxx }}" ]; then
             args+=(-DCMAKE_C_COMPILER=${{ matrix.cc }} -DCMAKE_CXX_COMPILER=${{ matrix.cxx }})
           fi

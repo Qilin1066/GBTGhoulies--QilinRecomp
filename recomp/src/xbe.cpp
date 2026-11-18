@@ -4,13 +4,12 @@
 #include <array>
 #include <bit>
 #include <cstring>
-#include <format>
 #include <fstream>
 #include <iterator>
 #include <string_view>
 #include <tuple>
 
-#include "json.hpp"
+#include "strf.hpp"
 
 static_assert(std::endian::native == std::endian::little,
               "qilin reads little-endian guest data with memcpy: big-endian hosts are not supported");
@@ -39,13 +38,13 @@ struct ParseError {
 struct Reader {
     std::span<const uint8_t> d;
     uint32_t u32(size_t o) const {
-        if (o + 4 > d.size()) bad(std::format("read past end of file at offset {:#x}", o));
+        if (o + 4 > d.size()) bad(strf("read past end of file at offset %#zx", size_t(o)));
         uint32_t v;
         std::memcpy(&v, d.data() + o, 4);
         return v;
     }
     uint16_t u16(size_t o) const {
-        if (o + 2 > d.size()) bad(std::format("read past end of file at offset {:#x}", o));
+        if (o + 2 > d.size()) bad(strf("read past end of file at offset %#zx", size_t(o)));
         uint16_t v;
         std::memcpy(&v, d.data() + o, 2);
         return v;
@@ -123,7 +122,7 @@ std::expected<Xbe, std::string> Xbe::parse(std::span<const uint8_t> d) try {
     // Offset of a header-area pointer, checking that n bytes from it are inside the headers.
     auto hdr = [&](uint32_t va, uint64_t n = 1) -> size_t {
         if (va < x.base || uint64_t(va - x.base) + n > x.size_headers)
-            bad(std::format("header pointer {:#x} outside the header area", va));
+            bad(strf("header pointer %#x outside the header area", unsigned(va)));
         return va - x.base;
     };
     auto cstr = [&](uint32_t va) {
@@ -225,12 +224,12 @@ void Xbe::index_code_sections() {
 }
 
 uint8_t Xbe::u8(uint32_t va) const {
-    if (!mapped(va, 1)) throw XbeError(std::format("u8 read outside the image at {:#x}", va));
+    if (!mapped(va, 1)) throw XbeError(strf("u8 read outside the image at %#x", unsigned(va)));
     return image_[va - base];
 }
 
 uint32_t Xbe::u32(uint32_t va) const {
-    if (!mapped(va, 4)) throw XbeError(std::format("u32 read outside the image at {:#x}", va));
+    if (!mapped(va, 4)) throw XbeError(strf("u32 read outside the image at %#x", unsigned(va)));
     uint32_t v;
     std::memcpy(&v, image_.data() + (va - base), 4);
     return v;
@@ -248,67 +247,6 @@ const XbeSection* Xbe::code_section_at(uint32_t va) const {
     if (it == code_index_.begin()) return nullptr;
     const XbeSection& s = sections[*std::prev(it)];
     return va < s.file_end() ? &s : nullptr;
-}
-
-std::string Xbe::to_json() const {
-    JsonWriter j(true);
-    j.begin_object();
-    j.kv("kind", kind);
-    j.key("base").hex32(base);
-    j.key("entry").hex32(entry);
-    j.key("kernel_thunk").hex32(kthunk);
-    j.kv("size_image", size_image);
-    j.kv("stack_commit", stack_commit);
-    j.kv("heap_reserve", heap_reserve);
-    j.kv("heap_commit", heap_commit);
-    j.key("init_flags").hex32(init_flags);
-    j.key("tls_addr").hex32(tls_addr);
-    j.kv("timestamp", timestamp);
-    j.key("debug_path");
-    if (debug_path.empty()) j.null(); else j.value(debug_path);
-    j.key("certificate").begin_object();
-    j.key("title_id").hex32(cert.title_id);
-    j.kv("title_id_str", std::format("{:c}{:c}-{:03}", char(cert.title_id >> 24), char((cert.title_id >> 16) & 0xFF),
-                                     cert.title_id & 0xFFFF));
-    j.kv("title_name", cert.title_name);
-    j.key("allowed_media").hex32(cert.allowed_media);
-    j.key("region").hex32(cert.region);
-    j.kv("ratings", cert.ratings);
-    j.kv("disk_number", cert.disk_number);
-    j.kv("version", cert.version);
-    j.end_object();
-    j.key("sections").begin_array();
-    for (auto& s : sections) {
-        j.begin_object();
-        j.kv("name", s.name);
-        j.key("flags").hex32(s.flags);
-        j.key("va").hex32(s.va);
-        j.kv("vsize", s.vsize);
-        j.key("raw").hex32(s.raw);
-        j.kv("rsize", s.rsize);
-        j.kv("writable", s.writable());
-        j.kv("preload", s.preload());
-        j.kv("executable", s.executable());
-        j.kv("inserted", s.inserted());
-        j.end_object();
-    }
-    j.end_array();
-    j.key("libraries").begin_array();
-    for (auto& l : libraries) {
-        j.begin_object();
-        j.kv("name", l.name);
-        j.kv("version", std::format("{}.{}.{}", l.major, l.minor, l.build));
-        j.kv("qfe", l.qfe);
-        j.kv("approved", l.approved);
-        j.kv("debug", l.debug);
-        j.end_object();
-    }
-    j.end_array();
-    j.key("kernel_imports").begin_array();
-    for (auto o : kernel_imports) j.value(o);
-    j.end_array();
-    j.end_object();
-    return j.str();
 }
 
 }  // namespace qilin

@@ -23,7 +23,7 @@ XAPI is lifted too, and the runtime implements the Xbox kernel beneath it. Start
 - **`qilin_run --ram-mb N`:** guest RAM from 64 MB (the default, the retail Xbox's) to 1 GB. RAM is `calloc`ed, so untouched pages cost nothing.
 - **Start-up:** the XBE entry point's TLS sizing, then XAPI's process initialisation, then the C runtime's.
 - **`tools/check/xg_math.py`:** XGraphics' maths with aligned operands: 7 functions, 4,200 trials, all matching.
-- **macOS:** every 64-bit Mac with a Metal GPU running macOS 10.15 or later, Intel included, is a target. CI builds for macOS 10.15 on Apple Silicon and Intel (`macos-15-intel`). Percentages are formatted without floating-point `std::format`, which needs macOS 13.3.
+- **macOS:** every 64-bit Mac with a Metal GPU running macOS 10.15 or later, Intel included, is a target. CI builds on Apple Silicon and Intel (`macos-15-intel`). The runtime (`qilin_host`, the XBE loader `qilin_xbe`, `qilin_run`) is built for macOS 10.15 and formats with `qilin::strf` instead of `std::format`, which Apple's libc++ only has from 13.3; the developer tools are built for 13.3. `qilin info`'s JSON writer moved to `xbe_json.cpp`, and the region table to `regions.hpp`.
 
 ### Changed
 - The XAPI replacements for `QueryPerformanceFrequency`, `GlobalMemoryStatus`, `XGetLaunchInfo` and `XGetLanguage` are gone: the lifted originals run, over the kernel.

@@ -1,10 +1,10 @@
 #include "host.hpp"
+#include "strf.hpp"
 
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <format>
 #include <map>
 #include <span>
 
@@ -187,11 +187,11 @@ void set_current(rt::Context* c) { g_current = c; }
 std::string describe(uint32_t a) {
     if (a >= 0x80000000u && a < 0x80001000u) {
         const KernelExport* e = kernel_export(a & 0xFFFu);
-        return e ? std::format("kernel {} (ordinal {})", e->name, e->ordinal) : std::format("kernel ordinal {}", a & 0xFFFu);
+        return e ? strf("kernel %s (ordinal %u)", e->name, unsigned(e->ordinal)) : strf("kernel ordinal %u", a & 0xFFFu);
     }
     for (const Region& r : regions())
-        if (a >= r.lo && a < r.hi) return std::format("{} code at {:08X}", r.name, a);
-    return std::format("{:08X}", a);
+        if (a >= r.lo && a < r.hi) return strf("%s code at %08X", r.name.c_str(), a);
+    return strf("%08X", a);
 }
 
 }  // namespace qilin::host
@@ -207,7 +207,7 @@ void call_unlifted(Context& c, uint32_t target) {
     const Mem m{c.mem, c.mem_size};
     const uint32_t caller = c.esp + 4 <= c.mem_size ? ld32(m, c.esp, 0) : 0;
     static std::string why;
-    why = std::format("no replacement for {}, called from {:08X}", host::describe(target), caller);
+    why = strf("no replacement for %s, called from %08X", host::describe(target).c_str(), caller);
     trap(target, why.c_str());
 }
 

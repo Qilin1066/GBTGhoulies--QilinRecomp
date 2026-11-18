@@ -1,7 +1,7 @@
 // Tests for the runtime's host side; no game files needed.
 #include <cstring>
 #include <memory>
-#include <print>
+#include <cstdio>
 #include <string>
 
 #include "host.hpp"
@@ -13,7 +13,7 @@ int failures = 0;
 #define CHECK(cond)                                                                      \
     do {                                                                                 \
         if (!(cond)) {                                                                   \
-            std::println(stderr, "{}:{}: CHECK failed: {}", __FILE__, __LINE__, #cond); \
+            std::fprintf(stderr, "%s:%d: CHECK failed: %s\n", __FILE__, __LINE__, #cond); \
             ++failures;                                                                  \
         }                                                                                \
     } while (0)
@@ -73,7 +73,7 @@ int main() {
     CHECK(v.decommit(r1 + 0x1000, 0x1000) && v.commit(r1 + 0x1000, 1, 4) && vram[r1 + 0x1000] == 0);  // recommitted: zero again
     CHECK(v.release(r1) && !v.release(r1) && v.reserve(0, 0x1000, 4, false) == 0x10000);
 
-    if (failures) std::println(stderr, "{} check(s) failed", failures);
-    else std::println("all host tests passed");
+    if (failures) std::fprintf(stderr, "%d check(s) failed\n", failures);
+    else std::printf("all host tests passed\n");
     return failures != 0;
 }

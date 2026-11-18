@@ -9,10 +9,10 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <format>
 #include <string_view>
 
 #include "host.hpp"
+#include "strf.hpp"
 
 namespace qilin::host {
 namespace {
@@ -42,7 +42,7 @@ void init_event(const rt::Context& c, uint32_t ev, uint8_t type, bool signalled)
 // this can only mean a lock held across a missing thread, or a deadlock.
 [[noreturn]] void needs_threads(uint32_t ordinal, const char* what) {
     static std::string why;
-    why = std::format("{}: needs another thread, and the runtime has only the main thread so far", what);
+    why = strf("%s: needs another thread, and the runtime has only the main thread so far", what);
     rt::trap(kernel_addr(ordinal), why.c_str());
 }
 
@@ -289,7 +289,7 @@ void ex_query_non_volatile_setting(rt::Context& c) {
     const auto it = std::ranges::find(kSettings, index, &Setting::index);
     if (it == std::end(kSettings)) {
         static std::string why;
-        why = std::format("ExQueryNonVolatileSetting: setting {:#x} isn't modelled yet", index);
+        why = strf("ExQueryNonVolatileSetting: setting %#x isn't modelled yet", index);
         rt::trap(kernel_addr(24), why.c_str());
     }
     if (len < 4) {
@@ -322,7 +322,7 @@ void rtl_nt_status_to_dos_error(rt::Context& c) {
     const auto it = std::ranges::find(kDosErrors, status, &StatusMap::status);
     if (it == std::end(kDosErrors)) {
         static std::string why;
-        why = std::format("RtlNtStatusToDosError: status {:08X} isn't in the table yet", status);
+        why = strf("RtlNtStatusToDosError: status %08X isn't in the table yet", status);
         rt::trap(kernel_addr(301), why.c_str());
     }
     ret(c, it->error, 4);

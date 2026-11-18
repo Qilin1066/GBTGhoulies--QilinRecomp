@@ -24,6 +24,7 @@
 #include <vector>
 
 #include "decoder.hpp"
+#include "regions.hpp"
 #include "xbe.hpp"
 
 namespace qilin {
@@ -87,18 +88,10 @@ struct CfgConfig {
     // misaligned entry in these regions needs a direct call to count.
     std::vector<std::pair<uint32_t, uint32_t>> aligned_regions = {{0x11000, 0x14A840}, {0x152780, 0x165C00}};
     uint32_t alignment = 16;
-    // Regions of .text for the coverage report (docs/code-analysis.md);
-    // other code sections are reported per section, as replaced libraries.
-    struct Region {
-        std::string name;
-        uint32_t lo, hi;
-        bool lifted;
-    };
-    std::vector<Region> text_regions = {
-        {"game", 0x11000, 0x14A840, true},       {"xapi", 0x14A840, 0x152780, false},
-        {"rare-libs", 0x152780, 0x165C00, true}, {"crt", 0x165C00, 0x1707B0, false},
-        {"eh-funclets", 0x1707B0, 0x171020, true},
-    };
+    // Regions of .text for the coverage report (regions.hpp); other code
+    // sections are reported per section, as replaced libraries.
+    using Region = TextRegion;
+    std::vector<Region> text_regions = kTextRegions;
 };
 
 struct Gap {
@@ -116,8 +109,8 @@ struct Suspect {
     std::string why;
 };
 
-// part / whole as a percentage with `decimals` places, in integer arithmetic
-// (std::format of a double needs macOS 13.3's libc++; this builds for older).
+// part / whole as a percentage with `decimals` places, in integer arithmetic,
+// so reports are identical on every host.
 std::string percent(uint64_t part, uint64_t whole, int decimals);
 
 // MSVC alignment filler (mov r, r / lea r, [r + 0]); semantically a no-op.
