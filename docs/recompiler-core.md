@@ -239,7 +239,7 @@ Half the trials start with a value already in `ST(0)`, as when a caller passes o
 - **NaN against NaN.** Unicorn propagates SSE NaNs by x87 rules (larger payload wins), real SSE by operand order. Trials whose only differences are NaN against NaN, in an xmm lane or an aligned memory word, are counted as `pass-nan`.
 - **Calls into non-code.** A call through a null or random pointer makes the original execute data, which depends on CPU state the lifted side doesn't carry (flags, segments). Those trials are skipped.
 
-**Emulator corrections.** Unicorn 2.1 (QEMU 5) differs from the hardware in three places that lifted code reaches. The harness corrects them in both emulators, at the addresses `qilin insns` lists:
+**Emulator corrections.** Unicorn 2.1 (QEMU 5) differs from the hardware in four places that lifted code reaches. The harness corrects them in both emulators, at the addresses `qilin insns` lists:
 - **`rdtsc`** reads the host's time-stamp counter, so an XAPI timing function (`0x14C29C`) gave different results in the two runs. It now returns a counter that restarts every trial.
 - **`fcomi`, `fcomip`, `fucomi` and `fucomip`** leave OF, SF and AF as they were; Intel documents them as cleared. `0x140D80` reads them back with `lahf`. They're cleared after each one.
 - **`fyl2x` with an operand ≤ 0** doesn't pop. The lifted code pops, as the hardware does, and those trials are skipped.
@@ -373,7 +373,7 @@ Checks 1–4 are static and will be reported by `qilin` itself. Check 5 needs th
 5. **Library sections have low coverage** (DSOUND 35%, WMADEC 36%). They get replaced, so this doesn't block anything.
 6. **The Ghoulies PC Recomp seed list hasn't been used yet** as a cross-check (see `prior-art.md`).
 7. **x87 transcendentals are correctly rounded doubles, not the x87's own results** (by design, v0.9.0). Before v0.9.0 they came from the host's maths library, so they could differ between hosts.
-8. **Unicorn's x87 differs from the hardware** in three known places (`rdtsc`, the `fcomi` family's OF/SF/AF, `fyl2x` with an operand ≤ 0). The harness corrects or skips them; other deviations may exist that the trials haven't reached yet.
+8. **Unicorn's x87 differs from the hardware** in four known places (`rdtsc`, the `fcomi` family's OF/SF/AF, `fyl2x` with an operand ≤ 0, and transcendentals from the host libm). The harness corrects or skips them; other deviations may exist that the trials haven't reached yet.
 9. **The difftest can't exercise most of the exception-frame functions.** They're `std::string` and `std::vector` members that allocate, and allocation goes through XAPI to the kernel, which the harness doesn't have, so 13 of the 20 fault in both versions on every random state. The 7 that complete match, and a planted bug in the unlink was caught in every one that completed. A harness stand-in for the allocator would reach the rest.
 
 ## Next
