@@ -127,7 +127,7 @@ A `cmp` or `and` directly above a table jump bounds most switches. For the rest,
 
 **Cross-check:** run on the 311 tables already bounded by `cmp` or `and`, the analysis gives the same size for all of them except two `and` tables in replaced library code, where it reports the full mask range and the old path drops unused trailing slots. Both answers are correct. The 7 tables still sized by scanning are all in XDK libraries that aren't lifted.
 
-**Lift check.** The lift report has no fragments left: every failure is an instruction class still to be implemented (calls for slice 2, x87 for slice 3, `std`, `pushfd`). In v0.3.0, 61 lift failures were fragments.
+**Lift check.** The lift report has no fragments left: every failure is something still to be implemented (x87 for slice 3, C++ exception frames, and one `pushfd`). In v0.3.0, 61 lift failures were fragments.
 
 ### Lifter, slices 1 and 2 (`recomp/src/lifter.*`, runtime `recomp/runtime/guest.hpp` and `dispatch.cpp`)
 Each guest function becomes `void fn_XXXXXXXX(rt::Context&)`. `Lifter::lift` returns `std::expected<std::string, LiftFailure>`, where the failure carries a kind (fragment, unsupported instruction, x87, undefined flag, implausible, bad control flow), the address and the instruction.
@@ -277,4 +277,3 @@ Checks 1–4 are static and will be reported by `qilin` itself. Check 5 needs th
 1. **Slice 3: x87.** 628 functions. Use host `double`, honour precision control where the game sets it, and keep x87 state in the Context across calls.
 2. **C++ exception frames:** 20 functions write `fs:[0]`. The strategy is still to be chosen: map to host C++ exceptions, or keep an explicit frame chain.
 3. **Indirect-call dispatch** is a binary search over 5,098 entries, about 13 steps. A direct-mapped table indexed by address (16-byte granularity in the aligned regions) would make it one lookup. Do this when the runtime measures it.
-4. **SEH/C++ EH strategy** for the 63 `fs:` sites.
