@@ -14,7 +14,7 @@ Roadmap step 2, **recompiler core**, is in progress.
 | x86 decoder (Zydis, vendored) | ✅ agrees with LLVM on every reachable instruction |
 | Function discovery + CFG (recursive descent, switch tables, C++ EH tables, data-as-code validation) | ✅ 8,842 functions, 556 jump tables (every one in lifted code has a proven size); **100% of the lifted code accounted for** (`qilin coverage`: 0 unknown bytes in the game code, Rare libraries and EH funclets) |
 | Lifter → C++ (integer, scalar SSE, x87 with the game's 24-bit precision control, jump tables, string ops; direct, indirect and tail calls; C++ exception frames) | ✅ all 6,214 functions (game code, Rare libraries, and the 471 C runtime and XAPI functions they reach; 3 more belong to Bink and are replaced with it), differentially tested against the original x86 under Unicorn, whole call trees included, also under UBSan: 0 mismatches |
-| Runtime: `qilin_run` loads the game and runs the lifted `main`, with a registry of native replacements for everything that isn't lifted | 🔨 started: XAPI and the C runtime lifted, the kernel beneath them native (memory, critical sections, timers, settings); start-up runs until XAPI opens its first file (see `docs/runtime.md`) |
+| Runtime: `qilin_run` loads the game and runs the lifted `main`, with a registry of native replacements for everything that isn't lifted | 🔨 started: XAPI and the C runtime lifted, the kernel beneath them native (memory, critical sections, timers, settings, the file system over your extracted disc and a data folder); start-up completes and the game's `main` runs until its first Direct3D call (see `docs/runtime.md`) |
 | HLE of the XDK libraries, Vulkan | later (see roadmap) |
 
 ## Versions and changes
@@ -51,6 +51,7 @@ build/qilin insns    path/to/default.xbe [--linear] -o listing.txt
 build/qilin suspects path/to/default.xbe                 # kept functions with problems, for review
 build/qilin coverage path/to/default.xbe [--list]        # every byte: code, table, padding or unknown (exit 3 if lifted code has unknown bytes)
 build/qilin lift     path/to/default.xbe --out gen/      # lift to C++ (gen/ is gitignored: never commit it)
+build/qilin_run      path/to/default.xbe [--game-dir DIR] [--data-dir DIR] [--ram-mb N]  # run it (built with -DQILIN_GEN_DIR=gen)
 
 Code that compiles lifted C++ must link the `qilin_runtime` CMake target (or pass `-ffp-contract=off`): SSE results are only bit-exact without fused multiply-add.
 ```

@@ -201,6 +201,19 @@ namespace qilin::rt {
 void call_unlifted(Context& c, uint32_t target) {
     const auto& r = host::registry();
     if (const auto it = r.find(target); it != r.end()) {
+        // QILIN_TRACE_HLE=1 logs every replacement call: caller, arguments, result.
+        static const bool trace = [] {
+            const char* v = std::getenv("QILIN_TRACE_HLE");
+            return v && *v && *v != '0';
+        }();
+        if (trace) {
+            const Mem m{c.mem, c.mem_size};
+            std::fprintf(stderr, "hle %08X %s(%08X %08X %08X %08X %08X %08X)", ld32(m, c.esp, 0), it->second.name,
+                         host::arg(c, 0), host::arg(c, 1), host::arg(c, 2), host::arg(c, 3), host::arg(c, 4), host::arg(c, 5));
+            it->second.fn(c);
+            std::fprintf(stderr, " = %08X\n", c.eax);
+            return;
+        }
         it->second.fn(c);
         return;
     }

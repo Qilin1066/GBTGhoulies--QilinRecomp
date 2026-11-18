@@ -10,6 +10,7 @@
 #pragma once
 
 #include <cstdint>
+#include <filesystem>
 #include <map>
 #include <optional>
 #include <string>
@@ -111,11 +112,30 @@ VirtualMemory& vm();
 void register_xapi();
 // The kernel replacements, registered at kernel_addr(ordinal) (kernel.cpp).
 void register_kernel();
+// The I/O manager (kernel_io.cpp): \\Device\\CdRom0 is `disc` (read-only), the
+// hard disk's partitions are data/partition1..6.
+struct IoConfig {
+    std::filesystem::path disc, data;
+};
+void register_kernel_io(const IoConfig& cfg);
+// Fills in the object behind a kernel data export (XeImageFileName,
+// HalDiskCachePartitionCount …) at `addr`, which its thunk slot points to.
+void init_kernel_data(rt::Context& c, uint32_t ordinal, uint32_t addr);
+// The XBE's sections that aren't preloaded ($$XTIMAGE and the like): the
+// kernel reads them in on XeLoadSection. `header` is the section header's
+// guest address, which XeLoadSection and XeUnloadSection take.
+struct DemandSection {
+    uint32_t header, va, vsize;
+    std::vector<uint8_t> bytes;  // the section's file data
+};
+void set_demand_sections(std::vector<DemandSection> sections);
 
 // ---- Threads. fs points at the KPCR, whose PrcbData.CurrentThread (+0x28)
 // is the running thread's KTHREAD (kernel.cpp).
 inline constexpr uint32_t kKThreadSize = 0x200;
-void init_main_thread(rt::Context& c, uint32_t kpcr, uint32_t kthread, uint32_t stack_top, uint32_t stack_size);
+// tls_size: the thread's TLS block, at the top of its stack (KTHREAD.TlsData).
+void init_main_thread(rt::Context& c, uint32_t kpcr, uint32_t kthread, uint32_t stack_top, uint32_t stack_size,
+                      uint32_t tls_size);
 uint32_t current_thread(const rt::Context& c);
 
 // ---- Reports.

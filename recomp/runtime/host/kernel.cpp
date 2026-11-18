@@ -377,7 +377,162 @@ struct KernelFn {
     uint16_t arg_bytes;  // checked against the export table at registration
     HleFn fn;
 };
+// ---------------------------------------------------------------- strings
+// ANSI_STRING / STRING: USHORT Length, USHORT MaximumLength, PCHAR Buffer.
+
+// VOID RtlInitAnsiString(PANSI_STRING, PCSZ) (289)
+void rtl_init_ansi_string(rt::Context& c) {
+    const uint32_t s = arg(c, 0), src = arg(c, 1);
+    uint32_t n = 0;
+    if (src)
+        while (rt::ld8(mem(c), src + n, 0) && n < 0xFFFE) ++n;
+    rt::st16(mem(c), s, uint16_t(n), 0);
+    rt::st16(mem(c), s + 2, uint16_t(src ? n + 1 : 0), 0);
+    st(c, s + 4, src);
+    ret(c, c.eax, 8);
+}
+
+// BOOLEAN RtlEqualString(PSTRING, PSTRING, BOOLEAN CaseInsensitive) (279)
+void rtl_equal_string(rt::Context& c) {
+    const uint32_t a = arg(c, 0), b = arg(c, 1);
+    const bool fold = (arg(c, 2) & 0xFF) != 0;
+    const uint32_t n = rt::ld16(mem(c), a, 0);
+    bool eq = n == rt::ld16(mem(c), b, 0);
+    const uint32_t pa = ld(c, a + 4), pb = ld(c, b + 4);
+    for (uint32_t k = 0; eq && k < n; ++k) {
+        uint8_t x = rt::ld8(mem(c), pa + k, 0), y = rt::ld8(mem(c), pb + k, 0);
+        if (fold) {  // RtlUpperChar: ASCII letters only (no NLS tables on the Xbox)
+            if (x >= 'a' && x <= 'z') x = uint8_t(x - 32);
+            if (y >= 'a' && y <= 'z') y = uint8_t(y - 32);
+        }
+        eq = x == y;
+    }
+    ret(c, (c.eax & ~0xFFu) | (eq ? 1u : 0u), 12);
+}
+
+// NTSTATUS RtlUnicodeStringToAnsiString(PANSI_STRING Dest, PUNICODE_STRING Src,
+//     BOOLEAN AllocateDestinationString) (308)
+// The Xbox kernel's code page is Latin-1: characters below 0x100 map to
+// their byte, the rest to '?'. The result is NUL-terminated, and a buffer
+// too short takes what fits with STATUS_BUFFER_OVERFLOW.
+void rtl_unicode_string_to_ansi_string(rt::Context& c) {
+    const uint32_t d = arg(c, 0), sp = arg(c, 1);
+    if (arg(c, 2) & 0xFF) {
+        rt::trap(0, "RtlUnicodeStringToAnsiString: AllocateDestinationString (pool allocation) isn't modelled yet");
+    }
+    const uint32_t chars = rt::ld16(mem(c), sp, 0) / 2u, src = ld(c, sp + 4);
+    const uint32_t max = rt::ld16(mem(c), d + 2, 0), buf = ld(c, d + 4);
+    uint32_t status = 0, with_nul = chars + 1;
+    if (with_nul > max) {
+        if (max == 0) {
+            ret(c, 0x80000005, 12);
+            return;
+        }
+        status = 0x80000005;  // STATUS_BUFFER_OVERFLOW
+        with_nul = max;
+    }
+    const uint32_t n = with_nul - 1;
+    for (uint32_t k = 0; k < n; ++k) {
+        const uint16_t w = rt::ld16(mem(c), src + 2 * k, 0);
+        rt::st8(mem(c), buf + k, w < 0x100 ? uint8_t(w) : uint8_t('?'), 0);
+    }
+    rt::st8(mem(c), buf + n, 0, 0);
+    rt::st16(mem(c), d, uint16_t(n), 0);
+    ret(c, status, 12);
+}
+
+// SIZE_T RtlCompareMemoryUlong(PVOID Source, SIZE_T Length, ULONG Pattern) (271):
+// the bytes from the start, in whole ULONGs, that equal the pattern.
+void rtl_compare_memory_ulong(rt::Context& c) {
+    const uint32_t src = arg(c, 0), len = arg(c, 1) & ~3u, pat = arg(c, 2);
+    uint32_t k = 0;
+    while (k < len && ld(c, src + k) == pat) k += 4;
+    ret(c, k, 12);
+}
+
+// VOID RtlRaiseException(PEXCEPTION_RECORD) (302): the guest's own exception
+// dispatch isn't modelled; stop with the code it raised.
+void rtl_raise_exception(rt::Context& c) {
+    static std::string why;
+    why = strf("RtlRaiseException: guest raised exception %08X at %08X", ld(c, arg(c, 0)), ld(c, arg(c, 0) + 12));
+    rt::trap(0, why.c_str());
+}
+
+// VOID KeQuerySystemTime(PLARGE_INTEGER) (128): 100 ns since 1601, UTC.
+void ke_query_system_time(rt::Context& c) {
+    const int64_t unix_100ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                   std::chrono::system_clock::now().time_since_epoch()).count() / 100;
+    rt::st64(mem(c), arg(c, 0), uint64_t(unix_100ns + 116444736000000000LL), 0);
+    ret(c, c.eax, 4);
+}
+
+// ---------------------------------------------------------------- XBE sections
+// XBEIMAGE_SECTION: Flags, VirtualAddress, VirtualSize, FileAddress, FileSize,
+// SectionName, SectionReferenceCount (+0x18), HeadSharedPageReferenceCount
+// (+0x1C), TailSharedPageReferenceCount (+0x20) — the last two point at
+// USHORT counts of the sections using the first and last pages.
+std::vector<DemandSection>& demand_sections() {
+    static std::vector<DemandSection> d;
+    return d;
+}
+const DemandSection* demand_section(uint32_t header) {
+    for (const DemandSection& d : demand_sections())
+        if (d.header == header) return &d;
+    return nullptr;
+}
+void shared_pages(rt::Context& c, uint32_t header, int delta) {
+    const uint32_t head = ld(c, header + 0x1C), tail = ld(c, header + 0x20);
+    rt::st16(mem(c), head, uint16_t(rt::ld16(mem(c), head, 0) + delta), 0);
+    if (tail != head) rt::st16(mem(c), tail, uint16_t(rt::ld16(mem(c), tail, 0) + delta), 0);
+}
+
+// NTSTATUS XeLoadSection(PXBEIMAGE_SECTION) (327): the first load reads the
+// section's file data in and zeroes the rest of its virtual size.
+void xe_load_section(rt::Context& c) {
+    const uint32_t h = arg(c, 0);
+    const uint32_t count = ld(c, h + 0x18);
+    if (count == 0) {
+        const DemandSection* d = demand_section(h);
+        if (!d) {
+            static std::string why;
+            why = strf("XeLoadSection: %08X isn't one of the XBE's section headers", h);
+            rt::trap(0, why.c_str());
+        }
+        rt::check(mem(c), d->va, d->vsize, 0);
+        std::memset(c.mem + d->va, 0, d->vsize);
+        std::memcpy(c.mem + d->va, d->bytes.data(), d->bytes.size());
+        shared_pages(c, h, +1);
+    }
+    st(c, h + 0x18, count + 1);
+    ret(c, 0, 4);
+}
+
+// NTSTATUS XeUnloadSection(PXBEIMAGE_SECTION) (328): the last unload frees
+// the section's pages; here its memory goes back to zero.
+void xe_unload_section(rt::Context& c) {
+    const uint32_t h = arg(c, 0);
+    const uint32_t count = ld(c, h + 0x18);
+    if (count == 0) {
+        ret(c, 0xC000000D, 4);  // STATUS_INVALID_PARAMETER
+        return;
+    }
+    if (count == 1) {
+        if (const DemandSection* d = demand_section(h)) std::memset(c.mem + d->va, 0, d->vsize);
+        shared_pages(c, h, -1);
+    }
+    st(c, h + 0x18, count - 1);
+    ret(c, 0, 4);
+}
+
 constexpr KernelFn kKernel[] = {
+    {"XeLoadSection", 4, xe_load_section},
+    {"XeUnloadSection", 4, xe_unload_section},
+    {"RtlInitAnsiString", 8, rtl_init_ansi_string},
+    {"RtlEqualString", 12, rtl_equal_string},
+    {"RtlUnicodeStringToAnsiString", 12, rtl_unicode_string_to_ansi_string},
+    {"RtlCompareMemoryUlong", 12, rtl_compare_memory_ulong},
+    {"RtlRaiseException", 4, rtl_raise_exception},
+    {"KeQuerySystemTime", 4, ke_query_system_time},
     {"RtlInitializeCriticalSection", 4, rtl_initialize_critical_section},
     {"RtlEnterCriticalSection", 4, rtl_enter_critical_section},
     {"RtlLeaveCriticalSection", 4, rtl_leave_critical_section},
@@ -408,6 +563,28 @@ const KernelExport* kernel_export(std::string_view name) {
     return nullptr;
 }
 
+void init_kernel_data(rt::Context& c, uint32_t ordinal, uint32_t addr) {
+    const rt::Mem m = mem(c);
+    switch (ordinal) {
+        case 326: {  // XeImageFileName: an ANSI_STRING naming the running XBE, the string after it
+            static constexpr char kName[] = "\\Device\\CdRom0\\default.xbe";
+            const uint16_t n = uint16_t(sizeof kName - 1);
+            rt::st16(m, addr, n, 0);
+            rt::st16(m, addr + 2, uint16_t(n + 1), 0);
+            st(c, addr + 4, addr + 8);
+            for (uint16_t k = 0; k <= n; ++k) rt::st8(m, addr + 8 + k, uint8_t(kName[k]), 0);
+            break;
+        }
+        case 40:  // HalDiskCachePartitionCount: the retail drive's three cache partitions
+            st(c, addr, 3);
+            break;
+        default:  // the rest start as zero: no launch data (LaunchDataPage), retail hardware flags …
+            break;
+    }
+}
+
+void set_demand_sections(std::vector<DemandSection> sections) { demand_sections() = std::move(sections); }
+
 void register_kernel() {
     for (const KernelFn& k : kKernel) {
         const KernelExport* e = kernel_export(k.name);
@@ -424,7 +601,10 @@ void register_kernel() {
 // NT_TIB of the running thread (ExceptionList, StackBase, StackLimit, …,
 // Self at +0x18); then SelfPcr (+0x1C), Prcb (+0x20, pointing at PrcbData),
 // Irql (+0x24) and PrcbData (+0x28), whose first field is CurrentThread.
-void init_main_thread(rt::Context& c, uint32_t kpcr, uint32_t kthread, uint32_t stack_top, uint32_t stack_size) {
+// KTHREAD: Header (0x10), MutantListHead, KernelTime, StackBase (+0x1C),
+// StackLimit (+0x20), KernelStack (+0x24), TlsData (+0x28), State …
+void init_main_thread(rt::Context& c, uint32_t kpcr, uint32_t kthread, uint32_t stack_top, uint32_t stack_size,
+                      uint32_t tls_size) {
     std::memset(c.mem + kpcr, 0, 0x300);
     std::memset(c.mem + kthread, 0, kKThreadSize);
     st(c, kpcr + 0x00, 0xFFFFFFFFu);              // ExceptionList: the end of the chain
@@ -434,6 +614,9 @@ void init_main_thread(rt::Context& c, uint32_t kpcr, uint32_t kthread, uint32_t 
     st(c, kpcr + 0x1C, kpcr);                     // SelfPcr
     st(c, kpcr + 0x20, kpcr + 0x28);              // Prcb
     st(c, kpcr + 0x28, kthread);                  // PrcbData.CurrentThread
+    st(c, kthread + 0x1C, stack_top);             // StackBase
+    st(c, kthread + 0x20, stack_top - stack_size);
+    st(c, kthread + 0x28, tls_size ? stack_top - tls_size : 0);  // TlsData
     c.fs_base = kpcr;
 }
 

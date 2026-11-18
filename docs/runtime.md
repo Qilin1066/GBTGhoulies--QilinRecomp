@@ -1,6 +1,6 @@
 # Runtime: status (roadmap step 3)
 
-Last updated 2026-11-18 (v0.12.0: XAPI lifted too; the runtime implements the kernel beneath it; guest RAM size is a setting).
+Last updated 2026-11-18 (v0.13.0: the file system; XAPI's and the C runtime's start-up complete and the game's `main` runs, as far as its first Direct3D call).
 
 The runtime is everything the lifted game code needs that isn't lifted: guest memory, the Xbox kernel, D3D, DirectSound/XACT and the other XDK libraries. All of it is replaced natively (HLE); none of it is emulated.
 
@@ -13,12 +13,14 @@ Two libraries are lifted with the game instead: the C runtime (since v0.11.0), s
 ```sh
 qilin lift default.xbe --out gen
 cmake -S . -B build -DQILIN_GEN_DIR=$PWD/gen && cmake --build build
-build/qilin_run default.xbe
+build/qilin_run [--game-dir DIR] [--data-dir DIR] [--ram-mb N] path/to/default.xbe
 ```
+
+`--game-dir` is the extracted disc (by default, `default.xbe`'s folder). `--data-dir` holds the hard disk: saves and caches, by default `%LOCALAPPDATA%\qilin\ghoulies` on Windows, `~/Library/Application Support/qilin/ghoulies` on macOS and `$XDG_DATA_HOME/qilin/ghoulies` (`~/.local/share/…`) elsewhere. Set `QILIN_TRACE_HLE=1` to log every replacement call (caller, arguments, result) and every object name the file system resolves, with where it went.
 
 **Start-up.** The XBE entry point (`0x14FAE9`) is XAPI start-up code. It sizes the static TLS block, then creates the main thread, whose procedure (`0x14FA75`) initialises XAPI, runs the initializer tables, then calls the game's `main(0, 0, 0)` at `0x32390`. The runtime sets up memory, the main thread's stack, KPCR and KTHREAD, then follows the same steps:
 
-1. The entry point's prologue, natively: the certificate size fix-up and the TLS size (`0x549528`) and index.
+1. The entry point's prologue, natively: the certificate size fix-up and the TLS size (`0x549528`) and index. The kernel puts a thread's TLS block at the top of its stack (`KTHREAD.TlsData`, `StackBase` − size), which makes `[StackBase + 4 × index]` the block, as XAPI's `SetLastError` reads it; the stack starts below it. XAPI's thread start routine (`0x14BB4D`) then points the block's first word at its data and copies in the TLS template; the runtime does the same for the main thread.
 2. XAPI's process initialisation, lifted (`0x151011`): critical sections, the auto power-off timer, the process heap (`RtlCreateHeap` over `NtAllocateVirtualMemory`), console settings, drive letters. The step before it in the thread procedure, `0x1517B9`, patches kernel code for known kernel builds (`cli`, writes into the kernel, `sti`); it's left out.
 3. The C runtime's initializers, in XAPI's order (`0x15172C`, then `0x1516D4`). They hold only library code, no game constructors:
 
@@ -37,7 +39,7 @@ An entry runs if it's lifted (`rt::is_lifted`); otherwise `qilin_run` names it a
 |---|---|
 | `0x00010000` … end of image | The XBE image, BSS zeroed |
 | End of image (64 KB aligned) … stack | Virtual memory (`host::VirtualMemory`): `NtAllocateVirtualMemory` and contiguous allocations |
-| R − 0x120000 … R − 0x20000 | The main thread's stack (1 MB) |
+| R − 0x120000 … R − 0x20000 | The main thread's stack (1 MB), with its TLS block at the top |
 | R − 0x20000 | The main thread's KPCR: `fs:[0]` (the exception chain, starts as `0xFFFFFFFF`), stack limits, `Prcb`, `CurrentThread` at `+0x28` |
 | R − 0x1F000 | The main thread's KTHREAD |
 | R − 0x10000 | Objects behind the kernel's data exports, 256 bytes each |
@@ -46,7 +48,9 @@ An entry runs if it's lifted (`rt::is_lifted`); otherwise `qilin_run` names it a
 
 `qilin_run` is built with checked memory for bring-up, so an access outside RAM stops with the guest address of the instruction.
 
-**Kernel imports.** A function's thunk slot keeps `0x80000000 | ordinal`, which `rt::call_unlifted` recognises. A data export's slot (`KeTickCount`, `LaunchDataPage`, `XboxHardwareInfo` and 12 more) gets the address of its object. Names, ordinals, stdcall argument sizes and data/fastcall flags come from nxdk's `xboxkrnl.exe.def` (CC0, in `third_party/nxdk/`), turned into `recomp/runtime/host/kernel_exports.inc` by `tools/gen/kernel_exports.py`.
+**Kernel imports.** A function's thunk slot keeps `0x80000000 | ordinal`, which `rt::call_unlifted` recognises. A data export's slot (`KeTickCount`, `LaunchDataPage`, `XboxHardwareInfo` and 12 more) gets the address of its object: `XeImageFileName` names `\Device\CdRom0\default.xbe`, `HalDiskCachePartitionCount` is 3, and the rest start as zero.
+
+**XBE sections.** Sections without the preload flag (`$$XTIMAGE`, `$$XSIMAGE`, `.XTLID`) start as zero, as the kernel's loader leaves them, and `XeLoadSection` reads them in. Their reference counts and the shared-page counts live in the section headers, as the kernel keeps them. Names, ordinals, stdcall argument sizes and data/fastcall flags come from nxdk's `xboxkrnl.exe.def` (CC0, in `third_party/nxdk/`), turned into `recomp/runtime/host/kernel_exports.inc` by `tools/gen/kernel_exports.py`.
 
 **Replacements** (`recomp/runtime/host/host.hpp`). Every call from lifted code to code that isn't lifted reaches `rt::call_unlifted`: a direct call to a stub, an indirect call the function table doesn't know, or a kernel import. It runs the replacement registered for that guest address. There's no fallback: anything unregistered stops the game and names the target and its caller, for example:
 
@@ -80,17 +84,46 @@ Replacements read stdcall arguments with `host::arg(c, i)` and return with `host
 | `RtlNtStatusToDosError` | The NT table for the statuses the runtime and the file system return; any other status stops the runtime |
 | `HalRegisterShutdownNotification` | Accepted; the routines never run |
 
-**Where it stops now:** XAPI's process initialisation opens a file with `NtOpenFile` (from `0x150EAE`): the file system is next. In v0.11.0 it stopped at the CRT's first critical section; before that, at `sprintf`.
+| `RtlInitAnsiString`, `RtlEqualString`, `RtlUnicodeStringToAnsiString`, `RtlCompareMemoryUlong` | As the kernel: `RtlEqualString` folds ASCII only, `RtlUnicodeStringToAnsiString` maps Latin-1 and turns the rest into `?`. Allocating the destination string stops the runtime |
+| `KeQuerySystemTime` | The host's UTC time, in 100 ns since 1601 |
+| `XeLoadSection`, `XeUnloadSection` | XBE sections above |
+| `RtlRaiseException` | Stops the runtime with the exception code |
+
+**The file system** (`recomp/runtime/host/kernel_io.cpp`) is the kernel's object namespace and I/O manager over host directories:
+
+| Object | Host |
+|---|---|
+| `\Device\CdRom0` | The extracted disc (`--game-dir`), read-only |
+| `\Device\Harddisk0\Partition1` … `6` | Folders `partition1` … `partition6` in the data directory, made when first used. 1 is E: (saves, `TDATA`/`UDATA`), 3–5 the title caches X:, Y:, Z: |
+| `\Device\Harddisk0\Partition0` | The whole disk, raw. Its first 512 KB, the configuration area, is the file `partition0.bin` (sparse: unwritten sectors read as zero). It holds the cache partition database that XAPI reads and writes at start-up |
+| `\??\D:` and the other drive letters | Symbolic links made by `IoCreateSymbolicLink`, followed when names resolve |
+
+Names are matched case-insensitively, as on FATX and the disc's XDVDFS (an exact match first), relative to a handle or to `ObDosDevicesDirectory()` (`D:\…` names), and can't climb out of a device with `..`.
+
+| Kernel function | Implementation |
+|---|---|
+| `NtCreateFile`, `NtOpenFile`, `NtClose` | Files, directories and raw devices, with every create disposition. Writing to the disc fails with `STATUS_MEDIA_WRITE_PROTECTED` |
+| `NtReadFile`, `NtWriteFile`, `NtFlushBuffersFile` | Synchronous, at an offset or the file position. An event or APC routine stops the runtime |
+| `NtQueryInformationFile`, `NtSetInformationFile`, `NtQueryFullAttributesFile` | Basic, standard, position, network-open; set position, end of file, allocation, delete-on-close |
+| `NtQueryVolumeInformationFile` | Size and full-size: the partition's size from the retail partition table, less what its folder holds, within the host's free space; the disc in 2 KB sectors |
+| `NtQueryDirectoryFile` | One entry per call, sorted, filtered by the mask (`*`, `?`) |
+| `NtDeviceIoControlFile` | Disk geometry and partition information from the retail 8 GB disk's table. On the disc, SCSI pass-through fails as on an empty drive: XAPI's DVD authentication check at start-up ignores the result |
+| `NtFsControlFile` | Dismount, which XAPI's formatter sends |
+| `IoCreateSymbolicLink`, `IoDeleteSymbolicLink`, `NtOpenSymbolicLinkObject`, `NtQuerySymbolicLinkObject` | The link table |
+
+**Cache partitions.** XAPI gives each title one of the three cache partitions, recorded in the configuration area, and formats it the first time: it writes a FATX volume header, FAT and root directory as raw sectors. The runtime takes the header as the format: it empties the partition's folder and keeps the header (`partitionN.fatx`), whose cluster size the volume reports from then on. This title asks for 64 KB clusters on its Z: drive (XBE init flags), and XAPI refuses to mount a volume whose cluster size differs. Raw writes to a partition that aren't part of a format, and raw reads of one, stop the runtime.
+
+**Where it stops now:** XAPI and the C runtime start up completely, and the game's `main` runs until its first Direct3D call (`0x17F890`, from `0x1549D4`). Before that, start-up writes the title's save metadata and images to `partition1/UDATA/4d530053/`, gets cache partition 5 formatted with 64 KB clusters and mounted as Z:, and checks that `D:\loctext\english` exists. In v0.12.0 it stopped at the first `NtOpenFile`; in v0.11.0 at the CRT's first critical section.
 
 ## Tests
 
-`qilin_host_tests` (CI, no game files) covers the kernel export table, a replacement called through `rt::call_unlifted` with stdcall argument popping, `describe()`, and virtual memory (granularity, top-down reservations, commit zeroing, queries, release).
+`qilin_host_tests` (CI, no game files) covers the kernel export table, a replacement called through `rt::call_unlifted` with stdcall argument popping, `describe()`, virtual memory (granularity, top-down reservations, commit zeroing, queries, release), and the file system on a scratch disc and hard disk: links, case-insensitive names, reads at offsets and to the end, the read-only disc, `..`, directory masks, creating and writing a save, attributes, formatting a cache partition, and the configuration area.
 
 ## Next
 
-1. **The file system:** the object namespace (`\Device\CdRom0`, the hard disk partitions, `\??\D:` and the other symbolic links XAPI creates), handles, and `Nt*File` over host directories: the extracted disc read-only, save data and cache partitions writable.
+1. **D3D:** the game's `main` calls Direct3D first. The D3D entry points it uses need replacements; the first ones create the device and set up the frame, before any drawing. They're the start of D3D on Vulkan (roadmap step 4).
 2. **The scheduler:** guest threads (`PsCreateSystemThreadEx`), waits, events, timers and DPCs. Until then a second thread stops the runtime.
-3. **Keep running `qilin_run`** and implement each kernel function it stops at. Lifted code imports 81; the rest of the list is the 167 library entry points (D3D, XACT, DSOUND …) it calls directly.
+3. **Keep running `qilin_run`** and implement each function it stops at: the rest of the 81 kernel imports, and the 167 library entry points (D3D, XACT, DSOUND …).
 4. **Hot C runtime functions** (`memcpy`, `strlen` …) may get native versions once the runtime shows which are hot, each checked against the lifted original.
 5. **Names:** XbSymbolDatabase can name the XDK library functions by signature, which would speed up identifying them.
 6. **D3D on Vulkan** (roadmap step 4).

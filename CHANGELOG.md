@@ -11,6 +11,22 @@ Each release is a git tag (`vX.Y.Z`) with a matching GitHub release. The version
 
 ## [Unreleased]
 
+## [0.13.0] - 2026-11-18
+The file system. XAPI's and the C runtime's start-up now complete, and the game's `main` runs until its first Direct3D call.
+
+### Added
+- **The kernel's I/O manager** (`recomp/runtime/host/kernel_io.cpp`) over host directories: `\Device\CdRom0` is the extracted disc, read-only; the hard disk's partitions are folders in a data directory; partition 0's configuration area is a sparse file. Symbolic links, handles, case-insensitive names relative to a handle or `ObDosDevicesDirectory()`, and `NtCreateFile`, `NtOpenFile`, `NtClose`, `NtReadFile`, `NtWriteFile`, `NtFlushBuffersFile`, `NtQueryInformationFile`, `NtSetInformationFile`, `NtQueryFullAttributesFile`, `NtQueryVolumeInformationFile`, `NtQueryDirectoryFile`, `NtDeviceIoControlFile` (disk geometry and partition information from the retail table), `NtFsControlFile` (dismount), `IoCreateSymbolicLink`, `IoDeleteSymbolicLink`, `NtOpenSymbolicLinkObject`, `NtQuerySymbolicLinkObject`.
+- **Cache partitions:** XAPI's format of the title's cache partition empties its folder and sets the volume's cluster size from the FATX header it writes, kept across runs. This title's Z: drive uses 64 KB clusters.
+- **`qilin_run --game-dir DIR` and `--data-dir DIR`:** the disc defaults to `default.xbe`'s folder, the hard disk to the platform's per-user data folder (`qilin/ghoulies`).
+- **`QILIN_TRACE_HLE=1`:** logs every replacement call with its caller, arguments and result, and every object name resolved.
+- **Kernel:** `RtlInitAnsiString`, `RtlEqualString`, `RtlUnicodeStringToAnsiString`, `RtlCompareMemoryUlong`, `RtlRaiseException` (stops with the code), `KeQuerySystemTime`, `XeLoadSection`, `XeUnloadSection`; `XeImageFileName` and `HalDiskCachePartitionCount` filled in.
+- **XBE sections without the preload flag** start as zero and are read in by `XeLoadSection`, with the kernel's reference counts.
+- **Tests:** the file system on a scratch disc and hard disk, in `qilin_host_tests`.
+
+### Fixed
+- **The main thread's TLS block** is at the top of its stack, as the kernel places it, with its pointer word and template copied as XAPI's thread start routine does. Before, the stack started over it and `SetLastError` wrote through a stray pointer, so the first failed call returned to the wrong place.
+
+
 ## [0.12.0] - 2026-11-18
 XAPI is lifted too, and the runtime implements the Xbox kernel beneath it. Start-up runs XAPI's own process initialisation and gets as far as its first file.
 

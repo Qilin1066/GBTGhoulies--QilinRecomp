@@ -15,6 +15,7 @@
 #include <initializer_list>
 #include <iterator>
 #include <cstdlib>
+#include <filesystem>
 #include <memory>
 #include <string_view>
 
@@ -31,6 +32,26 @@ constexpr uint32_t kGameMain = 0x32390;
 void push(rt::Context& c, uint32_t v) {
     c.esp -= 4;
     rt::st32(rt::Mem{c.mem, c.mem_size}, c.esp, v, 0);
+}
+
+// Where the hard disk's partitions live: the platform's per-user data
+// directory, under qilin/ghoulies.
+std::filesystem::path default_data_dir() {
+    auto env = [](const char* n) -> std::filesystem::path {
+        const char* v = std::getenv(n);
+        return v && *v ? std::filesystem::path(v) : std::filesystem::path();
+    };
+#if defined(_WIN32)
+    std::filesystem::path base = env("LOCALAPPDATA");
+#elif defined(__APPLE__)
+    std::filesystem::path base = env("HOME");
+    if (!base.empty()) base /= "Library/Application Support";
+#else
+    std::filesystem::path base = env("XDG_DATA_HOME");
+    if (base.empty() && !env("HOME").empty()) base = env("HOME") / ".local/share";
+#endif
+    if (base.empty()) base = ".";
+    return base / "qilin" / "ghoulies";
 }
 
 // Calls a guest function (cdecl) with the given arguments.
@@ -57,18 +78,43 @@ void run_table(rt::Context& c, uint32_t lo, uint32_t hi) {
     }
 }
 
+// The XBE's TLS directory (header +0x12C): StartAddressOfRawData,
+// EndAddressOfRawData, AddressOfIndex, AddressOfCallBacks, SizeOfZeroFill.
+// A thread's TLS block is a pointer to its data, then the data: the template
+// and the zero fill, rounded up to 16 bytes, as the entry point sizes it.
+uint32_t tls_directory(const rt::Mem& m) { return rt::ld32(m, 0x1012C, 0); }
+uint32_t tls_size(const rt::Mem& m) {
+    const uint32_t dir = tls_directory(m);
+    if (!dir) return 0;
+    auto ld = [&](uint32_t a) { return rt::ld32(m, a, 0); };
+    return ((ld(dir + 16) - ld(dir) + ld(dir + 4) + 15) & ~15u) + 4;
+}
+
 // What the XBE entry point (0x14FAE9) does before it starts the main thread:
-// fix up the certificate's size field, then size the static TLS block from the
-// TLS directory at 0x203468 and store its size (0x549528) and the TLS index.
+// fix up the certificate's size field, then store the TLS block's size
+// (0x549528) and the TLS index, which makes [StackBase + 4 * index] the block.
 void entry_prologue(rt::Context& c) {
     const rt::Mem m{c.mem, c.mem_size};
     auto ld = [&](uint32_t a) { return rt::ld32(m, a, 0); };
     const uint32_t cert = ld(0x10118);
     const uint32_t need = ld(0x10108) - cert + 0x10000;
     if (need < ld(cert)) rt::st32(m, cert, need, 0);
-    const uint32_t tls = ((ld(0x203478) - ld(0x203468) + ld(0x20346C) + 15) & ~15u) + 4;
+    const uint32_t tls = tls_size(m);
     rt::st32(m, 0x549528, tls, 0);
-    rt::st32(m, ld(0x203470), uint32_t(int32_t(tls) / -4), 0);
+    rt::st32(m, ld(tls_directory(m) + 8), uint32_t(int32_t(tls) / -4), 0);
+}
+
+// What XAPI's thread start routine (0x14BB4D) does first, on the TLS block the
+// kernel put at the top of the thread's stack (KTHREAD.TlsData): point its
+// first word at the data after it, copy the template there and zero the fill.
+void init_tls(rt::Context& c, uint32_t tls_data) {
+    const rt::Mem m{c.mem, c.mem_size};
+    auto ld = [&](uint32_t a) { return rt::ld32(m, a, 0); };
+    const uint32_t dir = tls_directory(m);
+    const uint32_t start = ld(dir), raw = ld(dir + 4) - start, zero = ld(dir + 16);
+    rt::st32(m, tls_data, tls_data + 4, 0);
+    for (uint32_t k = 0; k < raw; ++k) rt::st8(m, tls_data + 4 + k, rt::ld8(m, start + k, 0), 0);
+    for (uint32_t k = 0; k < zero; ++k) rt::st8(m, tls_data + 4 + raw + k, 0, 0);
 }
 
 // Start-up, as XAPI's main-thread procedure (0x14FA75) does it: XAPI's
@@ -89,6 +135,8 @@ void crt_startup(rt::Context& c) {
 
 int main(int argc, char** argv) {
     const char* path = nullptr;
+    const char* game_dir = nullptr;
+    const char* data_dir = nullptr;
     uint32_t ram_mb = host::kRetailRamMb;
     for (int k = 1; k < argc; ++k) {
         const std::string_view a = argv[k];
@@ -98,6 +146,10 @@ int main(int argc, char** argv) {
                 std::fprintf(stderr, "qilin_run: --ram-mb takes a multiple of 4 from %u to %u\n", host::kRetailRamMb, host::kMaxRamMb);
                 return 2;
             }
+        } else if (a == "--game-dir" && k + 1 < argc) {
+            game_dir = argv[++k];
+        } else if (a == "--data-dir" && k + 1 < argc) {
+            data_dir = argv[++k];
         } else if (!path) {
             path = argv[k];
         } else {
@@ -106,8 +158,12 @@ int main(int argc, char** argv) {
         }
     }
     if (!path) {
-        std::fprintf(stderr, "usage: qilin_run [--ram-mb N] <default.xbe>   (N: guest RAM in MB, %u by default, as the retail Xbox)\n",
-                     host::kRetailRamMb);
+        std::fprintf(stderr,
+                     "usage: qilin_run [--ram-mb N] [--game-dir DIR] [--data-dir DIR] <default.xbe>\n"
+                     "  --ram-mb N       guest RAM in MB (%u by default, as the retail Xbox)\n"
+                     "  --game-dir DIR   the extracted disc (default: default.xbe's directory)\n"
+                     "  --data-dir DIR   the hard disk: saves and caches (default: %s)\n",
+                     host::kRetailRamMb, default_data_dir().string().c_str());
         return 2;
     }
     host::set_memory_map(host::MemoryMap{ram_mb << 20});
@@ -131,6 +187,21 @@ int main(int argc, char** argv) {
         return 2;
     }
     std::memcpy(ram.get() + xbe.base, xbe.image().data(), xbe.image().size());
+    // Sections not marked preload stay unloaded until XeLoadSection, as the
+    // kernel's loader leaves them: keep their file data and clear their memory.
+    {
+        std::vector<host::DemandSection> demand;
+        const uint32_t headers = xbe.u32(xbe.base + 0x120);
+        for (size_t i = 0; i < xbe.sections.size(); ++i) {
+            const XbeSection& s = xbe.sections[i];
+            if (s.preload()) continue;
+            host::DemandSection d{headers + 56 * uint32_t(i), s.va, s.vsize, {}};
+            d.bytes.assign(ram.get() + s.va, ram.get() + s.va + s.rsize);
+            std::memset(ram.get() + s.va, 0, s.vsize);
+            demand.push_back(std::move(d));
+        }
+        host::set_demand_sections(std::move(demand));
+    }
     rt::Context c{};
     c.mem = ram.get();
     c.mem_size = mm.ram_size;
@@ -146,6 +217,7 @@ int main(int argc, char** argv) {
         const uint32_t slot = xbe.kthunk + 4 * uint32_t(i);
         if (e && e->data) {
             rt::st32(m, slot, data_slot, 0);
+            host::init_kernel_data(c, ordinal, data_slot);
             data_slot += 256;
         } else {
             rt::st32(m, slot, host::kernel_addr(ordinal), 0);
@@ -163,12 +235,20 @@ int main(int argc, char** argv) {
     host::vm().init(c.mem, (xbe.image_end() + 0xFFFFu) & ~0xFFFFu, mm.stack_bottom() & ~0xFFFFu);
     host::register_xapi();
     host::register_kernel();
+    const std::filesystem::path disc = game_dir ? std::filesystem::path(game_dir) : std::filesystem::path(path).parent_path();
+    const std::filesystem::path data = data_dir ? std::filesystem::path(data_dir) : default_data_dir();
+    host::register_kernel_io({disc.empty() ? std::filesystem::path(".") : disc, data});
+    std::printf("qilin_run: disc %s, hard disk %s\n", disc.string().c_str(), data.string().c_str());
 
     // The main thread: its information block (fs:[0] = end of the exception
     // chain), the C runtime's default x87 control word, and main's arguments.
-    host::init_main_thread(c, mm.kpcr(), mm.kthread(), mm.stack_top(), host::MemoryMap::kStackSize);
+    // The kernel puts the thread's TLS block at the top of its stack, below
+    // StackBase, and starts the stack under it.
+    const uint32_t tls = tls_size(m);
+    host::init_main_thread(c, mm.kpcr(), mm.kthread(), mm.stack_top(), host::MemoryMap::kStackSize, tls);
+    if (tls) init_tls(c, mm.stack_top() - tls);
     c.fpcw = 0x027F;
-    c.esp = mm.stack_top();
+    c.esp = (mm.stack_top() - tls) & ~15u;
     for (int k = 0; k < 3; ++k) push(c, 0);  // main(argc, argv, envp)
     push(c, host::kReturnSentinel);
     host::set_current(&c);
