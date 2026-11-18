@@ -37,7 +37,7 @@ Two 5-byte stubs at `0xF7270` / `0xF7280` are jumps into XAPI's allocator, calle
 | Indirect calls | 846 | C++ virtual calls / function pointers; need a runtime lookup table |
 | Switch jump tables | 496 | Tables inline after code; must be decoded |
 | Other indirect jumps | 17 | |
-| `fs:` (SEH / C++ EH) | 63 | Game uses C++ exceptions / SEH frames; lifter needs an EH strategy |
+| `fs:` (SEH / C++ EH) | 63 | Game uses C++ exception frames. Resolved in v0.7.0: lifted as guest-memory accesses (see `recompiler-core.md`) |
 | Privileged/port I/O | 0 real | The few hits are jump-table data decoded as code |
 
 Elsewhere: **BINK has 1,743 MMX instructions** (YUV→RGB blitters). The Rare libs are heavier on x87 (4.3k) plus 2.4k SSE.
@@ -68,7 +68,7 @@ Asset check: a 6.7 MB decompressed character bundle contains **no** push-buffer 
 **Consequence:** no NV2A emulation needed. The Vulkan layer implements `BeginPush` as a guest-visible scratch buffer and, at `EndPush`, interprets just `SET_BEGIN_END` / `INLINE_ARRAY` (anything else asserts) and issues the equivalent of `DrawPrimitiveUP` with the current vertex format.
 
 ## Risks remaining
-1. **C++ exceptions / SEH** (63 `fs:` sites, unwind funclets). The lifter needs a plan: map to host C++ EH, or `setjmp`-style frames.
+1. ~~**C++ exceptions / SEH**~~ Resolved in v0.7.0: the frame chain stays in guest memory, and since nothing in the game handles an exception it can throw, a throw stops with a diagnostic (see `recompiler-core.md`).
 2. **Indirect calls**: requires a function table covering every possible target (vtables in `.rdata`, function pointers in `.data`).
 3. **`pushbuffer.c` engine node**: may use D3D push-buffer *recording* (`BeginPushBuffer`/`RunPushBuffer`) at runtime. If so, our D3D layer records its own command lists, so no NV2A parsing is needed. To confirm once D3D functions are named.
 
