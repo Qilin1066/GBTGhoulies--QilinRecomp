@@ -7,7 +7,7 @@ if(APPLE AND NOT CMAKE_OSX_DEPLOYMENT_TARGET)
     set(CMAKE_OSX_DEPLOYMENT_TARGET 10.15 CACHE STRING "oldest macOS the runtime runs on")
 endif()
 # The single source of the version number (see CHANGELOG.md for the scheme).
-project(GBTGQilincomp VERSION 0.22.0 LANGUAGES C CXX)
+project(GBTGQilincomp VERSION 0.23.0 LANGUAGES C CXX)
 
 # ---- Language: C++23 everywhere (recompiler, runtime, generated code) ----
 set(CMAKE_CXX_STANDARD 23)
@@ -137,13 +137,43 @@ add_executable(qilin_audio_tests recomp/runtime/audio/audio_tests.cpp)
 target_link_libraries(qilin_audio_tests PRIVATE qilin_audio qilin_warnings)
 add_test(NAME qilin_audio_tests COMMAND qilin_audio_tests)
 
+# ---- Platform: the window, input and audio output, through SDL3 ----
+# A system SDL3 (3.2 or later) is used if CMake finds one; otherwise a pinned
+# release is fetched and built static, with only what the runtime uses.
+option(QILIN_SYSTEM_SDL "Use an installed SDL3 if there is one" ON)
+if(QILIN_SYSTEM_SDL)
+    find_package(SDL3 3.2 CONFIG QUIET COMPONENTS SDL3)
+endif()
+if(NOT TARGET SDL3::SDL3)
+    include(FetchContent)
+    set(SDL_SHARED OFF CACHE BOOL "" FORCE)
+    set(SDL_STATIC ON CACHE BOOL "" FORCE)
+    set(SDL_TEST_LIBRARY OFF CACHE BOOL "" FORCE)
+    set(SDL_TESTS OFF CACHE BOOL "" FORCE)
+    set(SDL_EXAMPLES OFF CACHE BOOL "" FORCE)
+    set(SDL_INSTALL OFF CACHE BOOL "" FORCE)
+    set(SDL_RENDER OFF CACHE BOOL "" FORCE)   # the runtime draws with its own Vulkan renderer
+    set(SDL_GPU OFF CACHE BOOL "" FORCE)
+    set(SDL_CAMERA OFF CACHE BOOL "" FORCE)
+    set(SDL_DIALOG OFF CACHE BOOL "" FORCE)
+    FetchContent_Declare(SDL3
+        URL https://github.com/libsdl-org/SDL/releases/download/release-3.4.20/SDL3-3.4.20.tar.gz
+        URL_HASH SHA256=f3bb06f55bed9557227a700af2ea62e49497ebdf58037732a731a5fb3ef8581f
+        DOWNLOAD_EXTRACT_TIMESTAMP ON
+        EXCLUDE_FROM_ALL)
+    FetchContent_MakeAvailable(SDL3)
+endif()
+add_library(qilin_platform STATIC recomp/runtime/platform/window.cpp)
+target_include_directories(qilin_platform PUBLIC recomp/runtime/platform)
+target_link_libraries(qilin_platform PUBLIC SDL3::SDL3 PRIVATE qilin_warnings)
+
 # ---- Runtime host side: native replacements (HLE) for code that isn't lifted ----
 add_library(qilin_host STATIC recomp/runtime/host/host.cpp recomp/runtime/host/xapi.cpp recomp/runtime/host/kernel.cpp
                               recomp/runtime/host/kernel_io.cpp recomp/runtime/host/xinput.cpp
                               recomp/runtime/host/call_guest.cpp recomp/runtime/host/d3d.cpp
                               recomp/runtime/host/dsound.cpp recomp/runtime/host/guest_ram.cpp)
 target_include_directories(qilin_host PUBLIC recomp/runtime/host)
-target_link_libraries(qilin_host PUBLIC qilin_runtime qilin_gfx qilin_audio PRIVATE qilin_warnings)
+target_link_libraries(qilin_host PUBLIC qilin_runtime qilin_gfx qilin_audio qilin_platform PRIVATE qilin_warnings)
 add_executable(qilin_host_tests recomp/runtime/host/host_tests.cpp)
 target_link_libraries(qilin_host_tests PRIVATE qilin_host qilin_warnings)
 add_test(NAME qilin_host_tests COMMAND qilin_host_tests)

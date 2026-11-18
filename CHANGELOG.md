@@ -11,6 +11,15 @@ Each release is a git tag (`vX.Y.Z`) with a matching GitHub release. The version
 
 ## [Unreleased]
 
+## [0.23.0] - 2026-11-18
+The game is shown in a window.
+
+### Added
+- **A window, through SDL3** (`recomp/runtime/platform/`): sized to the largest whole multiple of 640×480 that fits the main display, resizable, the picture scaled to fit with its shape kept (black bars where the window's shape differs). F11 or Alt+Enter switch fullscreen; closing the window stops the runtime. Events are handled at each `Swap`, on the game's own thread.
+- **Presenting in the renderer:** a swapchain made again when the window changes size or the driver says it's out of date, MAILBOX where the GPU has it and FIFO otherwise (the game paces itself, as on the console), nothing presented while minimised. The renderer still knows nothing of SDL: the window gives it the surface, the instance extensions and Vulkan's loader, so both use the same Vulkan library. Clean under the validation layer, resizes included.
+- **`--headless`** runs without a window (frames are still drawn, for `--dump-frames`); **`--fullscreen`** starts fullscreen. Where there's no display, `qilin_run` says so and runs headless.
+- **SDL3 in the build:** an installed SDL3 (3.2 or later) is used if CMake finds one; otherwise SDL 3.4.20 is downloaded (checked against its SHA-256) and built static, without the parts the runtime doesn't use. CI installs the Linux headers SDL's back ends need; the README lists them.
+
 ## [0.22.0] - 2026-11-18
 The game draws. The attract sequence renders on Vulkan: the candle, the book opening, the "Press START" text and its effects.
 

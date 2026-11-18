@@ -37,6 +37,7 @@
 #include "texture.hpp"
 #include "vsh.hpp"
 #include "host.hpp"
+#include "window.hpp"
 #include "strf.hpp"
 
 namespace qilin::host {
@@ -285,6 +286,15 @@ void create_device(rt::Context& c) {
     gc.back_buffers = count;
     gc.depth_stencil = auto_depth != 0;
     gc.gpu = d->config.gpu;
+    if (platform::Window* w = d->config.window) {
+        gc.surface.instance_extensions = w->vulkan_instance_extensions();
+        gc.surface.loader = w->vulkan_loader();
+        gc.surface.create = [w](void* instance, std::string* error) { return w->create_surface(instance, error); };
+        gc.surface.size = [w](uint32_t* pw, uint32_t* ph) {
+            if (w->minimized()) *pw = *ph = 0;
+            else w->pixel_size(pw, ph);
+        };
+    }
     std::string error;
     d->renderer = gfx::Renderer::create(gc, &error);
     if (!d->renderer) {
@@ -476,6 +486,15 @@ void swap(rt::Context& c) {
     mirror_device(c, d);
     run_vblanks(c, d, target, true);
     deliver_frame(d);
+    if (platform::Window* w = d.config.window) {
+        w->pump();
+        if (w->quit_requested()) {
+            std::fflush(stderr);
+            std::printf("qilin_run: the window was closed after %u frames\n", d.swaps);
+            std::fflush(stdout);
+            std::exit(0);
+        }
+    }
     ret(c, d.swaps, 4);
 }
 

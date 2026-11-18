@@ -1,6 +1,6 @@
 # Graphics: Direct3D on Vulkan (roadmap step 4)
 
-Last updated 2026-11-18 (v0.22.0: drawing; v0.21.0: resources destroyed as the original; v0.20.0: state setters, draws recorded, push-buffer sink; v0.17.0: vertex programs decoded, pixel-shader objects lifted; v0.16.0: D3D's resource code lifted; guest RAM's kernel windows; v0.14.0: the renderer and the Direct3D device).
+Last updated 2026-11-18 (v0.23.0: the window; v0.22.0: drawing; v0.21.0: resources destroyed as the original; v0.20.0: state setters, draws recorded, push-buffer sink; v0.17.0: vertex programs decoded, pixel-shader objects lifted; v0.16.0: D3D's resource code lifted; guest RAM's kernel windows; v0.14.0: the renderer and the Direct3D device).
 
 The game draws through the Xbox's Direct3D 8 library (D3D8, XDK 5659), which is linked into the XBE. Its calls stay in the recompiled code; what answers them is the runtime. Every D3D function the game calls is replaced natively (`recomp/runtime/host/d3d.cpp`) over a Vulkan 1.3 renderer (`recomp/runtime/gfx/`). There is no DirectX anywhere, and the Xbox's GPU (the NV2A) isn't emulated: the replacements see what the game asks for (clear this, draw that mesh with this texture) and do it with Vulkan.
 
@@ -39,6 +39,7 @@ The game has 24 vertex shaders, written in Xbox shader assembly (`vs.1.0` and `x
 - **Vulkan 1.3 core**, loaded at run time through volk: building needs no Vulkan SDK, and a machine without Vulkan gets a message naming what's missing. It uses dynamic rendering and synchronization2 (both core in 1.3), picks a discrete GPU over an integrated one over a software renderer (`--gpu N` chooses), and enables `VK_KHR_portability_subset` where it's offered (MoltenVK).
 - **Frame buffers are the renderer's own images**, B8G8R8A8 as the Xbox's A8R8G8B8, plus a D24S8 depth buffer (D32S8 where a GPU has no D24S8, as on Apple GPUs). The D3D back buffer is drawn into; `present` flips, as the Xbox's `Swap` does. Rendering doesn't depend on a window: a frame can be read back, saved (`--dump-frames`) or later scaled to any window size.
 - **Clears:** a clear of the whole buffer before anything is drawn becomes the render pass's load operation, which is what tile-based GPUs (Raspberry Pi, Apple) need to run well; other clears are `vkCmdClearAttachments`.
+- **The window** (v0.23.0) is SDL3's (`recomp/runtime/platform/window.*`); the renderer stays free of SDL, and the window gives it what a swapchain needs (the surface, the instance extensions, and Vulkan's loader as SDL loaded it, so both use one library). `present` copies the new front buffer into the swapchain, scaled with linear filtering to the largest size that keeps its shape, with black bars around it, then presents: MAILBOX where the GPU has it (least latency, no tearing), FIFO otherwise; the game paces itself through `Swap`'s vblank wait, so the window's refresh rate doesn't change its speed. The swapchain is made again when the window changes size or the driver reports it out of date or suboptimal; a minimised window gets nothing. The window opens at the largest whole multiple of 640×480 that fits the main display; F11 or Alt+Enter switch fullscreen; closing it stops the runtime. SDL's events are handled at each `Swap`, on the game's thread (macOS takes events only on the first thread, which is the game's). `--headless`, or no display, runs without a window.
 - **Validation:** `QILIN_VK_VALIDATION=1` turns on the Khronos validation layer if it's installed. The renderer test runs with it in CI, on Mesa's software driver (llvmpipe) on Linux x64 and ARM64; it's skipped where there's no Vulkan device (the macOS and Windows runners).
 
 ## Direct3D replacements so far
@@ -52,7 +53,7 @@ The game has 24 vertex shaders, written in Xbox shader assembly (`vs.1.0` and `x
 | `D3D_BlockOnResource`, `D3DVertexBuffer_Lock2` | See the lifted resource code above |
 | `D3DDevice_CreateVertexShader` | Builds the original's shader object, and decodes the program (Vertex shaders, above) |
 | `D3DDevice_SetVerticalBlankCallback` | Kept; called at each vblank (below) |
-| `D3DDevice_SetGammaRamp` | Kept; frames written with `--dump-frames` go through it, as the TV would show them |
+| `D3DDevice_SetGammaRamp` | Kept; frames written with `--dump-frames` go through it, as the TV would show them. The window doesn't apply it yet (the game sets one ramp so far, each level i to about i × 254/255: nearly the identity) |
 | `D3DDevice_BlockUntilIdle` | Waits for the GPU |
 | `D3DDevice_Clear` | Colour, depth and stencil, all of the target or a list of rectangles. Clearing some colour channels only stops the runtime |
 | `D3DDevice_Swap` | Shows the frame, waits for the vblank the presentation interval asks for, runs the vblank callback (below), returns the swap count |
@@ -81,11 +82,12 @@ Each draw call (and each `SET_BEGIN_END` pair the game pushes itself) becomes a 
 - **Textures** (`gfx/texture.*`): swizzled, linear and DXT1/3/5, every level, face and slice, decoded to RGBA8 and cached; texels are hashed once a frame and re-uploaded when they change. Linear textures are addressed in texels, as the hardware does.
 - **Culling:** the original sends `CULLMODE` to the GPU as GL's front/back against `FRONTFACE`, so the winding culled is the one `CULLMODE` names in GL's terms, y up. On the screen, y down, `D3DCULL_CW` culls what looks counter-clockwise.
 
-**Not modelled yet:** the fixed-function vertex and pixel pipelines (the game's draws so far are all programs and combiners), texture modes beyond the six above (bump mapping, dot products), fog factors (the vertex fog value is used as is), rendering into textures (named once and skipped), palettized textures, point sprites, the combiners' fixed-point precision, CPU writes to a frame buffer reaching the screen (the disc-error screen draws into the front buffer this way), the device's own `Release`, draws from `SetVertexShaderInput` streams, `Swap` keeping a render target that isn't the back buffer, a window.
+**Not modelled yet:** the fixed-function vertex and pixel pipelines (the game's draws so far are all programs and combiners), texture modes beyond the six above (bump mapping, dot products), fog factors (the vertex fog value is used as is), rendering into textures (named once and skipped), palettized textures, point sprites, the combiners' fixed-point precision, CPU writes to a frame buffer reaching the screen (the disc-error screen draws into the front buffer this way), the device's own `Release`, draws from `SetVertexShaderInput` streams, `Swap` keeping a render target that isn't the back buffer, the gamma ramp on screen.
 
 ## Next
 
-1. **A window** on SDL3, so frames are shown and not only saved; then the controller and audio output.
+1. **The controller and sound output** through SDL3 (input and audio, on the window's SDL).
 2. **Rendering into textures** (the book's pages and other effects), then the fixed-function pipelines, fog and the remaining texture modes, as the game reaches them.
-3. **Speed:** textures uploaded in GPU formats where the GPU has them (BC1-3) instead of decoded, fewer submissions per frame, a pipeline cache on disk.
-4. The improvements the design allows: higher resolutions, SMAA, better texture filtering.
+3. **Presenting through a shader** in place of the copy: the gamma ramp, and sharper scaling (sharp bilinear: whole-pixel scaling, then a linear step only at pixel edges).
+4. **Speed:** textures uploaded in GPU formats where the GPU has them (BC1-3) instead of decoded, fewer submissions per frame, a pipeline cache on disk.
+5. The improvements the design allows: higher resolutions, SMAA, better texture filtering.

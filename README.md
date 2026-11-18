@@ -15,7 +15,7 @@ Roadmap step 2, **recompiler core**, is in progress.
 | Function discovery + CFG (recursive descent, switch tables, C++ EH tables, data-as-code validation) | ✅ 8,842 functions, 556 jump tables (every one in lifted code has a proven size); **100% of the lifted code accounted for** (`qilin coverage`: 0 unknown bytes in the game code, Rare libraries and EH funclets) |
 | Lifter → C++ (integer, scalar SSE, x87 with the game's 24-bit precision control, jump tables, string ops; direct, indirect and tail calls; C++ exception frames) | ✅ all 6,214 functions (game code, Rare libraries, and the 471 C runtime and XAPI functions they reach; 3 more belong to Bink and are replaced with it), differentially tested against the original x86 under Unicorn, whole call trees included, also under UBSan: 0 mismatches |
 | Runtime: `qilin_run` loads the game and runs the lifted `main`, with a registry of native replacements for everything that isn't lifted | 🔨 started: XAPI and the C runtime lifted, the kernel beneath them native (memory, critical sections, timers, settings, the file system over your extracted disc and a data folder); XACT and XGraphics lifted too; the game's `main` creates its graphics device on Vulkan, starts its audio, loads its first assets and stops at its first texture (see `docs/runtime.md`) |
-| HLE of the XDK libraries, Vulkan | 🔨 started: the Vulkan 1.3 renderer (clears and frame flips, tested on Mesa's software driver in CI) and the first Direct3D replacements: the device, its frame buffers, clears, swaps at the display's vblank (see `docs/graphics.md`). DirectSound replaced over a software mixer (PCM and Xbox ADPCM voices, mix bins, `--dump-audio`; see `docs/audio.md`). Drawing, a window and input to come |
+| HLE of the XDK libraries, Vulkan | 🔨 started: the Vulkan 1.3 renderer (clears and frame flips, tested on Mesa's software driver in CI) and the first Direct3D replacements: the device, its frame buffers, clears, swaps at the display's vblank (see `docs/graphics.md`). Since v0.22.0 the game draws: vertex programs and pixel combiners as generated SPIR-V, textures, in a window (SDL3) since v0.23.0. DirectSound replaced over a software mixer (PCM and Xbox ADPCM voices, mix bins, `--dump-audio`; see `docs/audio.md`). Input and sound output to come |
 
 ## Versions and changes
 
@@ -32,7 +32,17 @@ The whole project (recompiler, runtime and generated code) is **C++23**. You nee
 | Apple Clang | Xcode 16 | |
 | MSVC | Visual Studio 2022 17.10 | |
 
-CMake stops with a clear message if the compiler is older. There are no other dependencies.
+CMake stops with a clear message if the compiler is older.
+
+The one other dependency is **SDL3** (window, input, audio output). CMake uses an installed SDL3 (3.2 or later) if it finds one; otherwise it downloads SDL 3.4.20 (checked against its SHA-256) and builds it static, which needs network access once. On Linux, SDL needs the development headers of what it supports, or the build has no window or sound there. On Debian, Ubuntu and Raspberry Pi OS:
+
+```sh
+sudo apt install libx11-dev libxext-dev libxrandr-dev libxcursor-dev libxfixes-dev libxi-dev libxss-dev libxtst-dev \
+    libwayland-dev libxkbcommon-dev wayland-protocols libdecor-0-dev libegl-dev \
+    libasound2-dev libpulse-dev libpipewire-0.3-dev libudev-dev libdbus-1-dev
+```
+
+Windows and macOS need nothing more.
 
 ```sh
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
@@ -51,7 +61,7 @@ build/qilin insns    path/to/default.xbe [--linear] -o listing.txt
 build/qilin suspects path/to/default.xbe                 # kept functions with problems, for review
 build/qilin coverage path/to/default.xbe [--list]        # every byte: code, table, padding or unknown (exit 3 if lifted code has unknown bytes)
 build/qilin lift     path/to/default.xbe --out gen/      # lift to C++ (gen/ is gitignored: never commit it)
-build/qilin_run      path/to/default.xbe [--game-dir DIR] [--data-dir DIR] [--ram-mb N] [--dump-frames DIR] [--dump-audio FILE.wav] [--frames N] [--gpu N]  # run it (built with -DQILIN_GEN_DIR=gen)
+build/qilin_run      path/to/default.xbe [--game-dir DIR] [--data-dir DIR] [--ram-mb N] [--dump-frames DIR] [--dump-audio FILE.wav] [--frames N] [--gpu N] [--headless] [--fullscreen]  # run it (built with -DQILIN_GEN_DIR=gen)
 
 Code that compiles lifted C++ must link the `qilin_runtime` CMake target (or pass `-ffp-contract=off`): SSE results are only bit-exact without fused multiply-add.
 ```
@@ -80,6 +90,7 @@ This runs the unit tests and the CFG pass, then cross-checks Zydis against LLVM'
 | `recomp/runtime/` | Runtime headers the generated C++ includes (guest memory, flag and float helpers, x87 maths) |
 | `recomp/runtime/host/` | The runtime's host side: `qilin_run`, the replacement registry, the guest heap and the replacements themselves (kernel, file system, Direct3D, XInput) |
 | `recomp/runtime/gfx/` | The renderer: Vulkan 1.3, loaded at run time |
+| `recomp/runtime/platform/` | The window (and soon input and sound output), through SDL3 |
 | `recomp/runtime/audio/` | The audio engine: voices (PCM, Xbox ADPCM) and the 48 kHz mixer |
 | `tools/check/` | The LLVM decoder cross-check, the x87 rounding and transcendental cross-checks, the C++ exception-handling report and the full local check script |
 | `tools/difftest/` | Differential test: lifted C++ against the original x86 under Unicorn |

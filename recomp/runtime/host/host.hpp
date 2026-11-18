@@ -20,6 +20,10 @@
 
 #include "guest.hpp"
 
+namespace qilin::platform {
+class Window;
+}
+
 namespace qilin::host {
 
 // ---- Guest memory: RAM flat from address 0. 64 MB is the retail Xbox's;
@@ -119,6 +123,7 @@ struct D3dConfig {
     std::string dump_dir;     // write each presented frame there as frame_NNNNN.png (--dump-frames)
     uint64_t max_frames = 0;  // stop after this many frames, 0 for never (--frames)
     int gpu = -1;             // Vulkan device index, -1 for the best one (--gpu)
+    platform::Window* window = nullptr;  // where frames are shown; none with --headless
 };
 void register_d3d(const D3dConfig& config);
 const D3dConfig& d3d_config();

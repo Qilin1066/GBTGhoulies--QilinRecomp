@@ -124,7 +124,11 @@ private:
     void transition(Target& t, VkImageLayout to);
     void begin_pass();                               // makes sure the render pass is open, applying pending clears
     void end_pass();
-    void submit();                                   // ends the command buffer, submits it and waits for it
+    // Ends the command buffer, submits it and waits for it; the submission can
+    // wait for a semaphore before its transfers and signal one when done.
+    void submit(VkSemaphore wait = VK_NULL_HANDLE, VkSemaphore signal = VK_NULL_HANDLE);
+    void show(Target& frame);                        // to the window: scaled into the swapchain, then presented
+    bool make_swapchain(uint32_t width, uint32_t height);
     void create_draw_objects();
     VkDeviceSize ring_alloc(VkDeviceSize bytes, VkDeviceSize align, const void* data);  // into this submission's ring
     VkShaderModule shader(uint64_t key, const std::vector<uint32_t>* code);
@@ -147,6 +151,16 @@ private:
     VkCommandPool pool_ = VK_NULL_HANDLE;
     VkCommandBuffer cmd_ = VK_NULL_HANDLE;
     VkFence fence_ = VK_NULL_HANDLE;
+
+    // The window, when there is one.
+    VkSurfaceKHR surface_ = VK_NULL_HANDLE;
+    VkSwapchainKHR swapchain_ = VK_NULL_HANDLE;
+    VkFormat swap_format_ = VK_FORMAT_UNDEFINED;
+    VkExtent2D swap_extent_{};
+    std::vector<VkImage> swap_images_;
+    VkSemaphore acquired_ = VK_NULL_HANDLE;
+    std::vector<VkSemaphore> rendered_;  // one for each swapchain image, which its presentation waits for
+    bool swap_stale_ = false;            // out of date or suboptimal: made again before the next frame
 
     std::vector<Target> color_;  // the flip chain: back_ is drawn to, front_ was presented last
     uint32_t back_ = 0, front_ = 0;
@@ -195,7 +209,10 @@ private:
 };
 
 bool VulkanRenderer::create_instance(std::string* error) {
-    if (volkInitialize() != VK_SUCCESS) {
+    const VkResult loaded = config_.surface.loader
+                                ? (volkInitializeCustom(reinterpret_cast<PFN_vkGetInstanceProcAddr>(config_.surface.loader)), VK_SUCCESS)
+                                : volkInitialize();
+    if (loaded != VK_SUCCESS) {
         *error = "no Vulkan library found: install a graphics driver with Vulkan 1.3 (on macOS, MoltenVK)";
         return false;
     }
@@ -229,6 +246,13 @@ bool VulkanRenderer::create_instance(std::string* error) {
         enabled_layers.push_back(kValidation);
         extensions.push_back(VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
     }
+    for (const char* e : config_.surface.instance_extensions) {
+        if (!has(available, e)) {
+            *error = std::string("the Vulkan library has no ") + e + ", which the window needs";
+            return false;
+        }
+        if (std::ranges::none_of(extensions, [&](const char* x) { return std::strcmp(x, e) == 0; })) extensions.push_back(e);
+    }
 
     VkApplicationInfo app{VK_STRUCTURE_TYPE_APPLICATION_INFO};
     app.pApplicationName = "qilin";
@@ -253,6 +277,10 @@ bool VulkanRenderer::create_instance(std::string* error) {
         m.pfnUserCallback = on_debug_message;
         m.pUserData = &validation_errors_;
         check(vkCreateDebugUtilsMessengerEXT(instance_, &m, nullptr, &messenger_), "vkCreateDebugUtilsMessengerEXT");
+    }
+    if (config_.surface.create) {
+        surface_ = VkSurfaceKHR(config_.surface.create(instance_, error));
+        if (!surface_) return false;
     }
     return true;
 }
@@ -292,9 +320,20 @@ bool VulkanRenderer::pick_device(std::string* error) {
             vkGetPhysicalDeviceQueueFamilyProperties(devices[i], &q, nullptr);
             std::vector<VkQueueFamilyProperties> families(q);
             vkGetPhysicalDeviceQueueFamilyProperties(devices[i], &q, families.data());
-            for (uint32_t k = 0; k < q && family == UINT32_MAX; ++k)
-                if (families[k].queueFlags & VK_QUEUE_GRAPHICS_BIT) family = k;
-            if (why.empty() && family == UINT32_MAX) why = "no graphics queue";
+            for (uint32_t k = 0; k < q && family == UINT32_MAX; ++k) {
+                VkBool32 presents = VK_TRUE;
+                if (surface_) vkGetPhysicalDeviceSurfaceSupportKHR(devices[i], k, surface_, &presents);
+                if ((families[k].queueFlags & VK_QUEUE_GRAPHICS_BIT) && presents) family = k;
+            }
+            if (why.empty() && family == UINT32_MAX) why = surface_ ? "no graphics queue that can show the window" : "no graphics queue";
+            if (why.empty() && surface_) {
+                uint32_t e = 0;
+                vkEnumerateDeviceExtensionProperties(devices[i], nullptr, &e, nullptr);
+                std::vector<VkExtensionProperties> exts(e);
+                vkEnumerateDeviceExtensionProperties(devices[i], nullptr, &e, exts.data());
+                exts.resize(e);
+                if (!has(exts, VK_KHR_SWAPCHAIN_EXTENSION_NAME)) why = "no swapchains";
+            }
         }
         if (!why.empty()) {
             rejected += std::string(rejected.empty() ? "" : "; ") + props.deviceName + ": " + why;
@@ -352,6 +391,7 @@ void VulkanRenderer::create_device() {
     f13.synchronization2 = VK_TRUE;
     std::vector<const char*> extensions;
     if (portability_subset_) extensions.push_back("VK_KHR_portability_subset");
+    if (surface_) extensions.push_back(VK_KHR_SWAPCHAIN_EXTENSION_NAME);
     VkDeviceCreateInfo info{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
     info.pNext = &f13;
     info.queueCreateInfoCount = 1;
@@ -481,10 +521,15 @@ void VulkanRenderer::destroy() {
         if (readback_) vkDestroyBuffer(device_, readback_, nullptr);
         if (readback_memory_) vkFreeMemory(device_, readback_memory_, nullptr);
         if (fence_) vkDestroyFence(device_, fence_, nullptr);
+        if (swapchain_) vkDestroySwapchainKHR(device_, swapchain_, nullptr);
+        if (acquired_) vkDestroySemaphore(device_, acquired_, nullptr);
+        for (VkSemaphore sem : rendered_) vkDestroySemaphore(device_, sem, nullptr);
         if (pool_) vkDestroyCommandPool(device_, pool_, nullptr);
         vkDestroyDevice(device_, nullptr);
         device_ = VK_NULL_HANDLE;
     }
+    if (surface_) vkDestroySurfaceKHR(instance_, surface_, nullptr);
+    surface_ = VK_NULL_HANDLE;
     if (messenger_) vkDestroyDebugUtilsMessengerEXT(instance_, messenger_, nullptr);
     if (instance_) vkDestroyInstance(instance_, nullptr);
     instance_ = VK_NULL_HANDLE;
@@ -598,7 +643,7 @@ void VulkanRenderer::clear(const Rect* rects, uint32_t count, uint32_t flags, co
     vkCmdClearAttachments(cmd_, n, attachments, uint32_t(clipped.size()), clipped.data());
 }
 
-void VulkanRenderer::submit() {
+void VulkanRenderer::submit(VkSemaphore wait, VkSemaphore signal) {
     if (!recording_) return;
     check(vkEndCommandBuffer(cmd_), "vkEndCommandBuffer");
     recording_ = false;
@@ -607,6 +652,19 @@ void VulkanRenderer::submit() {
     VkSubmitInfo2 info{VK_STRUCTURE_TYPE_SUBMIT_INFO_2};
     info.commandBufferInfoCount = 1;
     info.pCommandBufferInfos = &cb;
+    VkSemaphoreSubmitInfo w{VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO}, sg{VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO};
+    if (wait) {
+        w.semaphore = wait;
+        w.stageMask = VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT;
+        info.waitSemaphoreInfoCount = 1;
+        info.pWaitSemaphoreInfos = &w;
+    }
+    if (signal) {
+        sg.semaphore = signal;
+        sg.stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+        info.signalSemaphoreInfoCount = 1;
+        info.pSignalSemaphoreInfos = &sg;
+    }
     check(vkQueueSubmit2(queue_, 1, &info, fence_), "vkQueueSubmit2");
     check(vkWaitForFences(device_, 1, &fence_, VK_TRUE, UINT64_MAX), "vkWaitForFences");
     check(vkResetFences(device_, 1, &fence_), "vkResetFences");
@@ -625,10 +683,178 @@ void VulkanRenderer::submit() {
 
 void VulkanRenderer::present() {
     end_pass();
-    submit();
+    if (surface_) show(color_[back_]);
+    else submit();
     front_ = back_;
     back_ = (back_ + 1) % uint32_t(color_.size());
     ++frames_;
+}
+
+// The swapchain for a drawable of width × height pixels: images the frame is
+// copied into (8-bit UNORM, as the frame buffers, so the copy changes no
+// value), and the present mode with the least latency that doesn't tear:
+// MAILBOX where there is one, FIFO (always there) otherwise. The game paces
+// itself, as on the console (Swap waits for its vblank), so either works.
+bool VulkanRenderer::make_swapchain(uint32_t width, uint32_t height) {
+    VkSurfaceCapabilitiesKHR caps{};
+    check(vkGetPhysicalDeviceSurfaceCapabilitiesKHR(gpu_, surface_, &caps), "vkGetPhysicalDeviceSurfaceCapabilitiesKHR");
+    VkExtent2D extent = caps.currentExtent;
+    if (extent.width == UINT32_MAX) {  // the window takes its size from the swapchain (Wayland)
+        extent.width = std::clamp(width, caps.minImageExtent.width, caps.maxImageExtent.width);
+        extent.height = std::clamp(height, caps.minImageExtent.height, caps.maxImageExtent.height);
+    }
+    if (extent.width == 0 || extent.height == 0) return false;  // minimised
+    if (!(caps.supportedUsageFlags & VK_IMAGE_USAGE_TRANSFER_DST_BIT)) {
+        std::fprintf(stderr, "qilin: Vulkan: the window's images can't be copied into on %s\n", device_name_.c_str());
+        std::exit(3);
+    }
+
+    if (swap_format_ == VK_FORMAT_UNDEFINED) {
+        uint32_t n = 0;
+        vkGetPhysicalDeviceSurfaceFormatsKHR(gpu_, surface_, &n, nullptr);
+        std::vector<VkSurfaceFormatKHR> formats(n);
+        vkGetPhysicalDeviceSurfaceFormatsKHR(gpu_, surface_, &n, formats.data());
+        formats.resize(n);
+        auto blits = [&](VkFormat f) {
+            VkFormatProperties fp{};
+            vkGetPhysicalDeviceFormatProperties(gpu_, f, &fp);
+            return (fp.optimalTilingFeatures & VK_FORMAT_FEATURE_BLIT_DST_BIT) != 0;
+        };
+        for (const VkFormat want : {VK_FORMAT_B8G8R8A8_UNORM, VK_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_A8B8G8R8_UNORM_PACK32})
+            for (const VkSurfaceFormatKHR& f : formats)
+                if (swap_format_ == VK_FORMAT_UNDEFINED && f.format == want && f.colorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR && blits(want))
+                    swap_format_ = want;
+        if (swap_format_ == VK_FORMAT_UNDEFINED) {  // an sRGB format only: the copy would encode, so the picture is brighter
+            for (const VkSurfaceFormatKHR& f : formats)
+                if (swap_format_ == VK_FORMAT_UNDEFINED && blits(f.format)) swap_format_ = f.format;
+            if (swap_format_ == VK_FORMAT_UNDEFINED) {
+                std::fprintf(stderr, "qilin: Vulkan: the window has no image format the renderer can copy into\n");
+                std::exit(3);
+            }
+            std::fprintf(stderr, "qilin: the window has only sRGB formats; colours will be lighter than the console's\n");
+        }
+    }
+    uint32_t n = 0;
+    vkGetPhysicalDeviceSurfacePresentModesKHR(gpu_, surface_, &n, nullptr);
+    std::vector<VkPresentModeKHR> modes(n);
+    vkGetPhysicalDeviceSurfacePresentModesKHR(gpu_, surface_, &n, modes.data());
+    const VkPresentModeKHR mode = std::ranges::find(modes, VK_PRESENT_MODE_MAILBOX_KHR) != modes.end() ? VK_PRESENT_MODE_MAILBOX_KHR
+                                                                                                      : VK_PRESENT_MODE_FIFO_KHR;
+    uint32_t count = caps.minImageCount + 1;
+    if (caps.maxImageCount && count > caps.maxImageCount) count = caps.maxImageCount;
+
+    check(vkDeviceWaitIdle(device_), "vkDeviceWaitIdle");  // the old swapchain's images may still be presenting
+    VkSwapchainCreateInfoKHR info{VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR};
+    info.surface = surface_;
+    info.minImageCount = count;
+    info.imageFormat = swap_format_;
+    info.imageColorSpace = VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;
+    info.imageExtent = extent;
+    info.imageArrayLayers = 1;
+    info.imageUsage = VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+    info.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    info.preTransform = (caps.supportedTransforms & VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR) ? VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR
+                                                                                           : caps.currentTransform;
+    info.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
+    for (const VkCompositeAlphaFlagBitsKHR a : {VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR, VK_COMPOSITE_ALPHA_INHERIT_BIT_KHR,
+                                                VK_COMPOSITE_ALPHA_PRE_MULTIPLIED_BIT_KHR, VK_COMPOSITE_ALPHA_POST_MULTIPLIED_BIT_KHR})
+        if (caps.supportedCompositeAlpha & a) {
+            info.compositeAlpha = a;
+            break;
+        }
+    info.presentMode = mode;
+    info.clipped = VK_TRUE;
+    info.oldSwapchain = swapchain_;
+    VkSwapchainKHR made = VK_NULL_HANDLE;
+    check(vkCreateSwapchainKHR(device_, &info, nullptr, &made), "vkCreateSwapchainKHR");
+    if (swapchain_) vkDestroySwapchainKHR(device_, swapchain_, nullptr);
+    swapchain_ = made;
+    swap_extent_ = extent;
+    swap_stale_ = false;
+
+    vkGetSwapchainImagesKHR(device_, swapchain_, &n, nullptr);
+    swap_images_.resize(n);
+    vkGetSwapchainImagesKHR(device_, swapchain_, &n, swap_images_.data());
+    const VkSemaphoreCreateInfo sem{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
+    if (!acquired_) check(vkCreateSemaphore(device_, &sem, nullptr, &acquired_), "vkCreateSemaphore");
+    while (rendered_.size() < n) {
+        VkSemaphore s = VK_NULL_HANDLE;
+        check(vkCreateSemaphore(device_, &sem, nullptr, &s), "vkCreateSemaphore");
+        rendered_.push_back(s);
+    }
+    return true;
+}
+
+// The frame, scaled to fit the window with its shape kept (black bars on the
+// sides or above and below), filtered linearly, then presented.
+void VulkanRenderer::show(Target& frame) {
+    uint32_t w = 0, h = 0;
+    if (config_.surface.size) config_.surface.size(&w, &h);
+    if (w == 0 || h == 0) return submit();  // minimised: nothing to show
+    if (!swapchain_ || swap_stale_ || (w != swap_extent_.width || h != swap_extent_.height))
+        if (!make_swapchain(w, h)) return submit();
+    uint32_t index = 0;
+    const VkResult got = vkAcquireNextImageKHR(device_, swapchain_, UINT64_MAX, acquired_, VK_NULL_HANDLE, &index);
+    if (got == VK_ERROR_OUT_OF_DATE_KHR) {
+        swap_stale_ = true;
+        return submit();
+    }
+    if (got == VK_SUBOPTIMAL_KHR) swap_stale_ = true;
+    else check(got, "vkAcquireNextImageKHR");
+
+    record();
+    transition(frame, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+    const VkImage image = swap_images_[index];
+    auto barrier = [&](VkImageLayout from, VkImageLayout to, VkPipelineStageFlags2 src, VkAccessFlags2 src_access,
+                       VkPipelineStageFlags2 dst, VkAccessFlags2 dst_access) {
+        VkImageMemoryBarrier2 b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};
+        b.srcStageMask = src;
+        b.srcAccessMask = src_access;
+        b.dstStageMask = dst;
+        b.dstAccessMask = dst_access;
+        b.oldLayout = from;
+        b.newLayout = to;
+        b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        b.image = image;
+        b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        VkDependencyInfo dep{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+        dep.imageMemoryBarrierCount = 1;
+        dep.pImageMemoryBarriers = &b;
+        vkCmdPipelineBarrier2(cmd_, &dep);
+    };
+    // From UNDEFINED: the whole image is written, so what it held doesn't matter.
+    barrier(VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT, 0,
+            VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
+    const VkClearColorValue black{};
+    const VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    vkCmdClearColorImage(cmd_, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &black, 1, &range);
+    barrier(VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT,
+            VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
+
+    const uint64_t fw = config_.width, fh = config_.height, sw = swap_extent_.width, sh = swap_extent_.height;
+    uint64_t dw = sw, dh = sh;
+    if (sw * fh > sh * fw) dw = std::max<uint64_t>(1, sh * fw / fh);  // wider than the frame: bars at the sides
+    else dh = std::max<uint64_t>(1, sw * fh / fw);
+    const int32_t dx = int32_t((sw - dw) / 2), dy = int32_t((sh - dh) / 2);
+    VkImageBlit blit{};
+    blit.srcSubresource = blit.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    blit.srcOffsets[1] = {int32_t(fw), int32_t(fh), 1};
+    blit.dstOffsets[0] = {dx, dy, 0};
+    blit.dstOffsets[1] = {dx + int32_t(dw), dy + int32_t(dh), 1};
+    vkCmdBlitImage(cmd_, frame.image, frame.layout, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit, VK_FILTER_LINEAR);
+    barrier(VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT,
+            VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_2_NONE, 0);
+    submit(acquired_, rendered_[index]);
+
+    VkPresentInfoKHR info{VK_STRUCTURE_TYPE_PRESENT_INFO_KHR};
+    info.waitSemaphoreCount = 1;
+    info.pWaitSemaphores = &rendered_[index];
+    info.swapchainCount = 1;
+    info.pSwapchains = &swapchain_;
+    info.pImageIndices = &index;
+    const VkResult shown = vkQueuePresentKHR(queue_, &info);
+    if (shown == VK_ERROR_OUT_OF_DATE_KHR || shown == VK_SUBOPTIMAL_KHR) swap_stale_ = true;
+    else check(shown, "vkQueuePresentKHR");
 }
 
 Image VulkanRenderer::read(Target& t) {

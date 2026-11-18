@@ -22,6 +22,7 @@
 #include "regions.hpp"
 #include "host.hpp"
 #include "xbe.hpp"
+#include "window.hpp"
 
 using namespace qilin;
 
@@ -131,6 +132,7 @@ int main(int argc, char** argv) {
     const char* data_dir = nullptr;
     host::D3dConfig d3d;
     std::string dump_audio;
+    bool headless = false, fullscreen = false;
     uint32_t ram_mb = host::kRetailRamMb;
     for (int k = 1; k < argc; ++k) {
         const std::string_view a = argv[k];
@@ -150,6 +152,10 @@ int main(int argc, char** argv) {
             dump_audio = argv[++k];
         } else if (a == "--frames" && k + 1 < argc) {
             d3d.max_frames = std::strtoull(argv[++k], nullptr, 10);
+        } else if (a == "--headless") {
+            headless = true;
+        } else if (a == "--fullscreen") {
+            fullscreen = true;
         } else if (a == "--gpu" && k + 1 < argc) {
             d3d.gpu = int(std::strtol(argv[++k], nullptr, 10));
         } else if (!path) {
@@ -161,14 +167,16 @@ int main(int argc, char** argv) {
     }
     if (!path) {
         std::fprintf(stderr,
-                     "usage: qilin_run [--ram-mb N] [--game-dir DIR] [--data-dir DIR] [--dump-frames DIR] [--dump-audio FILE.wav] [--frames N] [--gpu N] <default.xbe>\n"
+                     "usage: qilin_run [--ram-mb N] [--game-dir DIR] [--data-dir DIR] [--dump-frames DIR] [--dump-audio FILE.wav] [--frames N] [--gpu N] [--headless] [--fullscreen] <default.xbe>\n"
                      "  --ram-mb N       guest RAM in MB (%u by default, as the retail Xbox)\n"
                      "  --game-dir DIR   the extracted disc (default: default.xbe's directory)\n"
                      "  --data-dir DIR   the hard disk: saves and caches (default: %s)\n"
                      "  --dump-frames DIR  write every frame shown there as a PNG\n"
                      "  --dump-audio FILE.wav  write everything the mixer plays there\n"
                      "  --frames N       stop after N frames\n"
-                     "  --gpu N          the Vulkan device to use, by index (default: the best one)\n",
+                     "  --gpu N          the Vulkan device to use, by index (default: the best one)\n"
+                     "  --headless       no window (frames are still drawn, for --dump-frames)\n"
+                     "  --fullscreen     start fullscreen (F11 or Alt+Enter switches)\n",
                      host::kRetailRamMb, default_data_dir().string().c_str());
         return 2;
     }
@@ -251,6 +259,14 @@ int main(int argc, char** argv) {
     host::vm().init(c.mem, (xbe.image_end() + 0xFFFFu) & ~0xFFFFu, mm.stack_bottom() & ~0xFFFFu);
     host::register_xapi();
     host::register_xinput();
+    // The window: where there's no display, the game still runs and draws.
+    std::unique_ptr<platform::Window> window;
+    if (!headless) {
+        std::string why;
+        window = platform::Window::create("Grabbed by the Ghoulies", 640, 480, fullscreen, &why);
+        if (!window) std::printf("qilin_run: no window (%s); running without one\n", why.c_str());
+    }
+    d3d.window = window.get();
     host::register_d3d(d3d);
     host::register_dsound(dump_audio);
     host::register_kernel();

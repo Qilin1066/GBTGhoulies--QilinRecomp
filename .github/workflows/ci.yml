@@ -29,6 +29,10 @@ jobs:
           sudo apt-get install -y -qq g++-14 ${{ startsWith(matrix.cc, 'clang') && matrix.cc || '' }}
           # Mesa's software Vulkan driver (llvmpipe) and the validation layer, so the renderer test runs.
           sudo apt-get install -y -qq mesa-vulkan-drivers vulkan-validationlayers
+          # SDL3's window, input and audio back ends (the build fetches SDL itself).
+          sudo apt-get install -y -qq libx11-dev libxext-dev libxrandr-dev libxcursor-dev libxfixes-dev libxi-dev libxss-dev \
+            libxtst-dev libwayland-dev libxkbcommon-dev wayland-protocols libdecor-0-dev libegl-dev libasound2-dev \
+            libpulse-dev libpipewire-0.3-dev libudev-dev libdbus-1-dev
       - name: Configure
         shell: bash
         run: |

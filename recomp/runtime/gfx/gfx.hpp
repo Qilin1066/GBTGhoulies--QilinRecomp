@@ -8,6 +8,7 @@
 #pragma once
 
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <string>
 #include <vector>
@@ -20,6 +21,16 @@ struct Config {
     bool depth_stencil = true;           // a 24-bit depth, 8-bit stencil buffer
     int gpu = -1;                        // index among the Vulkan devices; -1 picks the best one
     bool validation = false;             // Vulkan validation layers, if installed (also QILIN_VK_VALIDATION=1)
+
+    // A window to show frames in; without one (create empty) frames are
+    // only kept, to read back. The renderer stays free of any windowing
+    // library: the window's side gives these.
+    struct Surface {
+        std::vector<const char*> instance_extensions;  // what the surface needs
+        void* loader = nullptr;                        // PFN_vkGetInstanceProcAddr to load Vulkan through, or null
+        std::function<uint64_t(void* instance, std::string* error)> create;  // a VkSurfaceKHR, 0 on failure
+        std::function<void(uint32_t* width, uint32_t* height)> size;        // the drawable size in pixels now
+    } surface;
 };
 
 struct Rect {
