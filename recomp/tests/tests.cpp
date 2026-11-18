@@ -556,8 +556,8 @@ int main() {
         in.insns = {0x113EE, 0x113F0, 0x113F1};
         CHECK(!lifter.lift(in).has_value());  // without the convention: flags read before written
         Conventions conv;
-        conv.flags_out = {{0x113EB, 8}};
-        conv.flags_in = {{0x113EE, 8}};
+        conv.flags_out = {{0x113EBu, uint8_t{8}}};
+        conv.flags_in = {{0x113EEu, uint8_t{8}}};
         Lifter with(dec, &conv);
         auto o = with.lift(out);
         CHECK(o.has_value() && o->contains("c.eflags = 0u | (zf ? 0x40u : 0u);"));
