@@ -11,6 +11,15 @@ Each release is a git tag (`vX.Y.Z`) with a matching GitHub release. The version
 
 ## [Unreleased]
 
+## [0.26.0] - 2026-11-18
+The whole attract sequence draws: the desk, the Rare and Microsoft books, the title page and the comic-strip pages with their 3D scenes.
+
+### Added
+- **Rendering into textures:** draws and clears into a texture's surface go to a renderer image for it, with the device's depth buffer when the game pairs them; textures whose texels the GPU drew are sampled from that image, with nothing read back. A CPU write to the texture's memory hands it back to the guest's texels. Clean under the validation layer.
+
+### Fixed
+- **Culling:** `D3DCULL_CW` culls triangles clockwise on screen, and `D3DCULL_CCW` counter-clockwise ones. Since v0.22.0 it was the other way round: the attract sequence's pages read mirrored and the desk behind the books was culled away.
+
 ## [0.25.0] - 2026-11-18
 The game makes sound: its music, effects and menu sounds play through the speakers.
 

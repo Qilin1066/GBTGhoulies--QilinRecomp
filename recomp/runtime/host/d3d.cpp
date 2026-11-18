@@ -118,6 +118,16 @@ struct Device {
         uint32_t width = 0, height = 0, depth = 1;
     };
     std::unordered_map<uint64_t, CachedTexture> textures;
+    // Textures the game renders into: the renderer's image for each, by the
+    // guest address of its texels. Their texels live on the GPU; guest
+    // memory keeps what the CPU last put there, hashed, so a CPU write (the
+    // memory reused for another resource) takes over from the GPU's image.
+    struct TargetTexture {
+        CachedTexture texture;  // the renderer's id, the shape
+        uint32_t format = 0;
+        uint64_t guest = 0;     // hash of the guest bytes when last rendered
+    };
+    std::map<uint32_t, TargetTexture> targets;
     std::vector<std::string> said;  // notices given once
 };
 Device* g_device = nullptr;
@@ -439,6 +449,7 @@ void block_until_idle(rt::Context& c) {
 // HRESULT D3DDevice_Clear(DWORD Count, CONST D3DRECT*, DWORD Flags, D3DCOLOR,
 //     float Z, DWORD Stencil): the render target and depth buffer, all of
 //     them or the rectangles given (D3DRECT: x1, y1, x2, y2).
+std::pair<uint32_t, uint32_t> apply_target(rt::Context& c, Device& d, const char* fn);
 void clear(rt::Context& c) {
     Device& d = device("D3DDevice_Clear");
     const uint32_t count = arg(c, 0), rects = arg(c, 1), flags = arg(c, 2), color = arg(c, 3), stencil = arg(c, 5);
@@ -464,6 +475,7 @@ void clear(rt::Context& c) {
     if (flags & kClearStencil) f |= gfx::kClearStencil;
     const float rgba[4] = {float((color >> 16) & 0xFF) / 255.0f, float((color >> 8) & 0xFF) / 255.0f, float(color & 0xFF) / 255.0f,
                            float(color >> 24) / 255.0f};
+    apply_target(c, d, "D3DDevice_Clear");
     d.renderer->clear(list.data(), uint32_t(list.size()), f, rgba, z, stencil & 0xFF);
     ret(c, 0, 24);
 }
@@ -559,6 +571,8 @@ void copy_rects(rt::Context& c) {
     const uint32_t src = arg(c, 0), rects = arg(c, 1), count = arg(c, 2), dst = arg(c, 3), points = arg(c, 4);
     const SurfacePixels from = surface_pixels(c, d, fn, src), to = surface_pixels(c, d, fn, dst);
     if (to.frame_buffer >= 0) unmodelled(fn, "a copy into a frame buffer");
+    if (d.targets.count(to.data)) unmodelled(fn, "a copy into a texture the GPU renders into");
+    if (d.targets.count(from.data)) unmodelled(fn, "a copy from a texture the GPU renders into");
     if (count == 0 && rects) unmodelled(fn, "a rectangle list with no rectangles");
 
     std::vector<uint32_t> source;  // only for a frame buffer
@@ -948,7 +962,9 @@ enum Rs : uint32_t {
 
 // A texture stage's texture, decoded and uploaded once (and again when its
 // texels change; they're compared once a frame).
+const Device::CachedTexture* target_texture(rt::Context& c, Device& d, uint32_t tex);
 const Device::CachedTexture* stage_texture(rt::Context& c, Device& d, const char* fn, uint32_t tex) {
+    if (const Device::CachedTexture* t = target_texture(c, d, tex)) return t;
     const uint32_t format = ld(c, tex + 12), size = ld(c, tex + 16), data = ld(c, tex + 4);
     gfx::TextureShape shape;
     std::string why;
@@ -1010,6 +1026,68 @@ void viewport_constants(rt::Context& c, float scale[4], float offset[4]) {
     const float minz = f(dev + 0xEE0), maxz = f(dev + 0xEE4);
     scale[0] = hw, scale[1] = hh, scale[2] = (maxz - minz) * zscale, scale[3] = 0;
     offset[0] = hw + ox, offset[1] = -hh + oy, offset[2] = minz * zscale, offset[3] = 0;
+}
+
+// ---------------------------------------------------------------- render targets
+uint64_t hash_bytes(const uint8_t* p, size_t n, uint64_t h);
+std::pair<uint32_t, uint32_t> surface_size(const rt::Context& c, uint32_t surf);
+
+// Points the renderer at the device's render target before a draw or clear,
+// and returns its size: the back buffer, or a texture's surface (made a
+// render target the first time). Drawing into the front buffer, a texture
+// target with a depth buffer, and other formats stop the runtime.
+std::pair<uint32_t, uint32_t> apply_target(rt::Context& c, Device& d, const char* fn) {
+    const uint32_t target = ld(c, kDeviceStorage + kDevRenderTarget), depth = ld(c, kDeviceStorage + kDevDepth);
+    if (target == d.frame_buffers[d.renderer->back_index()]) {
+        d.renderer->set_render_target(0, true);
+        return {d.width, d.height};
+    }
+    for (uint32_t fb : d.frame_buffers)
+        if (fb == target) unmodelled(fn, "drawing into the front buffer");
+    const uint32_t format = ld(c, target + 12), fmt = (format >> 8) & 0xFF;
+    if (fmt != kFmtA8R8G8B8 && fmt != kFmtX8R8G8B8 && fmt != kFmtLinA8R8G8B8 && fmt != kFmtLinX8R8G8B8)
+        unmodelled(fn, strf("rendering into a surface of format %#x", fmt));
+    const auto [w, h] = surface_size(c, target);
+    // The device's depth buffer can go with a texture of its size (the
+    // renderer's depth buffer is it); any other depth surface stops the runtime.
+    if (depth && (depth != d.depth || w != d.width || h != d.height)) {
+        const auto [dw, dh] = surface_size(c, depth);
+        unmodelled(fn, strf("a depth buffer (%08X, %ux%u, format %#x) with a texture as the render target (%ux%u)", depth, dw, dh,
+                            (ld(c, depth + 12) >> 8) & 0xFF, w, h));
+    }
+    const uint32_t data = ld(c, target + 4);
+    Device::TargetTexture& t = d.targets[data];
+    if (!t.texture.id || t.texture.width != w || t.texture.height != h || t.format != fmt) {
+        if (t.texture.id) d.renderer->destroy_texture(t.texture.id);
+        t.texture = {};
+        t.texture.id = d.renderer->create_render_target(w, h);
+        t.texture.width = w, t.texture.height = h, t.texture.dims = 2;
+        t.texture.linear = fmt == kFmtLinA8R8G8B8 || fmt == kFmtLinX8R8G8B8;
+        t.format = fmt;
+    }
+    if (size_t(data) + size_t(w) * h * 4 > c.mem_size) unmodelled(fn, strf("a render target past the end of memory (%08X)", data));
+    t.guest = hash_bytes(c.mem + data, size_t(w) * h * 4, 0x9E3779B97F4A7C15ull);
+    d.renderer->set_render_target(t.texture.id, depth != 0);
+    return {w, h};
+}
+
+// The renderer's image for a texture whose texels were last drawn by the
+// GPU, or null (the guest memory is the texture).
+const Device::CachedTexture* target_texture(rt::Context& c, Device& d, uint32_t tex) {
+    const uint32_t data = ld(c, tex + 4);
+    auto it = d.targets.find(data);
+    if (it == d.targets.end()) return nullptr;
+    Device::TargetTexture& t = it->second;
+    const uint32_t format = ld(c, tex + 12), fmt = (format >> 8) & 0xFF;
+    const auto [w, h] = surface_size(c, tex);
+    const bool same_shape = fmt == t.format && w == t.texture.width && h == t.texture.height && ((format >> 16) & 0xF) <= 1;
+    const bool cpu_wrote = hash_bytes(c.mem + data, size_t(t.texture.width) * t.texture.height * 4, 0x9E3779B97F4A7C15ull) != t.guest;
+    if (!same_shape || cpu_wrote) {  // the memory holds something else now
+        d.renderer->destroy_texture(t.texture.id);
+        d.targets.erase(it);
+        return nullptr;
+    }
+    return &t.texture;
 }
 
 // ---------------------------------------------------------------- the fixed-function vertex pipeline
@@ -1202,9 +1280,8 @@ void issue_draw(rt::Context& c, Device& d, const char* fn, uint32_t prim, Vertic
     const uint32_t dev = kDeviceStorage;
     auto rs = [&](uint32_t i) { return ld(c, kRenderStateTable + 4 * i); };
 
-    // Only the back buffer is drawn to yet.
-    const uint32_t target = ld(c, dev + kDevRenderTarget);
-    if (target != d.frame_buffers[d.renderer->back_index()]) return notice_once(d, "drawing into a render target other than the back buffer");
+    // The back buffer, or a texture the game renders into.
+    const auto [target_w, target_h] = apply_target(c, d, fn);
 
     gfx::DrawCmd cmd;
     // The vertex program at the selected slot of the GPU's program memory,
@@ -1299,8 +1376,8 @@ void issue_draw(rt::Context& c, Device& d, const char* fn, uint32_t prim, Vertic
     viewport_constants(c, &vsu[58 * 4], &vsu[59 * 4]);  // c-38, c-37
     if (fixed_function) composite_constants(c, vsu.data());  // c0-c3 (the program's own constants aren't used)
     const float zscale = std::bit_cast<float>(ld(c, dev + 0x944));
-    vsu[gfx::nv2a::kVsScreen * 4 + 0] = 2.0f / float(d.width);
-    vsu[gfx::nv2a::kVsScreen * 4 + 1] = 2.0f / float(d.height);
+    vsu[gfx::nv2a::kVsScreen * 4 + 0] = 2.0f / float(target_w);
+    vsu[gfx::nv2a::kVsScreen * 4 + 1] = 2.0f / float(target_h);
     vsu[gfx::nv2a::kVsScreen * 4 + 2] = zscale > 0 ? 1.0f / zscale : 1.0f;
 
     // Fixed-function state.
@@ -1329,12 +1406,11 @@ void issue_draw(rt::Context& c, Device& d, const char* fn, uint32_t prim, Vertic
         cmd.stencil_write_mask = uint8_t(rs(kRsStencilWriteMask));
     }
     const uint32_t cull = rs(kRsCullMode);
-    // The original sends CULLMODE to the GPU as GL's front/back against
-    // FRONTFACE, which comes to culling the winding CULLMODE names in GL's
-    // terms (y up); the screen here runs y down, so that winding is the
-    // other one on screen: D3DCULL_CW (0x900) culls what looks
-    // counter-clockwise, the faces turned away in a D3D scene.
-    cmd.cull = cull == 0x900 ? gfx::Cull::CounterClockwise : cull == 0x901 ? gfx::Cull::Clockwise : gfx::Cull::None;
+    // D3D's cull modes name the winding culled as it appears on screen:
+    // D3DCULL_CW culls clockwise triangles, D3DCULL_CCW counter-clockwise
+    // ones. (Checked on the attract sequence's books: the other way round,
+    // pages read mirrored and the desk behind them vanishes.)
+    cmd.cull = cull == 0x900 ? gfx::Cull::Clockwise : cull == 0x901 ? gfx::Cull::CounterClockwise : gfx::Cull::None;
     // The viewport's rectangle bounds what's drawn.
     cmd.scissor.x = int32_t(ld(c, dev + kDevViewport));
     cmd.scissor.y = int32_t(ld(c, dev + kDevViewport + 4));

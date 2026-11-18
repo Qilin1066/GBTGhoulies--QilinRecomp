@@ -46,6 +46,7 @@ struct Target {
     VkImageView view = VK_NULL_HANDLE;
     VkImageLayout layout = VK_IMAGE_LAYOUT_UNDEFINED;
     VkImageAspectFlags aspect = 0;
+    uint32_t width = 0, height = 0;
 };
 
 // The pipeline stages and accesses that go with an image layout, for barriers.
@@ -108,6 +109,8 @@ public:
     uint32_t create_texture(const TextureData& data) override;
     void destroy_texture(uint32_t id) override;
     void draw(const DrawCmd& cmd) override;
+    uint32_t create_render_target(uint32_t width, uint32_t height) override;
+    void set_render_target(uint32_t id, bool depth) override;
     Image read_front_buffer() override { return read(color_[front_]); }
     Image read_back_buffer() override { return read(color_[back_]); }
     uint32_t validation_errors() const override { return validation_errors_; }
@@ -116,7 +119,9 @@ private:
     bool create_instance(std::string* error);
     bool pick_device(std::string* error);
     void create_device();
-    Target create_target(VkFormat format, VkImageUsageFlags usage, VkImageAspectFlags aspect);
+    Target create_target(VkFormat format, VkImageUsageFlags usage, VkImageAspectFlags aspect, uint32_t width = 0, uint32_t height = 0);
+    Target& target() { return current_rt_ ? render_targets_.at(current_rt_) : color_[back_]; }  // what draws and clears go to
+    bool target_has_depth() const { return depth_.image && (!current_rt_ || rt_depth_); }
     uint32_t memory_type(uint32_t allowed, VkMemoryPropertyFlags wanted) const;
     void destroy();
 
@@ -193,6 +198,7 @@ private:
         uint64_t vs = 0, fs = 0;
         uint32_t inputs = 0;
         uint8_t primitive = 0, blend = 0, write_mask = 0, factors[4] = {}, ops[2] = {};
+        uint8_t depth = 0;  // the target has a depth-stencil attachment
         auto operator<=>(const PipelineKey&) const = default;
     };
     std::map<PipelineKey, VkPipeline> pipelines_;
@@ -204,6 +210,11 @@ private:
     };
     std::unordered_map<uint32_t, Texture> textures_;
     uint32_t next_texture_ = 1;
+    // Textures drawn into (create_render_target), by the same ids as textures;
+    // current_rt_ is the one draws go to, 0 for the back buffer.
+    std::unordered_map<uint32_t, Target> render_targets_;
+    uint32_t current_rt_ = 0;
+    bool rt_depth_ = false;  // the depth buffer goes with the render target
     std::vector<Texture> dead_textures_;                                  // freed once the GPU is done with them
     std::vector<std::pair<VkBuffer, VkDeviceMemory>> staging_;            // likewise
 };
@@ -421,13 +432,16 @@ uint32_t VulkanRenderer::memory_type(uint32_t allowed, VkMemoryPropertyFlags wan
     fatal("finding a memory type", VK_ERROR_FEATURE_NOT_PRESENT);
 }
 
-Target VulkanRenderer::create_target(VkFormat format, VkImageUsageFlags usage, VkImageAspectFlags aspect) {
+Target VulkanRenderer::create_target(VkFormat format, VkImageUsageFlags usage, VkImageAspectFlags aspect, uint32_t width,
+                                     uint32_t height) {
     Target t;
     t.aspect = aspect;
+    t.width = width ? width : config_.width;
+    t.height = height ? height : config_.height;
     VkImageCreateInfo info{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
     info.imageType = VK_IMAGE_TYPE_2D;
     info.format = format;
-    info.extent = {config_.width, config_.height, 1};
+    info.extent = {t.width, t.height, 1};
     info.mipLevels = 1;
     info.arrayLayers = 1;
     info.samples = VK_SAMPLE_COUNT_1_BIT;
@@ -501,6 +515,7 @@ void VulkanRenderer::destroy() {
             if (t.memory) vkFreeMemory(device_, t.memory, nullptr);
         };
         for (Target& t : color_) drop(t);
+        for (auto& [id, t] : render_targets_) drop(t);
         drop(depth_);
         auto drop_texture = [&](Texture& t) {
             if (t.view) vkDestroyImageView(device_, t.view, nullptr);
@@ -563,7 +578,7 @@ void VulkanRenderer::transition(Target& t, VkImageLayout to) {
 void VulkanRenderer::begin_pass() {
     if (pass_open_) return;
     record();
-    Target& back = color_[back_];
+    Target& back = target();
     transition(back, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
     VkRenderingAttachmentInfo color{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
     color.imageView = back.view;
@@ -573,11 +588,11 @@ void VulkanRenderer::begin_pass() {
     color.clearValue.color = pending_.color_value;
     VkRenderingAttachmentInfo depth{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO}, stencil{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
     VkRenderingInfo info{VK_STRUCTURE_TYPE_RENDERING_INFO};
-    info.renderArea = {{0, 0}, {config_.width, config_.height}};
+    info.renderArea = {{0, 0}, {back.width, back.height}};
     info.layerCount = 1;
     info.colorAttachmentCount = 1;
     info.pColorAttachments = &color;
-    if (depth_.image) {
+    if (target_has_depth()) {
         transition(depth_, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
         depth.imageView = stencil.imageView = depth_.view;
         depth.imageLayout = stencil.imageLayout = depth_.layout;
@@ -601,17 +616,18 @@ void VulkanRenderer::end_pass() {
 }
 
 void VulkanRenderer::clear(const Rect* rects, uint32_t count, uint32_t flags, const float rgba[4], float depth, uint32_t stencil) {
-    if (!depth_.image) flags &= ~uint32_t(kClearDepth | kClearStencil);
+    if (!target_has_depth()) flags &= ~uint32_t(kClearDepth | kClearStencil);
     if (!(flags & (kClearColor | kClearDepth | kClearStencil))) return;
+    const uint32_t tw = target().width, th = target().height;
     // Clip the rectangles to the buffer; no rectangles means all of it.
     std::vector<VkClearRect> clipped;
     bool whole = count == 0;
     for (uint32_t i = 0; i < count; ++i) {
         const int64_t x0 = std::max<int64_t>(rects[i].x, 0), y0 = std::max<int64_t>(rects[i].y, 0);
-        const int64_t x1 = std::min<int64_t>(int64_t(rects[i].x) + rects[i].w, config_.width);
-        const int64_t y1 = std::min<int64_t>(int64_t(rects[i].y) + rects[i].h, config_.height);
+        const int64_t x1 = std::min<int64_t>(int64_t(rects[i].x) + rects[i].w, tw);
+        const int64_t y1 = std::min<int64_t>(int64_t(rects[i].y) + rects[i].h, th);
         if (x1 <= x0 || y1 <= y0) continue;
-        whole = whole || (x0 == 0 && y0 == 0 && x1 == config_.width && y1 == config_.height);
+        whole = whole || (x0 == 0 && y0 == 0 && x1 == tw && y1 == th);
         clipped.push_back({{{int32_t(x0), int32_t(y0)}, {uint32_t(x1 - x0), uint32_t(y1 - y0)}}, 0, 1});
     }
     if (!whole && clipped.empty()) return;
@@ -625,7 +641,7 @@ void VulkanRenderer::clear(const Rect* rects, uint32_t count, uint32_t flags, co
         return;
     }
     begin_pass();
-    if (whole) clipped.assign(1, {{{0, 0}, {config_.width, config_.height}}, 0, 1});
+    if (whole) clipped.assign(1, {{{0, 0}, {tw, th}}, 0, 1});
     VkClearAttachment attachments[2]{};
     uint32_t n = 0;
     if (flags & kClearColor) {
@@ -991,7 +1007,7 @@ VkShaderModule VulkanRenderer::shader(uint64_t key, const std::vector<uint32_t>*
 VkPipeline VulkanRenderer::pipeline(const DrawCmd& c) {
     PipelineKey k;
     k.vs = c.vs_key, k.fs = c.fs_key, k.inputs = c.inputs, k.primitive = uint8_t(c.primitive);
-    k.blend = c.blend, k.write_mask = c.write_mask;
+    k.blend = c.blend, k.write_mask = c.write_mask, k.depth = target_has_depth();
     if (c.blend) {
         k.factors[0] = uint8_t(c.src_color), k.factors[1] = uint8_t(c.dst_color), k.factors[2] = uint8_t(c.src_alpha), k.factors[3] = uint8_t(c.dst_alpha);
         k.ops[0] = uint8_t(c.color_op), k.ops[1] = uint8_t(c.alpha_op);
@@ -1055,7 +1071,7 @@ VkPipeline VulkanRenderer::pipeline(const DrawCmd& c) {
     VkPipelineRenderingCreateInfo ri{VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO};
     ri.colorAttachmentCount = 1;
     ri.pColorAttachmentFormats = &color_format;
-    if (depth_.image) ri.depthAttachmentFormat = ri.stencilAttachmentFormat = depth_format_;
+    if (k.depth) ri.depthAttachmentFormat = ri.stencilAttachmentFormat = depth_format_;
     VkGraphicsPipelineCreateInfo info{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
     info.pNext = &ri;
     info.stageCount = 2;
@@ -1186,14 +1202,72 @@ uint32_t VulkanRenderer::create_texture(const TextureData& t) {
 }
 
 void VulkanRenderer::destroy_texture(uint32_t id) {
+    if (auto rt = render_targets_.find(id); rt != render_targets_.end()) {
+        if (id == current_rt_) end_pass(), current_rt_ = 0;
+        dead_textures_.push_back({rt->second.image, rt->second.memory, rt->second.view});
+        render_targets_.erase(rt);
+        return;
+    }
     auto it = textures_.find(id);
     if (it == textures_.end()) return;
     dead_textures_.push_back(it->second);
     textures_.erase(it);
 }
 
+// A texture to draw into: B8G8R8A8 as the frame buffers, cleared to zero,
+// then readable (draws sample it) until it's drawn into.
+uint32_t VulkanRenderer::create_render_target(uint32_t width, uint32_t height) {
+    Target t = create_target(VK_FORMAT_B8G8R8A8_UNORM,
+                             VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+                                 VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                             VK_IMAGE_ASPECT_COLOR_BIT, width, height);
+    const bool was_open = pass_open_;
+    end_pass();
+    record();
+    transition(t, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+    const VkClearColorValue zero{};
+    const VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    vkCmdClearColorImage(cmd_, t.image, t.layout, &zero, 1, &range);
+    transition(t, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    const uint32_t id = next_texture_++;
+    render_targets_[id] = t;
+    if (was_open) begin_pass();
+    return id;
+}
+
+void VulkanRenderer::set_render_target(uint32_t id, bool depth) {
+    depth = depth && id;
+    if (id == current_rt_ && depth == rt_depth_) return;
+    if (id && !render_targets_.count(id)) {
+        std::fprintf(stderr, "qilin: renderer: no render target %u\n", id);
+        std::exit(3);
+    }
+    if (depth && (!depth_.image || render_targets_.at(id).width != depth_.width || render_targets_.at(id).height != depth_.height)) {
+        std::fprintf(stderr, "qilin: renderer: the depth buffer doesn't fit render target %u\n", id);
+        std::exit(3);
+    }
+    end_pass();
+    current_rt_ = id;
+    rt_depth_ = depth;
+}
+
 void VulkanRenderer::draw(const DrawCmd& c) {
     if (c.vertex_count == 0 || (c.indices && c.index_count == 0)) return;
+    // A render target sampled here must be ready to read: its last pass
+    // ended and the image made readable, outside any pass.
+    for (uint32_t i = 0; i < kSamplers; ++i) {
+        auto rt = render_targets_.find(c.textures[i]);
+        if (rt == render_targets_.end()) continue;
+        if (c.textures[i] == current_rt_) {
+            std::fprintf(stderr, "qilin: renderer: a draw samples the texture it draws into\n");
+            std::exit(3);
+        }
+        if (rt->second.layout != VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL) {
+            end_pass();
+            record();
+            transition(rt->second, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+        }
+    }
     const VkPipeline pl = pipeline(c);
     // Room for the whole draw in the ring first, so nothing below starts a
     // new submission halfway through its data.
@@ -1247,9 +1321,11 @@ void VulkanRenderer::draw(const DrawCmd& c) {
         writes[nw++].pBufferInfo = &ub[i];
     }
     for (uint32_t i = 0; i < kSamplers; ++i) {
-        auto it = textures_.find(c.textures[i]);
-        if (it == textures_.end()) continue;
-        images[i] = {sampler(c.samplers[i]), it->second.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+        VkImageView view = VK_NULL_HANDLE;
+        if (auto it = textures_.find(c.textures[i]); it != textures_.end()) view = it->second.view;
+        else if (auto rt = render_targets_.find(c.textures[i]); rt != render_targets_.end()) view = rt->second.view;
+        if (!view) continue;
+        images[i] = {sampler(c.samplers[i]), view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
         writes[nw].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
         writes[nw].dstSet = set;
         writes[nw].dstBinding = 2 + i;
@@ -1264,18 +1340,19 @@ void VulkanRenderer::draw(const DrawCmd& c) {
     for (uint32_t n = 0, k = 0; n < 16; ++n)
         if (c.inputs & (1u << n)) vkCmdBindVertexBuffers(cmd_, n, 1, &buffers[k], &offsets[k]), ++k;
     (void)first;
-    const VkViewport viewport{0, 0, float(config_.width), float(config_.height), 0, 1};
+    const int32_t tw = int32_t(target().width), th = int32_t(target().height);
+    const VkViewport viewport{0, 0, float(tw), float(th), 0, 1};
     vkCmdSetViewport(cmd_, 0, 1, &viewport);
-    const int32_t sx0 = std::clamp(c.scissor.x, 0, int32_t(config_.width)), sy0 = std::clamp(c.scissor.y, 0, int32_t(config_.height));
-    const int32_t sx1 = std::clamp(int32_t(int64_t(c.scissor.x) + c.scissor.w), sx0, int32_t(config_.width));
-    const int32_t sy1 = std::clamp(int32_t(int64_t(c.scissor.y) + c.scissor.h), sy0, int32_t(config_.height));
+    const int32_t sx0 = std::clamp(c.scissor.x, 0, tw), sy0 = std::clamp(c.scissor.y, 0, th);
+    const int32_t sx1 = std::clamp(int32_t(int64_t(c.scissor.x) + c.scissor.w), sx0, tw);
+    const int32_t sy1 = std::clamp(int32_t(int64_t(c.scissor.y) + c.scissor.h), sy0, th);
     const VkRect2D scissor{{sx0, sy0}, {uint32_t(sx1 - sx0), uint32_t(sy1 - sy0)}};
     vkCmdSetScissor(cmd_, 0, 1, &scissor);
     // Culling a winding: screen space runs y down as in the framebuffer, so
     // "clockwise" is the same on both.
     vkCmdSetCullMode(cmd_, c.cull == Cull::None ? VK_CULL_MODE_NONE : VK_CULL_MODE_BACK_BIT);
     vkCmdSetFrontFace(cmd_, c.cull == Cull::Clockwise ? VK_FRONT_FACE_COUNTER_CLOCKWISE : VK_FRONT_FACE_CLOCKWISE);
-    const bool has_depth = depth_.image != VK_NULL_HANDLE;
+    const bool has_depth = target_has_depth();
     vkCmdSetDepthTestEnable(cmd_, has_depth && (c.depth_test || c.depth_write));
     vkCmdSetDepthWriteEnable(cmd_, has_depth && c.depth_write);
     vkCmdSetDepthCompareOp(cmd_, c.depth_test ? VkCompareOp(c.depth_compare) : VK_COMPARE_OP_ALWAYS);

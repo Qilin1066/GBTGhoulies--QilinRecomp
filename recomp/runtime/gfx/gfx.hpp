@@ -143,6 +143,14 @@ public:
     // Draws into the back buffer.
     virtual void draw(const DrawCmd& cmd) = 0;
 
+    // Rendering into textures: a texture (an id like create_texture's, which
+    // draws can sample and destroy_texture frees) that draws and clears go to
+    // while it's the render target. 0 is the back buffer, with the depth
+    // buffer; a texture target can have the depth buffer too (`depth`) if
+    // it's the same size. A draw can't sample the texture it draws into.
+    virtual uint32_t create_render_target(uint32_t width, uint32_t height) = 0;
+    virtual void set_render_target(uint32_t id, bool depth) = 0;
+
     // Validation messages of error severity so far (0 without the layers).
     virtual uint32_t validation_errors() const = 0;
 };
