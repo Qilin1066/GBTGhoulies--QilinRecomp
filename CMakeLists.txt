@@ -7,7 +7,7 @@ if(APPLE AND NOT CMAKE_OSX_DEPLOYMENT_TARGET)
     set(CMAKE_OSX_DEPLOYMENT_TARGET 10.15 CACHE STRING "oldest macOS the runtime runs on")
 endif()
 # The single source of the version number (see CHANGELOG.md for the scheme).
-project(GBTGQilincomp VERSION 0.14.0 LANGUAGES C CXX)
+project(GBTGQilincomp VERSION 0.15.0 LANGUAGES C CXX)
 
 # ---- Language: C++23 everywhere (recompiler, runtime, generated code) ----
 set(CMAKE_CXX_STANDARD 23)
@@ -128,12 +128,21 @@ target_link_libraries(qilin_gfx_tests PRIVATE qilin_gfx qilin_warnings)
 add_test(NAME qilin_gfx_tests COMMAND qilin_gfx_tests)
 set_tests_properties(qilin_gfx_tests PROPERTIES SKIP_RETURN_CODE 77)
 
+# ---- Audio engine: voices and the software mixer ----
+add_library(qilin_audio STATIC recomp/runtime/audio/voice.cpp)
+target_include_directories(qilin_audio PUBLIC recomp/runtime/audio)
+target_link_libraries(qilin_audio PRIVATE qilin_warnings)
+add_executable(qilin_audio_tests recomp/runtime/audio/audio_tests.cpp)
+target_link_libraries(qilin_audio_tests PRIVATE qilin_audio qilin_warnings)
+add_test(NAME qilin_audio_tests COMMAND qilin_audio_tests)
+
 # ---- Runtime host side: native replacements (HLE) for code that isn't lifted ----
 add_library(qilin_host STATIC recomp/runtime/host/host.cpp recomp/runtime/host/xapi.cpp recomp/runtime/host/kernel.cpp
                               recomp/runtime/host/kernel_io.cpp recomp/runtime/host/xinput.cpp
-                              recomp/runtime/host/call_guest.cpp recomp/runtime/host/d3d.cpp)
+                              recomp/runtime/host/call_guest.cpp recomp/runtime/host/d3d.cpp
+                              recomp/runtime/host/dsound.cpp)
 target_include_directories(qilin_host PUBLIC recomp/runtime/host)
-target_link_libraries(qilin_host PUBLIC qilin_runtime qilin_gfx PRIVATE qilin_warnings)
+target_link_libraries(qilin_host PUBLIC qilin_runtime qilin_gfx qilin_audio PRIVATE qilin_warnings)
 add_executable(qilin_host_tests recomp/runtime/host/host_tests.cpp)
 target_link_libraries(qilin_host_tests PRIVATE qilin_host qilin_warnings)
 add_test(NAME qilin_host_tests COMMAND qilin_host_tests)

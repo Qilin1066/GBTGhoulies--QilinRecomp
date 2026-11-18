@@ -244,6 +244,21 @@ std::vector<uint8_t> make_xbe() {
     };
     std::memcpy(&d[0x13C0], crtops, sizeof crtops);
     put32(d, 0x1428, 0x113C0);
+    // 120A0 (in .rdata, after the EH tables; the code section is full):
+    // instructions XACT and XGraphics use, lifted by hand in main.
+    const uint8_t libops[] = {
+        0x66, 0x0F, 0xAF, 0x30,        // 120A0 imul si, word ptr [eax]
+        0xC1, 0xC0, 0x05,              // 120A4 rol eax, 5
+        0xD3, 0xC9,                    // 120A7 ror ecx, cl
+        0x0F, 0x6F, 0x06,              // 120A9 movq mm0, qword ptr [esi]
+        0x0F, 0x61, 0xC5,              // 120AC punpcklwd mm0, mm5
+        0x0F, 0x7F, 0x07,              // 120AF movq qword ptr [edi], mm0
+        0x0F, 0x77,                    // 120B2 emms
+        0x0F, 0x2B, 0x07,              // 120B4 movntps xmmword ptr [edi], xmm0
+        0xA1, 0x0C, 0x20, 0x80, 0xFE,  // 120B7 mov eax, [0xFE80200C] (the APU's sample counter)
+        0xC3,                          // 120BC ret
+    };
+    std::memcpy(&d[0x14A0], libops, sizeof libops);
     return d;
 }
 
@@ -563,6 +578,24 @@ int main() {
         CHECK(o.has_value() && o->contains("c.eflags = 0u | (zf ? 0x40u : 0u);"));
         auto i = with.lift(in);
         CHECK(i.has_value() && i->contains("zf = (c.eflags & 0x40u) != 0;"));
+    }
+    {
+        Function lib;
+        lib.start = 0x120A0;
+        lib.insns = {0x120A0, 0x120A4, 0x120A7, 0x120A9, 0x120AC, 0x120AF, 0x120B2, 0x120B4, 0x120B7, 0x120BC};
+        auto r = lifter.lift(lib);
+        CHECK(r.has_value());
+        if (r) {
+            CHECK(r->contains("const int32_t p = int32_t(int16_t((esi & 0xFFFFu))) * int32_t(int16_t("));  // 16-bit imul
+            CHECK(r->contains("rt::set_lo16(esi, r);"));
+            CHECK(r->contains("const uint32_t n0 = 5u;") && r->contains("n ? ((a << n) | (a >> (32 - n))) : a"));  // rol
+            CHECK(r->contains("const uint32_t n0 = (ecx & 31u);") && r->contains("n ? ((a >> n) | (a << (32 - n))) : a"));  // ror
+            CHECK(r->contains("c.mm[0] = rt::ld64(m, uint32_t(esi), 0x120A9u);"));
+            CHECK(r->contains("ftop = 0u; ftag = 0xFFu;") && r->contains("ftag = 0u;"));  // MMX takes the x87 stack; emms frees it
+            CHECK(r->contains("rt::st64(m, uint32_t(edi), c.mm[0], 0x120AFu);"));
+            CHECK(r->contains("rt::st128(m, uint32_t(edi), xmm0, true, 0x120B4u);"));  // movntps: aligned, as movaps
+            CHECK(r->contains("eax = rt::mmio_read32(0xFE80200Cu, 0x120B7u);"));
+        }
     }
     if (f.contains(0x11340)) {
         auto r = lifter.lift(f.at(0x11340));  // negative cases: unsigned values of ecx

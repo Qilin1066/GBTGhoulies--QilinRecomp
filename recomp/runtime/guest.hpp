@@ -62,6 +62,12 @@ struct Context {
     uint32_t fpsw;  // status word except TOP: condition codes C0-C3, sticky exception bits
     uint8_t* mem;
     uint64_t mem_size;
+    // MMX registers. On the hardware they alias the x87 registers' mantissas;
+    // here they're separate (the x87 registers are doubles), and MMX
+    // instructions set the x87 state as the hardware does: TOP 0 and every
+    // register in use, then emms marks them all empty. XGraphics' swizzler
+    // uses them between an x87-free entry and its emms.
+    uint64_t mm[8];
 };
 
 // Fail loudly: unknown jump-table index, divide error, int3, bad access...
@@ -90,6 +96,13 @@ void call(Context& c, uint32_t target);
 void call_unlifted(Context& c, uint32_t target);
 // Whether target has a lifted body in the generated table.
 bool is_lifted(uint32_t target);
+
+// Device registers: a load or store at a constant address in the Xbox's
+// register space (kMmioLo..kMmioHi: the NV2A at 0xFD000000, the APU at
+// 0xFE800000 …) is lifted to these, which the runtime implements.
+inline constexpr uint32_t kMmioLo = 0xFD000000u, kMmioHi = 0xFF000000u;
+uint32_t mmio_read32(uint32_t addr, uint32_t at);
+void mmio_write32(uint32_t addr, uint32_t value, uint32_t at);
 
 #if defined(QILIN_TRACE_WRITES)
 void trace_write(uint32_t addr, uint32_t size);

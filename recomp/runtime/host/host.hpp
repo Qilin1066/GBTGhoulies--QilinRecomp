@@ -123,6 +123,10 @@ struct D3dConfig {
 void register_d3d(const D3dConfig& config);
 const D3dConfig& d3d_config();
 
+// DirectSound (dsound.cpp), over the software mixer; dump_wav non-empty
+// writes everything mixed there (--dump-audio).
+void register_dsound(const std::string& dump_wav);
+
 // XInput (xinput.cpp): the controller ports, with nothing plugged in so far.
 void register_xinput();
 // The kernel replacements, registered at kernel_addr(ordinal) (kernel.cpp).
@@ -136,14 +140,16 @@ void register_kernel_io(const IoConfig& cfg);
 // Fills in the object behind a kernel data export (XeImageFileName,
 // HalDiskCachePartitionCount …) at `addr`, which its thunk slot points to.
 void init_kernel_data(rt::Context& c, uint32_t ordinal, uint32_t addr);
-// The XBE's sections that aren't preloaded ($$XTIMAGE and the like): the
-// kernel reads them in on XeLoadSection. `header` is the section header's
-// guest address, which XeLoadSection and XeUnloadSection take.
+// The XBE's sections, for XeLoadSection and XeUnloadSection, which take the
+// section header's guest address. Those not preloaded ($$XTIMAGE and the
+// like) keep their file data in `bytes` and are read in on the first load.
 struct DemandSection {
     uint32_t header, va, vsize;
     std::vector<uint8_t> bytes;  // the section's file data
 };
 void set_demand_sections(std::vector<DemandSection> sections);
+// Counts a preloaded section as loaded, as the kernel's loader does at boot.
+void preload_section(rt::Context& c, uint32_t header);
 
 // Contiguous memory (MmAllocateContiguousMemory and the runtime's own guest
 // objects): committed, top-down, below kPhysicalLimit; 0 if there's no room.
@@ -157,6 +163,11 @@ inline constexpr uint32_t kKThreadSize = 0x200;
 void init_main_thread(rt::Context& c, uint32_t kpcr, uint32_t kthread, uint32_t stack_top, uint32_t stack_size,
                       uint32_t tls_size);
 uint32_t current_thread(const rt::Context& c);
+
+// ---- Device registers lifted code reads or writes (rt::mmio_read32 and
+// rt::mmio_write32). An unregistered register stops the runtime, named.
+using MmioRead = uint32_t (*)();
+void register_mmio_read(uint32_t addr, const char* name, MmioRead fn);
 
 // ---- XDK library symbols: the functions and variables of the Microsoft
 // libraries linked into the game (D3D8, DSOUND, XACT …), by address.

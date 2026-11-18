@@ -195,6 +195,10 @@ std::optional<RegInfo> gpr(ZydisRegister r) {
     }
 }
 
+int mm_index(ZydisRegister r) {
+    return r >= ZYDIS_REGISTER_MM0 && r <= ZYDIS_REGISTER_MM7 ? r - ZYDIS_REGISTER_MM0 : -1;
+}
+
 int xmm_index(ZydisRegister r) {
     return r >= ZYDIS_REGISTER_XMM0 && r <= ZYDIS_REGISTER_XMM7 ? r - ZYDIS_REGISTER_XMM0 : -1;
 }
@@ -245,6 +249,7 @@ private:
 
     // operand helpers
     std::string addr(const Insn& i, const Operand& o);
+    std::optional<uint32_t> mmio_register(const Insn& i, const Operand& o, int w);
     std::string read(const Insn& i, const Operand& o, int w);
     std::string write(const Insn& i, const Operand& o, int w, std::string_view v);
     std::string xmm_lane0(const Insn& i, const Operand& o);  // 32-bit source: xmm lane 0 or m32
@@ -307,6 +312,18 @@ int FnEmitter::width(const Insn& i, const Operand& o) const {
 // fs:[0] is the head of the thread's exception-registration chain, which
 // functions with C++ exception handling link and unlink. It lives in guest
 // memory at c.fs_base, so the chain is kept exactly as the original keeps it.
+// A device register: an absolute 32-bit access in the register space.
+// Anything else there (a different width, or an address computed from
+// registers) isn't modelled and fails the lift.
+std::optional<uint32_t> FnEmitter::mmio_register(const Insn& i, const Operand& o, int w) {
+    const uint32_t d = uint32_t(o.disp);
+    const bool absolute = o.base == ZYDIS_REGISTER_NONE && o.index == ZYDIS_REGISTER_NONE && o.seg != ZYDIS_REGISTER_FS;
+    constexpr uint32_t kMmioLo = 0xFD000000u, kMmioHi = 0xFF000000u;  // as rt::kMmioLo/kMmioHi in guest.hpp
+    if (!absolute || d < kMmioLo || d >= kMmioHi) return std::nullopt;
+    if (w != 32 || (d & 3)) unsupported(i, "a device register access that isn't an aligned 32-bit load or store");
+    return d;
+}
+
 std::string FnEmitter::addr(const Insn& i, const Operand& o) {
     const bool fs = o.seg == ZYDIS_REGISTER_FS;
     if (!fs && o.seg != ZYDIS_REGISTER_DS && o.seg != ZYDIS_REGISTER_SS && o.seg != ZYDIS_REGISTER_ES &&
@@ -348,6 +365,7 @@ std::string FnEmitter::read(const Insn& i, const Operand& o, int w) {
             return std::format("({} & 0xFFu)", r->name());
         }
         case Operand::Kind::Mem: {
+            if (const auto r = mmio_register(i, o, w)) return std::format("rt::mmio_read32(0x{:X}u, 0x{:X}u)", *r, i.addr);
             const std::string a = addr(i, o);
             if (w == 8) return std::format("uint32_t(rt::ld8(m, {}, 0x{:X}u))", a, i.addr);
             if (w == 16) return std::format("uint32_t(rt::ld16(m, {}, 0x{:X}u))", a, i.addr);
@@ -373,6 +391,7 @@ std::string FnEmitter::write(const Insn& i, const Operand& o, int w, std::string
             return std::format("rt::set_lo8({}, {});", r->name(), v);
         }
         case Operand::Kind::Mem: {
+            if (const auto r = mmio_register(i, o, w)) return std::format("rt::mmio_write32(0x{:X}u, {}, 0x{:X}u);", *r, v, i.addr);
             const std::string a = addr(i, o);
             if (w == 8) return std::format("rt::st8(m, {}, uint8_t({}), 0x{:X}u);", a, v, i.addr);
             if (w == 16) return std::format("rt::st16(m, {}, uint16_t({}), 0x{:X}u);", a, v, i.addr);
@@ -608,9 +627,18 @@ void FnEmitter::emit(const Insn& i, uint8_t live_out) {
                 line("}");
                 return;
             }
-            if (w != 32) unsupported(i, "16-bit imul");
             const Operand& a = i.nops == 3 ? i.op[1] : i.op[0];
             const Operand& b = i.nops == 3 ? i.op[2] : i.op[1];
+            if (w == 16) {  // r16 = low 16 bits of the signed product; CF = OF = it doesn't fit in 16 bits
+                line("{");
+                line(std::format("const int32_t p = int32_t(int16_t({})) * int32_t(int16_t({}));", read(i, a, 16), read(i, b, 16)));
+                line("const uint32_t r = uint32_t(p) & 0xFFFFu;");
+                if (need & (CF | OF)) line("cf = of = p != int32_t(int16_t(r));");
+                line(write(i, d, 16, "r"));
+                line("}");
+                return;
+            }
+            if (w != 32) unsupported(i, "8-bit imul");
             line("{");
             line(std::format("const int64_t p = int64_t(int32_t({})) * int64_t(int32_t({}));", read(i, a, 32), read(i, b, 32)));
             line("const uint32_t r = uint32_t(uint64_t(p));");
@@ -797,6 +825,32 @@ void FnEmitter::emit(const Insn& i, uint8_t live_out) {
             line("}");
             return;
         }
+        case ZYDIS_MNEMONIC_ROL: case ZYDIS_MNEMONIC_ROR: {
+            // The count is masked to 5 bits; a count of 0 changes nothing,
+            // flags included. CF is the bit rotated last into the end it
+            // lands at; OF is defined for counts of 1 (as for RCL/RCR).
+            const int w = width(i, d);
+            const bool left = M == ZYDIS_MNEMONIC_ROL;
+            if (shift_by_cl(i)) use(ECX);
+            const std::string n = shift_by_cl(i) ? "(ecx & 31u)" : std::format("{}u", shift_imm(i) & 31);
+            line("{");
+            line(std::format("const uint32_t n0 = {}; const uint32_t a = {};", n, read(i, d, w)));
+            line("if (n0) {");
+            line(std::format("const uint32_t n = n0 % {}u;", w));
+            const std::string r = left ? std::format("n ? ((a << n) | (a >> ({} - n))) : a", w) : std::format("n ? ((a >> n) | (a << ({} - n))) : a", w);
+            line(std::format("const uint32_t r = {};", masked(r, w)));
+            if (left) {
+                if (need & CF) line("cf = (r & 1u) != 0;");
+                if (need & OF) line(std::format("of = (((r >> {}) & 1u) != 0) != ((r & 1u) != 0);", w - 1));
+            } else {
+                if (need & CF) line(std::format("cf = ((r >> {}) & 1u) != 0;", w - 1));
+                if (need & OF) line(std::format("of = (((r >> {}) ^ (r >> {})) & 1u) != 0;", w - 1, w - 2));
+            }
+            line(write(i, d, w, "r"));
+            line("}");
+            line("}");
+            return;
+        }
         case ZYDIS_MNEMONIC_RCL: case ZYDIS_MNEMONIC_RCR: {
             if (shift_by_cl(i) || shift_imm(i) != 1) unsupported(i, "rotate through carry by more than 1");
             const int w = width(i, d);
@@ -903,8 +957,40 @@ void FnEmitter::emit(const Insn& i, uint8_t live_out) {
             }
             return;
         }
+        case ZYDIS_MNEMONIC_EMMS:
+            mark_fx(FTAG);
+            line("ftag = 0u;");
+            return;
+        case ZYDIS_MNEMONIC_MOVQ: case ZYDIS_MNEMONIC_PUNPCKLWD: case ZYDIS_MNEMONIC_PUNPCKHWD: {
+            const bool dm = d.kind == Operand::Kind::Reg && mm_index(d.reg) >= 0;
+            const bool sm = s.kind == Operand::Kind::Reg && mm_index(s.reg) >= 0;
+            if (!dm && !sm) unsupported(i, "this form (not MMX)");
+            // Any MMX instruction: TOP 0, every x87 register in use.
+            mark_fx(FTOP);
+            mark_fx(FTAG);
+            line("ftop = 0u; ftag = 0xFFu;");
+            auto src64 = [&]() -> std::string {
+                if (sm) return std::format("c.mm[{}]", mm_index(s.reg));
+                if (s.kind == Operand::Kind::Mem) return std::format("rt::ld64(m, {}, 0x{:X}u)", addr(i, s), i.addr);
+                unsupported(i, "MMX source operand");
+            };
+            if (M == ZYDIS_MNEMONIC_MOVQ) {
+                if (dm) line(std::format("c.mm[{}] = {};", mm_index(d.reg), src64()));
+                else if (d.kind == Operand::Kind::Mem) line(std::format("rt::st64(m, {}, c.mm[{}], 0x{:X}u);", addr(i, d), mm_index(s.reg), i.addr));
+                else unsupported(i, "movq destination");
+                return;
+            }
+            if (!dm) unsupported(i, "MMX destination");
+            // Interleave the 16-bit words of the low (or high) halves: dst, src, dst, src.
+            const bool hi = M == ZYDIS_MNEMONIC_PUNPCKHWD;
+            line(std::format("{{ const uint64_t a = c.mm[{0}] >> {1}, b = {2} >> {1}; c.mm[{0}] = (a & 0xFFFFu) | ((b & 0xFFFFu) << 16) | "
+                             "(((a >> 16) & 0xFFFFu) << 32) | (((b >> 16) & 0xFFFFu) << 48); }}",
+                             mm_index(d.reg), hi ? 32 : 0, src64()));
+            return;
+        }
+        case ZYDIS_MNEMONIC_MOVNTPS:  // a non-temporal store: as movaps to memory, the cache hint aside
         case ZYDIS_MNEMONIC_MOVAPS: case ZYDIS_MNEMONIC_MOVUPS: {
-            const bool al = M == ZYDIS_MNEMONIC_MOVAPS;
+            const bool al = M != ZYDIS_MNEMONIC_MOVUPS;
             if (d.kind == Operand::Kind::Mem)
                 line(std::format("rt::st128(m, {}, {}, {}, 0x{:X}u);", addr(i, d), xmm128(i, s, al), al, i.addr));
             else

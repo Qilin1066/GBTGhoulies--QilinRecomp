@@ -69,7 +69,16 @@ constexpr Replaced kReplaced[] = {
 // the usual function contract in a few reviewed places (crt_conventions).
 constexpr Range kCrt{0x165C00, 0x1707B0};
 constexpr Range kXapi{0x14A840, 0x152780};
-constexpr Range kLibraries[] = {kXapi, kCrt};
+constexpr Range kXact{0x1BABA0, 0x1C57D0};   // the XACTENG section
+constexpr Range kXgrph{0x185440, 0x1A59D8};  // the XGRPH section: XGraphics (resource headers, swizzling, maths)
+constexpr Range kLibraries[] = {kXapi, kCrt, kXact, kXgrph};
+
+// DirectSound is replaced natively (it drives the APU), except these pure
+// helpers XACT calls, which compute without touching the hardware and are
+// lifted so their results are the original's: XAudioCalculatePitch (x87
+// log2) with its lock helpers and fyl2x core, and the PCM and Xbox ADPCM
+// WAVEFORMATEX builders (each a jump stub and its body).
+constexpr uint32_t kLiftedDsound[] = {0x1C5AF1, 0x1C5849, 0x1C586E, 0x1CB40D, 0x1C5B3B, 0x1C8BDF, 0x1C5B40, 0x1C8C29};
 
 // Entry points the runtime calls itself: XAPI's process start-up (heap,
 // drive letters), which XAPI's main-thread procedure (0x14FA75) runs first.
@@ -198,7 +207,10 @@ std::vector<std::string> check_replaced(const Xbe& xbe, Decoder& dec, const Cfg&
 // printf calls through). Natively replaced functions aren't followed.
 std::vector<uint32_t> library_closure(const Xbe& xbe, Decoder& dec, const Cfg& cfg, std::span<const uint32_t> from) {
     const auto& fns = cfg.functions();
-    auto in_lib = [](uint32_t a) { return std::ranges::any_of(kLibraries, [&](const Range& r) { return a >= r.lo && a < r.hi; }); };
+    auto in_lib = [](uint32_t a) {
+        return std::ranges::any_of(kLibraries, [&](const Range& r) { return a >= r.lo && a < r.hi; }) ||
+               std::ranges::find(kLiftedDsound, a) != std::end(kLiftedDsound);
+    };
     std::set<uint32_t> seen;
     std::vector<uint32_t> work;
     auto add = [&](uint32_t t) {
@@ -327,7 +339,7 @@ int cmd_lift(const Xbe& xbe, Decoder& dec, std::span<const std::string_view> arg
     write_file(dir / "failures.txt", failures);
 
     std::println("lifted {} of {} functions ({} call targets without a lifted body get stubs)", done.size(), total, stubs.size());
-    if (lib_n) std::println("  {} of them are C runtime and XAPI functions that lifted code can reach", lib_n);
+    if (lib_n) std::println("  {} of them are C runtime, XAPI, XACT, XGraphics and DirectSound-helper functions that lifted code can reach", lib_n);
     if (lib_failed) {
         std::println(stderr, "qilin: error: {} reachable library functions don't lift (see failures.txt)", lib_failed);
         return 3;

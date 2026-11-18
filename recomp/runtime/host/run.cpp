@@ -130,6 +130,7 @@ int main(int argc, char** argv) {
     const char* game_dir = nullptr;
     const char* data_dir = nullptr;
     host::D3dConfig d3d;
+    std::string dump_audio;
     uint32_t ram_mb = host::kRetailRamMb;
     for (int k = 1; k < argc; ++k) {
         const std::string_view a = argv[k];
@@ -145,6 +146,8 @@ int main(int argc, char** argv) {
             data_dir = argv[++k];
         } else if (a == "--dump-frames" && k + 1 < argc) {
             d3d.dump_dir = argv[++k];
+        } else if (a == "--dump-audio" && k + 1 < argc) {
+            dump_audio = argv[++k];
         } else if (a == "--frames" && k + 1 < argc) {
             d3d.max_frames = std::strtoull(argv[++k], nullptr, 10);
         } else if (a == "--gpu" && k + 1 < argc) {
@@ -158,11 +161,12 @@ int main(int argc, char** argv) {
     }
     if (!path) {
         std::fprintf(stderr,
-                     "usage: qilin_run [--ram-mb N] [--game-dir DIR] [--data-dir DIR] [--dump-frames DIR] [--frames N] [--gpu N] <default.xbe>\n"
+                     "usage: qilin_run [--ram-mb N] [--game-dir DIR] [--data-dir DIR] [--dump-frames DIR] [--dump-audio FILE.wav] [--frames N] [--gpu N] <default.xbe>\n"
                      "  --ram-mb N       guest RAM in MB (%u by default, as the retail Xbox)\n"
                      "  --game-dir DIR   the extracted disc (default: default.xbe's directory)\n"
                      "  --data-dir DIR   the hard disk: saves and caches (default: %s)\n"
                      "  --dump-frames DIR  write every frame shown there as a PNG\n"
+                     "  --dump-audio FILE.wav  write everything the mixer plays there\n"
                      "  --frames N       stop after N frames\n"
                      "  --gpu N          the Vulkan device to use, by index (default: the best one)\n",
                      host::kRetailRamMb, default_data_dir().string().c_str());
@@ -189,6 +193,10 @@ int main(int argc, char** argv) {
         return 2;
     }
     std::memcpy(ram.get() + xbe.base, xbe.image().data(), xbe.image().size());
+    rt::Context c{};
+    c.mem = ram.get();
+    c.mem_size = mm.ram_size;
+    const rt::Mem m{c.mem, c.mem_size};
     // Sections not marked preload stay unloaded until XeLoadSection, as the
     // kernel's loader leaves them: keep their file data and clear their memory.
     {
@@ -196,18 +204,18 @@ int main(int argc, char** argv) {
         const uint32_t headers = xbe.u32(xbe.base + 0x120);
         for (size_t i = 0; i < xbe.sections.size(); ++i) {
             const XbeSection& s = xbe.sections[i];
-            if (s.preload()) continue;
             host::DemandSection d{headers + 56 * uint32_t(i), s.va, s.vsize, {}};
-            d.bytes.assign(ram.get() + s.va, ram.get() + s.va + s.rsize);
-            std::memset(ram.get() + s.va, 0, s.vsize);
+            if (s.preload()) {
+                // Loaded at boot: the kernel's loader counts it loaded once, and its first and last pages shared.
+                host::preload_section(c, d.header);
+            } else {
+                d.bytes.assign(ram.get() + s.va, ram.get() + s.va + s.rsize);
+                std::memset(ram.get() + s.va, 0, s.vsize);
+            }
             demand.push_back(std::move(d));
         }
         host::set_demand_sections(std::move(demand));
     }
-    rt::Context c{};
-    c.mem = ram.get();
-    c.mem_size = mm.ram_size;
-    const rt::Mem m{c.mem, c.mem_size};
 
     // Kernel imports: a function's thunk slot keeps 0x80000000 | ordinal, which
     // rt::call_unlifted recognises; a variable's slot gets the address of a
@@ -238,6 +246,7 @@ int main(int argc, char** argv) {
     host::register_xapi();
     host::register_xinput();
     host::register_d3d(d3d);
+    host::register_dsound(dump_audio);
     host::register_kernel();
     const std::filesystem::path disc = game_dir ? std::filesystem::path(game_dir) : std::filesystem::path(path).parent_path();
     const std::filesystem::path data = data_dir ? std::filesystem::path(data_dir) : default_data_dir();

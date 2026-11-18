@@ -85,7 +85,7 @@ class Context(C.Structure):
     _fields_ = [(r, C.c_uint32) for r in GPRS] + [
         ("eflags", C.c_uint32), ("ret_to", C.c_uint32), ("fs_base", C.c_uint32), ("xmm", Xmm * 8),
         ("st", C.c_double * 8), ("ftop", C.c_uint32), ("ftag", C.c_uint32), ("fpcw", C.c_uint32), ("fpsw", C.c_uint32),
-        ("mem", C.c_void_p), ("mem_size", C.c_uint64)]
+        ("mem", C.c_void_p), ("mem_size", C.c_uint64), ("mm", C.c_uint64 * 8)]
 
 
 # ---- x87 values: the lifted side holds doubles, Unicorn 80-bit (mantissa, sign|exponent).
@@ -748,6 +748,9 @@ class Runner:
                         nan_only = True
                     else:
                         diffs.append(f"xmm{k}: original {uc_xmm[k]:032X} lifted {hv:032X}")
+            # MMX registers aren't compared: Unicorn doesn't expose them, and
+            # the code that uses them (XGraphics' swizzler) only lets their
+            # values out through memory, which is compared, before its emms.
             # x87: TOP, which registers hold values, those values, the control word.
             if ctx.ftop != uc_fx["top"] or ctx.ftag != uc_fx["valid"]:
                 diffs.append(f"x87 TOP/tags: original {uc_fx['top']}/{uc_fx['valid']:02X} lifted {ctx.ftop}/{ctx.ftag:02X}")

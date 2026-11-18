@@ -11,6 +11,24 @@ Each release is a git tag (`vX.Y.Z`) with a matching GitHub release. The version
 
 ## [Unreleased]
 
+## [0.15.0] - 2026-11-18
+Audio starts. XACT, the audio engine, is lifted; DirectSound beneath it is replaced over a software mixer. XGraphics is lifted too. The game gets through its audio start-up and first asset loads, and stops at its first texture.
+
+### Added
+- **XACT lifted** (the `XACTENG` section, the 332 functions lifted code reaches) and **XGraphics lifted** (the `XGRPH` section, 647 functions): 7,221 functions lift, 1,478 of them library functions. Three pure DirectSound helpers are lifted with them (`XAudioCalculatePitch` and the PCM and ADPCM format builders). Differential tests: XACT 7,950 trials, XGraphics 15,516, the helpers 1,584, **0 mismatches**.
+- **Lifter:** 16-bit `imul`; `rol`/`ror` by an immediate or `cl`; `movntps`; MMX (`movq`, `punpcklwd`, `punpckhwd`, `emms`) with its own registers (`Context::mm`) and the x87 state set as the hardware does; device registers: constant-address loads and stores in `0xFD000000`–`0xFEFFFFFF` lift to `rt::mmio_read32`/`rt::mmio_write32`. Unit tests for each.
+- **The audio engine** (`recomp/runtime/audio/`): voices playing 8/16-bit PCM and Xbox ADPCM from guest memory, pitch, volume, mix bins folded to stereo, play and loop regions; a 48 kHz stereo mix on the host's clock; a WAV writer. `qilin_audio_tests` in CI.
+- **DirectSound** (`recomp/runtime/host/dsound.cpp`): `DirectSoundCreate`, buffers (create, data, format, volume, pitch, headroom, mix bins and their volumes, regions, position, play, stop, `StopEx`, status), `CommitDeferredSettings`, `DoWork`, `SetMixBinHeadroom`, `DownloadEffectsImage`, `SetI3DL2Listener`, `UseFullHRTF`. Envelopes, LFOs, filters, 3D and the DSP effects are recorded and named once as not yet applied.
+- **The APU's sample counter** (`0xFE80200C`), which XACT reads as its clock, from the mixer's clock.
+- **Kernel:** `KfRaiseIrql`, `KfLowerIrql`, `KeRaiseIrqlToDpcLevel`, on the KPCR's IRQL byte.
+- **`qilin_run --dump-audio FILE.wav`.**
+- **`docs/audio.md`.**
+
+### Fixed
+- **Preloaded XBE sections** start with a reference count of 1, as the kernel's loader counts them; a title's `XeLoadSection` on one stopped the runtime.
+- **Difftest:** the guest context gained the MMX registers.
+
+
 ## [0.14.0] - 2026-11-18
 The renderer, on Vulkan 1.3, and the first Direct3D replacements over it. The game creates its graphics device on Vulkan and runs as far as its audio engine.
 

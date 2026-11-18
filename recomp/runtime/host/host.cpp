@@ -38,6 +38,18 @@ const KernelExport* kernel_export(uint32_t ordinal) {
 }
 
 void register_hle(uint32_t guest_addr, const char* name, HleFn fn) { registry()[guest_addr] = {name, fn}; }
+
+namespace {
+struct MmioReg {
+    const char* name;
+    MmioRead read;
+};
+std::map<uint32_t, MmioReg>& mmio() {
+    static std::map<uint32_t, MmioReg> r;
+    return r;
+}
+}  // namespace
+void register_mmio_read(uint32_t addr, const char* name, MmioRead fn) { mmio()[addr] = {name, fn}; }
 size_t hle_count() { return registry().size(); }
 
 uint32_t arg(const rt::Context& c, int i) {
@@ -259,6 +271,23 @@ void call_unlifted(Context& c, uint32_t target) {
     static std::string why;
     why = strf("no replacement for %s, called from %08X", host::describe(target).c_str(), caller);
     trap(target, why.c_str());
+}
+
+uint32_t mmio_read32(uint32_t addr, uint32_t at) {
+    const auto it = host::mmio().find(addr);
+    if (it == host::mmio().end() || !it->second.read) {
+        static std::string why;
+        why = strf("read of device register %08X, which isn't modelled", addr);
+        trap(at, why.c_str());
+    }
+    return it->second.read();
+}
+
+void mmio_write32(uint32_t addr, uint32_t value, uint32_t at) {
+    (void)value;
+    static std::string why;
+    why = strf("write to device register %08X, which isn't modelled", addr);
+    trap(at, why.c_str());
 }
 
 [[noreturn]] void trap(uint32_t guest_addr, const char* why) {

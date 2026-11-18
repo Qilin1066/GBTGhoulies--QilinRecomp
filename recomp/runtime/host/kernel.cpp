@@ -492,7 +492,7 @@ void xe_load_section(rt::Context& c) {
         }
         rt::check(mem(c), d->va, d->vsize, 0);
         std::memset(c.mem + d->va, 0, d->vsize);
-        std::memcpy(c.mem + d->va, d->bytes.data(), d->bytes.size());
+        std::memcpy(c.mem + d->va, d->bytes.data(), d->bytes.size());  // (a preloaded section never gets here: its count starts at 1)
         shared_pages(c, h, +1);
     }
     st(c, h + 0x18, count + 1);
@@ -516,7 +516,40 @@ void xe_unload_section(rt::Context& c) {
     ret(c, 0, 4);
 }
 
+// ---------------------------------------------------------------- IRQL
+// The current IRQL is the KPCR's Irql byte (+0x24), which XAPI reads
+// directly. With one processor and no interrupts yet, raising it only
+// records the level: nothing preempts the running code either way.
+constexpr uint8_t kDispatchLevel = 2;
+uint8_t irql(const rt::Context& c) { return rt::ld8(mem(c), c.fs_base + 0x24, 0); }
+void set_irql(const rt::Context& c, uint8_t v) { rt::st8(mem(c), c.fs_base + 0x24, v, 0); }
+
+// KIRQL FASTCALL KfRaiseIrql(KIRQL NewIrql) (160): NewIrql in cl.
+void kf_raise_irql(rt::Context& c) {
+    const uint8_t old = irql(c), to = uint8_t(c.ecx);
+    if (to < old) rt::trap(0, "KfRaiseIrql: lowering the IRQL (a bug check on the Xbox)");
+    set_irql(c, to);
+    ret(c, (c.eax & ~0xFFu) | old, 0);
+}
+// VOID FASTCALL KfLowerIrql(KIRQL NewIrql) (161)
+void kf_lower_irql(rt::Context& c) {
+    const uint8_t to = uint8_t(c.ecx);
+    if (to > irql(c)) rt::trap(0, "KfLowerIrql: raising the IRQL (a bug check on the Xbox)");
+    set_irql(c, to);
+    ret(c, c.eax, 0);
+}
+// KIRQL KeRaiseIrqlToDpcLevel(VOID) (129)
+void ke_raise_irql_to_dpc_level(rt::Context& c) {
+    const uint8_t old = irql(c);
+    if (old > kDispatchLevel) rt::trap(0, "KeRaiseIrqlToDpcLevel: called above DISPATCH_LEVEL");
+    set_irql(c, kDispatchLevel);
+    ret(c, (c.eax & ~0xFFu) | old, 0);
+}
+
 constexpr KernelFn kKernel[] = {
+    {"KfRaiseIrql", 4, kf_raise_irql},
+    {"KfLowerIrql", 4, kf_lower_irql},
+    {"KeRaiseIrqlToDpcLevel", 0, ke_raise_irql_to_dpc_level},
     {"XeLoadSection", 4, xe_load_section},
     {"XeUnloadSection", 4, xe_unload_section},
     {"RtlInitAnsiString", 8, rtl_init_ansi_string},
@@ -576,6 +609,11 @@ void init_kernel_data(rt::Context& c, uint32_t ordinal, uint32_t addr) {
 }
 
 void set_demand_sections(std::vector<DemandSection> sections) { demand_sections() = std::move(sections); }
+
+void preload_section(rt::Context& c, uint32_t header) {
+    st(c, header + 0x18, 1);
+    shared_pages(c, header, +1);
+}
 
 void register_kernel() {
     for (const KernelFn& k : kKernel) {
