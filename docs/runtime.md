@@ -13,7 +13,7 @@ Four libraries are lifted with the game instead: the C runtime (since v0.11.0), 
 ```sh
 qilin lift default.xbe --out gen
 cmake -S . -B build -DQILIN_GEN_DIR=$PWD/gen && cmake --build build
-build/qilin_run [--game-dir DIR] [--data-dir DIR] [--ram-mb N] [--dump-frames DIR] [--frames N] [--gpu N] path/to/default.xbe
+build/qilin_run [--game-dir DIR] [--data-dir DIR] [--ram-mb N] [--dump-frames DIR] [--dump-audio FILE.wav] [--frames N] [--gpu N] path/to/default.xbe
 ```
 
 `--game-dir` is the extracted disc (by default, `default.xbe`'s folder). `--data-dir` holds the hard disk: saves and caches, by default `%LOCALAPPDATA%\qilin\ghoulies` on Windows, `~/Library/Application Support/qilin/ghoulies` on macOS and `$XDG_DATA_HOME/qilin/ghoulies` (`~/.local/share/…`) elsewhere. `--dump-frames DIR` writes every frame shown as a PNG, `--dump-audio FILE.wav` everything the mixer plays, `--frames N` stops after N frames, and `--gpu N` picks the Vulkan device (see `graphics.md`). Set `QILIN_TRACE_HLE=1` to log every replacement call (caller, arguments, result) and every object name the file system resolves, with where it went.
