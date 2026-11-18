@@ -442,9 +442,9 @@ Recompiler core foundations.
 ### Fixed
 - **CI:** use `macos-latest` (the `macos-14` image was retired).
 
-[Unreleased]: https://github.com/Tecboy1066/GBTG-Qilincomp/compare/v0.5.0...HEAD
-[0.5.0]: https://github.com/Tecboy1066/GBTG-Qilincomp/compare/v0.4.0...v0.5.0
-[0.4.0]: https://github.com/Tecboy1066/GBTG-Qilincomp/compare/v0.3.0...v0.4.0
-[0.3.0]: https://github.com/Tecboy1066/GBTG-Qilincomp/compare/v0.2.0...v0.3.0
-[0.2.0]: https://github.com/Tecboy1066/GBTG-Qilincomp/compare/v0.1.0...v0.2.0
-[0.1.0]: https://github.com/Tecboy1066/GBTG-Qilincomp/releases/tag/v0.1.0
+[Unreleased]: https://github.com/Qilin1066/GBTGhoulies-Qilincomp/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/Qilin1066/GBTGhoulies-Qilincomp/compare/v0.4.0...v0.5.0
+[0.4.0]: https://github.com/Qilin1066/GBTGhoulies-Qilincomp/compare/v0.3.0...v0.4.0
+[0.3.0]: https://github.com/Qilin1066/GBTGhoulies-Qilincomp/compare/v0.2.0...v0.3.0
+[0.2.0]: https://github.com/Qilin1066/GBTGhoulies-Qilincomp/compare/v0.1.0...v0.2.0
+[0.1.0]: https://github.com/Qilin1066/GBTGhoulies-Qilincomp/releases/tag/v0.1.0
