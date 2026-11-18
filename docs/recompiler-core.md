@@ -1,6 +1,6 @@
 # Recompiler core: status (roadmap step 2)
 
-Last updated 2026-11-18 (v0.9.0: x87 transcendentals, the same bits on every host; v0.8.0: every function in the lifted set lifts; v0.7.0: C++ exception frames; v0.6.0: slice 3, x87; v0.5.0: slice 2, calls; every jump table in lifted code proven by value-range analysis; v0.4.0: every byte of the lifted code accounted for; earlier: C++23 migration and code review, validation pass, lifter slice 1, differential test).
+Last updated 2026-11-18 (v0.11.0: the C runtime lifted, SEH scope tables, `f2xm1`; v0.9.0: x87 transcendentals, the same bits on every host; v0.8.0: every function in the lifted set lifts; v0.7.0: C++ exception frames; v0.6.0: slice 3, x87; v0.5.0: slice 2, calls; every jump table in lifted code proven by value-range analysis; v0.4.0: every byte of the lifted code accounted for; earlier: C++23 migration and code review, validation pass, lifter slice 1, differential test).
 
 ## Language and toolchain
 Everything is **C++23**: the recompiler, the runtime header and the generated code. The C++23 features in use are `std::expected` (XBE loader and lifter results), `std::print`/`std::format`, `std::ranges` algorithms, `std::string::contains`, `std::unreachable` and `std::bit_cast`.
@@ -95,7 +95,7 @@ Functions that are the entry point, or direct call/jump targets of surviving fun
 | Rare engine libraries | `0x152780–0x165C00` | yes | 75,308 | 444 | 3,224 | **0** |
 | C++ EH funclets | `0x1707B0–0x171020` | yes | 2,043 | 0 | 117 | **0** |
 
-XAPI, the CRT and the XDK library sections (D3D, DSOUND, BINK and so on) aren't lifted: they get replaced. Their coverage is reported but doesn't gate anything.
+XAPI and the XDK library sections (D3D, DSOUND, BINK and so on) aren't lifted: they get replaced. Their coverage is reported but doesn't gate anything. The CRT is lifted function by function, only what lifted code reaches (v0.11.0), so its region isn't a coverage gate either; the SEH scope tables took its unknown bytes from 2,561 to 1,529.
 
 **The game code ends at `0x14A840`, not `0x14A895`** (corrected in v0.7.0). `0x14A840` is XAPI's `IsBadReadPtr`, which probes the pages it's given inside `__try`/`__except` and returns TRUE if one faults. The old boundary fell inside it, so it was lifted as a game function without its last part, which holds the exception handler and the NULL-pointer return. A bad pointer would have crashed the recomp, and a NULL one would have reached a stub for `0x14A8A0` and trapped; the original returns TRUE for both. It's now a stub like the rest of XAPI, so the runtime replaces it. The game calls it from 59 sites.
 
@@ -250,7 +250,7 @@ Half the trials start with a value already in `ST(0)`, as when a caller passes o
 - **NaN against NaN.** Unicorn propagates SSE NaNs by x87 rules (larger payload wins), real SSE by operand order. Trials whose only differences are NaN against NaN, in an xmm lane or an aligned memory word, are counted as `pass-nan`.
 - **Calls into non-code.** A call through a null or random pointer makes the original execute data, which depends on CPU state the lifted side doesn't carry (flags, segments). Those trials are skipped.
 
-**Emulator corrections.** Unicorn 2.1 (QEMU 5) differs from the hardware in four places that lifted code reaches. The harness corrects them in both emulators, at the addresses `qilin insns` lists:
+**Emulator corrections.** Unicorn 2.1 (QEMU 5) differs from the hardware in four places that the game's lifted code reaches (three more for the C runtime are under v0.11.0 below). The harness corrects them in both emulators, at the addresses `qilin insns` lists:
 - **`rdtsc`** reads the host's time-stamp counter, so an XAPI timing function (`0x14C29C`) gave different results in the two runs. It now returns a counter that restarts every trial.
 - **`fcomi`, `fcomip`, `fucomi` and `fucomip`** leave OF, SF and AF as they were; Intel documents them as cleared. `0x140D80` reads them back with `lahf`. They're cleared after each one.
 - **`fyl2x` with an operand ≤ 0** doesn't pop. The lifted code pops, as the hardware does, and those trials are skipped.
