@@ -19,6 +19,8 @@ Boundaries found from function alignment (Rare's code is 16-byte aligned, Micros
 | `0x165C00–0x170D80` | ~45 KB | **C/C++ runtime** (LIBCMT/LIBCPMT: printf family, float formatting, exceptions) | Replace with host CRT |
 | `0x170D80–0x171020` | ~0.7 KB | Compiler-generated C++ exception-unwind funclets (belong to game) | Lift |
 
+Three functions in the Rare-library range belong to Bink and are called only from the BINK section: `0x162570`, `0x1626B0` and Bink's MMX probe at `0x162840`. They're replaced with Bink, not lifted.
+
 Two 5-byte stubs at `0xF7270` / `0xF7280` are jumps into XAPI's allocator, called by D3D/XGRPH/XACT/WMADEC: library memory allocation goes through one hook point.
 
 ## Cross-module calls (direct)

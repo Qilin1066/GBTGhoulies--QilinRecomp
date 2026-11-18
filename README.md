@@ -13,7 +13,7 @@ Roadmap step 2, **recompiler core**, is in progress.
 | XBE loader (headers, certificate, sections, libraries, kernel thunks, flat image) | ✅ output identical to the Python prototype |
 | x86 decoder (Zydis, vendored) | ✅ agrees with LLVM on every reachable instruction |
 | Function discovery + CFG (recursive descent, switch tables, C++ EH tables, data-as-code validation) | ✅ 8,842 functions, 556 jump tables (every one in lifted code has a proven size); **100% of the lifted code accounted for** (`qilin coverage`: 0 unknown bytes in the game code, Rare libraries and EH funclets) |
-| Lifter → C++ (integer, scalar SSE, x87 with the game's 24-bit precision control, jump tables, string ops; direct, indirect and tail calls; C++ exception frames) | ✅ 5,745 of 5,746 functions (game code + Rare libraries; the last is a CPU-ID probe the runtime replaces), differentially tested against the original x86 under Unicorn, whole call trees included, also under UBSan: 0 mismatches |
+| Lifter → C++ (integer, scalar SSE, x87 with the game's 24-bit precision control, jump tables, string ops; direct, indirect and tail calls; C++ exception frames) | ✅ all 5,743 functions (game code + Rare libraries; 3 more there belong to Bink and are replaced with it), differentially tested against the original x86 under Unicorn, whole call trees included, also under UBSan: 0 mismatches |
 | Runtime, HLE, Vulkan | later (see roadmap) |
 
 ## Versions and changes

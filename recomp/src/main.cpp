@@ -49,6 +49,20 @@ struct Range {
 constexpr Range kGameCode{0x11000, 0x14A840};  // XAPI starts with IsBadReadPtr at 0x14A840
 constexpr Range kRareLibs{0x152780, 0x165C00};
 
+// Functions inside those regions that belong to a library we replace, and
+// that only that library calls. They aren't lifted: once the library is
+// replaced, nothing calls them. `qilin lift` fails if anything it lifts could
+// reach one (see check_replaced).
+struct Replaced {
+    uint32_t addr;
+    std::string_view why;
+};
+constexpr Replaced kReplaced[] = {
+    {0x162570, "Bink helper; its one caller is in BINK (0x1A958C)"},
+    {0x1626B0, "Bink helper; its one caller is in BINK (0x1A9571)"},
+    {0x162840, "Bink's MMX probe (pushfd, cpuid); its one caller is in BINK (0x1AE916), and only BINK reads its result"},
+};
+
 struct Failure {
     std::string message;
 };
@@ -103,6 +117,37 @@ void emit(FILE* out, const Decoder& dec, const Insn& i) {
     std::println(out, "{:08x} {} {} {}\t{}", i.addr, i.len, hex, Decoder::mnemonic_name(i.mnem), dec.format(i));
 }
 
+// The reasons a lifted function could reach a replaced one: a direct call or
+// tail call, or its address as an immediate or displacement (a function
+// pointer for an indirect call). A data section holding the address could
+// feed an indirect call from anywhere, so that counts too.
+std::vector<std::string> check_replaced(const Xbe& xbe, Decoder& dec, const Cfg& cfg, std::span<const uint32_t> lifted) {
+    std::vector<std::string> out;
+    for (const Replaced& r : kReplaced) {
+        if (!cfg.functions().contains(r.addr)) out.push_back(std::format("{:08X} is no longer a function", r.addr));
+        for (uint32_t a : lifted) {
+            const Function& fn = cfg.functions().at(a);
+            if (fn.calls.contains(r.addr) || fn.tails.contains(r.addr))
+                out.push_back(std::format("{:08X} calls or tail-calls {:08X}", a, r.addr));
+            for (uint32_t ia : fn.insns) {
+                const Insn* i = dec.decode(ia);
+                for (int k = 0; i && k < i->nops; ++k) {
+                    const Operand& o = i->op[k];
+                    if ((o.kind == Operand::Kind::Imm && !o.imm_relative && uint32_t(o.imm) == r.addr) ||
+                        (o.kind == Operand::Kind::Mem && uint32_t(o.disp) == r.addr))
+                        out.push_back(std::format("{:08X} refers to {:08X} at {:08X}", a, r.addr, ia));
+                }
+            }
+        }
+        for (const XbeSection& s : xbe.sections) {
+            if (s.code) continue;
+            for (uint32_t va = s.va; va + 4 <= s.file_end(); ++va)
+                if (xbe.u32(va) == r.addr) out.push_back(std::format("{:08X} is stored in {} at {:08X}", r.addr, s.name, va));
+        }
+    }
+    return out;
+}
+
 int cmd_lift(const Xbe& xbe, Decoder& dec, std::span<const std::string_view> args) {
     auto outdir = opt(args, "--out");
     if (!outdir) return usage();
@@ -118,9 +163,10 @@ int cmd_lift(const Xbe& xbe, Decoder& dec, std::span<const std::string_view> arg
         only = parse_hex(*o);
         if (!only) return usage();
     }
+    auto replaced = [](uint32_t a) { return std::ranges::any_of(kReplaced, [&](const Replaced& r) { return r.addr == a; }); };
     auto wanted = [&](uint32_t a) {
         if (only) return a == *only;
-        return std::ranges::any_of(ranges, [&](const Range& r) { return a >= r.lo && a < r.hi; });
+        return !replaced(a) && std::ranges::any_of(ranges, [&](const Range& r) { return a >= r.lo && a < r.hi; });
     };
 
     Cfg cfg(xbe, dec);
@@ -186,6 +232,16 @@ int cmd_lift(const Xbe& xbe, Decoder& dec, std::span<const std::string_view> arg
     write_file(dir / "failures.txt", failures);
 
     std::println("lifted {} of {} functions ({} call targets without a lifted body get stubs)", done.size(), total, stubs.size());
+    if (!only) {
+        size_t n = 0;
+        for (const Replaced& r : kReplaced)
+            n += std::ranges::any_of(ranges, [&](const Range& g) { return r.addr >= g.lo && r.addr < g.hi; });
+        if (n) std::println("  {} functions in these regions belong to a replaced library and aren't lifted", n);
+        if (auto bad = check_replaced(xbe, dec, cfg, done); !bad.empty()) {
+            for (auto& b : bad) std::println(stderr, "qilin: error: a replaced function is reachable from lifted code: {}", b);
+            return 3;
+        }
+    }
     std::vector<std::pair<int, std::string>> rs;
     for (auto& [w, n] : buckets) rs.emplace_back(n, w);
     std::ranges::sort(rs, std::greater{});

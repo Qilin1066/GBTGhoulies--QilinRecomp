@@ -1,6 +1,6 @@
 # Recompiler core: status (roadmap step 2)
 
-Last updated 2026-11-18 (v0.7.0: C++ exception frames; v0.6.0: slice 3, x87; v0.5.0: slice 2, calls; every jump table in lifted code proven by value-range analysis; v0.4.0: every byte of the lifted code accounted for; earlier: C++23 migration and code review, validation pass, lifter slice 1, differential test).
+Last updated 2026-11-18 (v0.8.0: every function in the lifted set lifts; v0.7.0: C++ exception frames; v0.6.0: slice 3, x87; v0.5.0: slice 2, calls; every jump table in lifted code proven by value-range analysis; v0.4.0: every byte of the lifted code accounted for; earlier: C++23 migration and code review, validation pass, lifter slice 1, differential test).
 
 ## Language and toolchain
 Everything is **C++23**: the recompiler, the runtime header and the generated code. The C++23 features in use are `std::expected` (XBE loader and lifter results), `std::print`/`std::format`, `std::ranges` algorithms, `std::string::contains`, `std::unreachable` and `std::bit_cast`.
@@ -129,7 +129,15 @@ A `cmp` or `and` directly above a table jump bounds most switches. For the rest,
 
 **Cross-check:** run on the 311 tables already bounded by `cmp` or `and`, the analysis gives the same size for all of them except two `and` tables in replaced library code, where it reports the full mask range and the old path drops unused trailing slots. Both answers are correct. The 7 tables still sized by scanning are all in XDK libraries that aren't lifted.
 
-**Lift check.** The lift report has no fragments left. The one failure left is the CPU-ID probe (`pushfd`), which the runtime replaces. In v0.3.0, 61 lift failures were fragments.
+**Lift check.** The lift report has no failures (in v0.3.0, 61 were fragments).
+
+**Replaced functions inside the lifted ranges** (v0.8.0). Three functions in the Rare-library range belong to Bink, which FFmpeg replaces. Each is called once, from the BINK section, and nothing else refers to them:
+- `0x162840` is Bink's MMX probe (`pushfd`/`popfd` to test the CPUID flag, then `cpuid`). Only BINK reads the flag it sets.
+- `0x162570` and `0x1626B0` are helpers.
+
+They're listed in `kReplaced` in `recomp/src/main.cpp`, with the reason for each, and `qilin lift` skips them. It also fails (exit 3) if anything it lifts could reach one: a call or tail call, the address as an immediate or displacement, or the address stored in a data section, since that could feed an indirect call. Listing `0x11090` as a test makes it report both the call from `0x11070` and a pointer in `.rdata`. `qilin coverage` still counts their bytes as code.
+
+The alternative was to lift `pushfd`, `popfd` and `cpuid` for the probe. That would mean packing the flags into a word, losing the statically known direction flag after `popfd`, and returning the Xbox CPU's answers to `cpuid`, which the difftest can't check because Unicorn reports its own CPU. All of that for a function nothing runs once Bink is replaced.
 
 ### Lifter, slices 1–3 and exception frames (`recomp/src/lifter.*`, runtime `recomp/runtime/guest.hpp` and `dispatch.cpp`)
 Each guest function becomes `void fn_XXXXXXXX(rt::Context&)`. `Lifter::lift` returns `std::expected<std::string, LiftFailure>`, where the failure carries a kind (fragment, unsupported instruction, x87, undefined flag, implausible, bad control flow), the address and the instruction.
@@ -182,16 +190,16 @@ Inside a lifted function:
     So in the original, every throw reaches the top of the thread unhandled and the game ends. The handlers that would run first only free memory. The catch handlers and their continuations are lifted as unreachable code inside their parent functions. `tools/check/eh_report.py` lists the frames, try blocks, catch handlers (following their branches to a rethrow or a continuation) and every call to `_CxxThrowException`.
 - **Stack-balance check:** a forward esp/ebp analysis rejects "functions" that are fragments of other functions: they return with esp off balance or pop their own return address.
 
-**Coverage today:** `qilin lift` covers the game code (`0x11000–0x14A840`) and the Rare engine libraries (`0x152780–0x165C00`), 5,746 functions in all. Before v0.7.0 the game range ended at `0x14A895` and held 5,747, one of them XAPI's `IsBadReadPtr`.
+**Coverage today:** `qilin lift` covers the game code (`0x11000–0x14A840`) and the Rare engine libraries (`0x152780–0x165C00`): 5,746 functions, less the 3 that belong to Bink, so 5,743. Before v0.7.0 the game range ended at `0x14A895` and held 5,747, one of them XAPI's `IsBadReadPtr`.
 
-| | v0.4.0 (slice 1) | v0.5.0 (slice 2) | v0.6.0 (slice 3) | v0.7.0 (exception frames) |
-|---|---|---|---|---|
-| **Lifted** | 1,276 | 5,098 (88.7%) | 5,726 (99.6%) | **5,745 of 5,746** |
-| Not leaves (needed calls) | 4,422 | 0 | 0 | 0 |
-| Use x87 | 48 | 628 | 0 | 0 |
-| C++ exception frames (`fs:[0]`) | — | 20 | 20 | 0 |
-| One-off (`pushfd` in a CPU-ID probe) | 2 | 1 | 1 | 1 |
-| Fragments of other functions | 0 | 0 | 0 | 0 |
+| | v0.4.0 (slice 1) | v0.5.0 (slice 2) | v0.6.0 (slice 3) | v0.7.0 (exception frames) | v0.8.0 |
+|---|---|---|---|---|---|
+| **Lifted** | 1,276 | 5,098 (88.7%) | 5,726 (99.6%) | 5,745 of 5,746 | **5,743 of 5,743 (100%)** |
+| Not leaves (needed calls) | 4,422 | 0 | 0 | 0 | 0 |
+| Use x87 | 48 | 628 | 0 | 0 | 0 |
+| C++ exception frames (`fs:[0]`) | — | 20 | 20 | 0 | 0 |
+| One-off (`pushfd` in a CPU-ID probe) | 2 | 1 | 1 | 1 | 0 (Bink's; replaced) |
+| Fragments of other functions | 0 | 0 | 0 | 0 | 0 |
 
 Most x87 users used to be counted as "not a leaf", because they also make calls.
 
@@ -254,7 +262,7 @@ Half the trials start with a value already in `ST(0)`, as when a caller passes o
 | Functions with at least one completed, matching trial | 4,440 | 4,440 |
 | … of the 20 exception-frame functions | 7 | 7 |
 
-The trials are the same as v0.6.0's for every function that was already lifted. The exercised functions are v0.6.0's, less `IsBadReadPtr` (now XAPI), plus 7 of the 20 exception-frame functions. In the `-O2` run one trial is missing, because a function hit the harness's time cap; in the UBSan run that trial faulted in both.
+These results stand for v0.8.0: its generated code is byte-identical, less the two Bink helpers, which nothing lifted calls. The trials are the same as v0.6.0's for every function that was already lifted. The exercised functions are v0.6.0's, less `IsBadReadPtr` (now XAPI), plus 7 of the 20 exception-frame functions. In the `-O2` run one trial is missing, because a function hit the harness's time cap; in the UBSan run that trial faulted in both.
 
 **Planted bugs in the exception frames:** an epilogue that restores the wrong register into `fs:[0]` was caught in all 6 of the 19 functions it applies to that completed a trial. A prologue that never links its record was caught in 1 of 20. Without a throw, a missing link is visible only to a callee that reads the chain.
 
@@ -339,7 +347,7 @@ The function and jump-table counts are **what we have found so far, not totals r
 1. **Every byte of the code we lift is accounted for.** It is either an instruction of a function, or a known kind of data: a jump table, a byte index table, alignment padding, or a constant. ✅ **Done in v0.4.0:** 0 unknown bytes in the game code, the Rare libraries and the EH funclets (`qilin coverage`). The 97.8% quoted before was for all of `.text`, including XAPI and the CRT, which aren't lifted.
 2. **Every switch has a proven size.** ✅ **Done for lifted code:** every jump table in the game code and Rare libraries is bounded by a `cmp`, an `and` mask or the value-range analysis. 7 tables are still sized by scanning, all in XDK libraries that get replaced. The lifter also traps on any index outside a table.
 3. **Every indirect jump is resolved.** ✅ **Done for lifted code:** the 9 that aren't switches are indirect tail calls through function pointers (`jmp [eax+0x14]`, `jmp eax`, `jmp [0x304EC4]`, two record tables in `.rdata`). They go through the indirect-call dispatcher, which traps on an unknown target.
-4. **Every function lifts.** The lift report must show zero failures. Today 5,745 of the 5,746 functions in the game code and Rare libraries lift. The one left is a CPU-ID probe (`pushfd`, `cpuid`) in the Rare libraries that the runtime will replace. None is a fragment.
+4. **Every function lifts.** ✅ **Done in v0.8.0:** all 5,743 functions in the game code and Rare libraries lift, with zero failures. Three more in those ranges belong to Bink and are replaced with it; `qilin lift` fails if anything lifted can reach them.
 5. **Nothing turns up at runtime.** An indirect call to an address we don't have a function for traps with the address logged. A full playthrough (and the attract mode, menus and every level) with no such trap closes the list. The Ghoulies PC Recomp's seed list of functions found during play is an extra cross-check.
 
 Checks 1–4 are static and will be reported by `qilin` itself. Check 5 needs the runtime (roadmap step 3) and a playable build.
@@ -357,5 +365,4 @@ Checks 1–4 are static and will be reported by `qilin` itself. Check 5 needs th
 
 ## Next
 1. **Transcendentals, the same on every host:** bundle portable `sin`, `cos`, `tan`, `atan2` and `log2` for the 23 x87 transcendentals (known issue 7).
-2. **The CPU-ID probe** (`0x162840`): lift `pushfd`/`popfd` and `cpuid` with the Xbox CPU's answers, or replace the function in the runtime. Either way it reports MMX, as on the Xbox.
-3. **Indirect-call dispatch** is a binary search over 5,745 entries, about 13 steps. A direct-mapped table indexed by address (16-byte granularity in the aligned regions) would make it one lookup. Do this when the runtime measures it.
+2. **Indirect-call dispatch** is a binary search over 5,743 entries, about 13 steps. A direct-mapped table indexed by address (16-byte granularity in the aligned regions) would make it one lookup. Do this when the runtime measures it.

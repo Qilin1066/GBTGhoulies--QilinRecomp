@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.25)
 # The single source of the version number (see CHANGELOG.md for the scheme).
-project(GBTGQilincomp VERSION 0.7.0 LANGUAGES C CXX)
+project(GBTGQilincomp VERSION 0.8.0 LANGUAGES C CXX)
 
 # ---- Language: C++23 everywhere (recompiler, runtime, generated code) ----
 set(CMAKE_CXX_STANDARD 23)

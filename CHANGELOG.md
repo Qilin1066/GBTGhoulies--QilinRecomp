@@ -11,6 +11,16 @@ Each release is a git tag (`vX.Y.Z`) with a matching GitHub release. The version
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-11-18
+Every function in the lifted set lifts: all 5,743 in the game code and Rare libraries, with zero failures. That closes check 4 of "How we'll know everything is recompiled".
+
+### Added
+- **Replaced functions inside the lifted ranges.** `kReplaced` in `recomp/src/main.cpp` lists them, with the reason for each, and `qilin lift` skips them. It exits with code 3 if anything it lifts could reach one: a call or tail call, the address as an immediate or displacement, or the address stored in a data section.
+
+### Changed
+- **Three functions in the Rare-library range are replaced with Bink, not lifted:** Bink's MMX probe at `0x162840` (the last function that didn't lift, because of `pushfd`/`cpuid`), and two helpers at `0x162570` and `0x1626B0`. Each is called once, from the BINK section, which FFmpeg replaces, and nothing else refers to them. Lifting `pushfd`, `popfd` and `cpuid` for code that never runs would have added more risk than it removed.
+- **The lifted set is 5,743 functions,** not 5,746. The generated code is otherwise byte-identical to 0.7.0's, so 0.7.0's difftest results (0 mismatches) still apply.
+
 ## [0.7.0] - 2026-11-18
 C++ exception frames. 5,745 of the 5,746 functions in the game code and Rare libraries lift now. The one left is a CPU-ID probe in the Rare libraries, which the runtime replaces.
 
