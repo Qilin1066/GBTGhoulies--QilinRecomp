@@ -16,6 +16,12 @@
 #include "gfx.hpp"
 #include "volk.h"
 
+// Vulkan structures are zero-initialised by naming only their sType
+// (VkFoo f{VK_STRUCTURE_TYPE_FOO}), which -Wextra would flag in GCC and Clang.
+#if defined(__GNUC__)
+#pragma GCC diagnostic ignored "-Wmissing-field-initializers"
+#endif
+
 namespace qilin::gfx {
 namespace {
 
