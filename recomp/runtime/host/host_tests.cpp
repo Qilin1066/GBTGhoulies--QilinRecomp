@@ -52,17 +52,26 @@ int main() {
     rt::call_unlifted(c, host::kernel_addr(190));
     CHECK(g_seen == 42 && c.eax == 42 && c.ret_to == 0x1234u && c.esp == 0x8000);
 
-    // The guest heap: page-granular first fit, zeroed, with sizes and frees.
-    host::GuestHeap h;
-    auto heap_ram = std::make_unique<uint8_t[]>(0x10000);
-    std::memset(heap_ram.get(), 0xAB, 0x10000);
-    h.init(heap_ram.get(), 0x1000, 0x5000);  // four pages
-    const uint32_t a = h.alloc(10), b = h.alloc(0x1001), d = h.alloc(1);
-    CHECK(a == 0x1000 && b == 0x2000 && d == 0x4000 && h.alloc(1) == 0);
-    CHECK(heap_ram[a] == 0 && heap_ram[b + 0x1FFF] == 0);  // zeroed, whole pages
-    CHECK(h.size_of(b) == 0x1001 && h.size_of(b + 4) == 0 && h.available() == 0);
-    CHECK(h.free(b) && !h.free(b) && h.available() == 0x2000);
-    CHECK(h.alloc(0x2000) == 0x2000 && h.alloc(0) == 0);
+    // Virtual memory: 64 KB reservations, committed pages zeroed, queries.
+    host::VirtualMemory v;
+    auto vram = std::make_unique<uint8_t[]>(0x100000);
+    std::memset(vram.get(), 0xAB, 0x100000);
+    v.init(vram.get(), 0x10000, 0x100000);
+    const uint32_t r1 = v.reserve(0, 0x3000, 4, false), r2 = v.reserve(0, 0x1000, 4, false), r3 = v.reserve(0, 0x1000, 4, true);
+    CHECK(r1 == 0x10000 && r2 == 0x20000 && r3 == 0xFF000 - 0xF000);  // granularity 64 KB; top down from the end
+    CHECK(v.reserve(0x20000, 0x1000, 4, false) == 0);                 // taken
+    CHECK(v.commit(r1 + 0x1800, 0x10, 4) && vram[r1 + 0x1000] == 0 && vram[r1] == 0xAB);  // only the touched page, zeroed
+    auto q = v.query(r1 + 0x1004);
+    CHECK(q && q->base == r1 + 0x1000 && q->size == 0x1000 && q->state == host::VirtualMemory::kMemCommit && q->allocation_base == r1);
+    q = v.query(r1);
+    CHECK(q && q->state == host::VirtualMemory::kMemReserve && q->size == 0x1000);
+    q = v.query(0x30000);
+    CHECK(q && q->state == host::VirtualMemory::kMemFree && q->size == r3 - 0x30000);
+    CHECK(!v.commit(r1 + 0x2000, 0x2000, 4));  // runs past the reservation
+    CHECK(v.committed_bytes() == 0x1000 && v.reserved_bytes() == 0x5000);
+    vram[r1 + 0x1000] = 7;
+    CHECK(v.decommit(r1 + 0x1000, 0x1000) && v.commit(r1 + 0x1000, 1, 4) && vram[r1 + 0x1000] == 0);  // recommitted: zero again
+    CHECK(v.release(r1) && !v.release(r1) && v.reserve(0, 0x1000, 4, false) == 0x10000);
 
     if (failures) std::println(stderr, "{} check(s) failed", failures);
     else std::println("all host tests passed");

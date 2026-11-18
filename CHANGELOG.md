@@ -11,6 +11,29 @@ Each release is a git tag (`vX.Y.Z`) with a matching GitHub release. The version
 
 ## [Unreleased]
 
+## [0.12.0] - 2026-11-18
+XAPI is lifted too, and the runtime implements the Xbox kernel beneath it. Start-up runs XAPI's own process initialisation and gets as far as its first file.
+
+### Added
+- **XAPI in the lifted set**, like the C runtime: the functions lifted code reaches, plus XAPI's process start-up (`0x151011`). 6,214 functions lift, 471 of them in the two libraries. `kNative` lists the four XAPI functions that can't be lifted, with why (`rdtsc`, `int 0x2D`, kernel patching, a GDT reload); `qilin lift` doesn't follow them.
+- **Lifter:** packed SSE for XGraphics' maths (add/sub/mul/div/min/max ps, shufps, unpcklps/unpckhps, movlps/movhps, movhlps/movlhps), `bsf`/`bsr`, `fsincos`.
+- **Kernel** (`recomp/runtime/host/kernel.cpp`): critical sections, `Nt*VirtualMemory`, contiguous memory, `MmQueryStatistics`, DPC and timer objects (timers recorded until the scheduler exists), `ExQueryNonVolatileSetting` (a North American retail console), `RtlNtStatusToDosError`, `HalRegisterShutdownNotification`. Each is checked against the export table's argument size.
+- **Virtual memory** (`host::VirtualMemory`, replacing the page heap): 64 KB reservations, committed pages zeroed, top-down allocation, queries.
+- **The main thread's KPCR and KTHREAD** at the top of RAM; `fs:[0x28]` is the current thread.
+- **`qilin_run --ram-mb N`:** guest RAM from 64 MB (the default, the retail Xbox's) to 1 GB. RAM is `calloc`ed, so untouched pages cost nothing.
+- **Start-up:** the XBE entry point's TLS sizing, then XAPI's process initialisation, then the C runtime's.
+- **`tools/check/xg_math.py`:** XGraphics' maths with aligned operands: 7 functions, 4,200 trials, all matching.
+- **macOS:** every 64-bit Mac with a Metal GPU running macOS 10.15 or later, Intel included, is a target. CI builds for macOS 10.15 on Apple Silicon and Intel (`macos-15-intel`). Percentages are formatted without floating-point `std::format`, which needs macOS 13.3.
+
+### Changed
+- The XAPI replacements for `QueryPerformanceFrequency`, `GlobalMemoryStatus`, `XGetLaunchInfo` and `XGetLanguage` are gone: the lifted originals run, over the kernel.
+
+### Fixed
+- **Difftest:** a trial's `setup` blocks were dropped from the restore list when a variable of the same name was reused. Unicorn's missing SSE alignment check is now emulated (a misaligned 16-byte operand faults in the original too).
+
+### Verified
+- XAPI: 192 functions, 9,205 trials, 0 mismatches; 14 newly reached CRT functions, 671 trials, 0 mismatches. The game's generated code is unchanged.
+
 ## [0.11.0] - 2026-11-18
 The C runtime is lifted, not replaced, so `sprintf`, string conversions and the x87 maths give exactly the original's results. Its start-up runs as XAPI ran it.
 

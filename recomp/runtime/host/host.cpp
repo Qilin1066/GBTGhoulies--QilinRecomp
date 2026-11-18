@@ -51,45 +51,135 @@ void ret(rt::Context& c, uint32_t eax, uint32_t arg_bytes) {
     c.eax = eax;
 }
 
-void GuestHeap::init(uint8_t* ram, uint32_t lo, uint32_t hi) {
+void VirtualMemory::init(uint8_t* ram, uint32_t lo, uint32_t hi) {
     ram_ = ram;
     lo_ = lo;
     hi_ = hi;
-    used_.clear();
+    regions_.clear();
 }
-uint32_t GuestHeap::alloc(uint32_t bytes) {
-    const uint64_t need = (uint64_t(bytes) + 0xFFF) & ~uint64_t(0xFFF);
-    if (need == 0 || need > hi_ - lo_) return 0;
-    uint32_t at = lo_;
-    size_t i = 0;
-    for (; i < used_.size(); ++i) {
-        if (used_[i].first - at >= need) break;
-        at = uint32_t(used_[i].first + ((uint64_t(used_[i].second) + 0xFFF) & ~uint64_t(0xFFF)));
+
+uint32_t VirtualMemory::reserve(uint32_t base, uint32_t size, uint32_t protect, bool top_down, uint32_t align, uint32_t lowest,
+                               uint32_t highest) {
+    const uint64_t bytes = (uint64_t(size) + kPage - 1) & ~uint64_t(kPage - 1);
+    if (bytes == 0 || bytes > hi_ - lo_ || align == 0 || (align & (align - 1))) return 0;
+    const uint64_t lim_lo = std::max<uint64_t>(lo_, lowest), lim_hi = std::min<uint64_t>(hi_, uint64_t(highest) + 1);
+    auto free_at = [&](uint64_t at) {  // [at, at + bytes) inside the range and clear of every reservation
+        if (at < lim_lo || at + bytes > lim_hi) return false;
+        auto it = regions_.upper_bound(uint32_t(at));
+        if (it != regions_.end() && it->first < at + bytes) return false;
+        if (it != regions_.begin()) {
+            --it;
+            if (uint64_t(it->first) + it->second.size > at) return false;
+        }
+        return true;
+    };
+    uint64_t at = 0;
+    if (base) {
+        at = base & ~(kGranularity - 1);
+        if (!free_at(at)) return 0;
+    } else {
+        // Candidate starts: the range's ends and the edges of each reservation.
+        std::vector<uint64_t> cands;
+        auto up = [&](uint64_t v) { return (v + align - 1) & ~uint64_t(align - 1); };
+        auto down = [&](uint64_t v) { return v & ~uint64_t(align - 1); };
+        if (!top_down) {
+            cands.push_back(up(lim_lo));
+            for (const auto& [b, r] : regions_) cands.push_back(up(uint64_t(b) + ((uint64_t(r.size) + kGranularity - 1) & ~uint64_t(kGranularity - 1))));
+        } else {
+            if (lim_hi >= bytes) cands.push_back(down(lim_hi - bytes));
+            for (auto it = regions_.rbegin(); it != regions_.rend(); ++it)
+                if (it->first >= bytes) cands.push_back(down(it->first - bytes));
+        }
+        bool found = false;
+        for (uint64_t c : cands)
+            if (free_at(c)) {
+                at = c;
+                found = true;
+                break;
+            }
+        if (!found) return 0;
     }
-    if (i == used_.size() && hi_ - at < need) return 0;
-    used_.insert(used_.begin() + std::ptrdiff_t(i), {at, bytes});
-    std::memset(ram_ + at, 0, size_t(need));
-    return at;
+    regions_[uint32_t(at)] = Region{uint32_t(bytes), protect, std::vector<uint32_t>(size_t(bytes / kPage), 0)};
+    return uint32_t(at);
 }
-bool GuestHeap::free(uint32_t addr) {
-    const auto it = std::ranges::lower_bound(used_, addr, {}, &std::pair<uint32_t, uint32_t>::first);
-    if (it == used_.end() || it->first != addr) return false;
-    used_.erase(it);
+
+const std::pair<const uint32_t, VirtualMemory::Region>* VirtualMemory::find(uint32_t addr) const {
+    auto it = regions_.upper_bound(addr);
+    if (it == regions_.begin()) return nullptr;
+    --it;
+    return addr - it->first < it->second.size ? &*it : nullptr;
+}
+
+bool VirtualMemory::commit(uint32_t base, uint32_t size, uint32_t protect) {
+    const uint32_t first = base & ~(kPage - 1);
+    const uint64_t end = (uint64_t(base) + size + kPage - 1) & ~uint64_t(kPage - 1);
+    const auto* r = find(first);
+    if (!r || end > uint64_t(r->first) + r->second.size || end == first) return false;
+    auto& pages = const_cast<Region&>(r->second).page_protect;
+    for (uint64_t a = first; a < end; a += kPage) {
+        uint32_t& p = pages[size_t((a - r->first) / kPage)];
+        if (!p) std::memset(ram_ + a, 0, kPage);
+        p = protect ? protect : 4;
+    }
     return true;
 }
-uint32_t GuestHeap::size_of(uint32_t addr) const {
-    const auto it = std::ranges::lower_bound(used_, addr, {}, &std::pair<uint32_t, uint32_t>::first);
-    return it != used_.end() && it->first == addr ? it->second : 0;
+
+bool VirtualMemory::decommit(uint32_t base, uint32_t size) {
+    const uint32_t first = base & ~(kPage - 1);
+    const auto* r = find(first);
+    if (!r) return false;
+    const uint64_t end = size ? (uint64_t(base) + size + kPage - 1) & ~uint64_t(kPage - 1) : uint64_t(r->first) + r->second.size;
+    if (end > uint64_t(r->first) + r->second.size) return false;
+    auto& pages = const_cast<Region&>(r->second).page_protect;
+    for (uint64_t a = first; a < end; a += kPage) pages[size_t((a - r->first) / kPage)] = 0;
+    return true;
 }
-uint32_t GuestHeap::available() const {
-    uint64_t used = 0;
-    for (const auto& [a, n] : used_) used += (uint64_t(n) + 0xFFF) & ~uint64_t(0xFFF);
-    return uint32_t(total() - used);
+
+bool VirtualMemory::release(uint32_t base) { return regions_.erase(base) == 1; }
+
+uint32_t VirtualMemory::region_size(uint32_t base) const {
+    const auto it = regions_.find(base);
+    return it == regions_.end() ? 0 : it->second.size;
 }
-GuestHeap& heap() {
-    static GuestHeap h;
-    return h;
+
+std::optional<VirtualMemory::Info> VirtualMemory::query(uint32_t addr) const {
+    if (addr < lo_ || addr >= hi_) return std::nullopt;
+    const uint32_t page = addr & ~(kPage - 1);
+    if (const auto* r = find(page)) {
+        const auto& pages = r->second.page_protect;
+        size_t k = (page - r->first) / kPage;
+        const uint32_t p = pages[k];
+        size_t e = k;
+        while (e < pages.size() && (pages[e] != 0) == (p != 0) && (!p || pages[e] == p)) ++e;
+        return Info{page, r->first, r->second.protect, uint32_t((e - k) * kPage), p ? kMemCommit : kMemReserve, p, kMemPrivate};
+    }
+    // Free: up to the next reservation or the end of the range.
+    const auto next = regions_.upper_bound(page);
+    const uint32_t end = next == regions_.end() ? hi_ : next->first;
+    return Info{page, 0, 0, end - page, kMemFree, 1, 0};  // PAGE_NOACCESS
 }
+
+uint64_t VirtualMemory::committed_bytes() const {
+    uint64_t n = 0;
+    for (const auto& [b, r] : regions_)
+        for (uint32_t p : r.page_protect) n += p ? kPage : 0;
+    return n;
+}
+uint64_t VirtualMemory::reserved_bytes() const {
+    uint64_t n = 0;
+    for (const auto& [b, r] : regions_) n += r.size;
+    return n;
+}
+VirtualMemory& vm() {
+    static VirtualMemory v;
+    return v;
+}
+
+namespace {
+MemoryMap g_map{kRetailRamMb << 20};
+}
+const MemoryMap& memory_map() { return g_map; }
+void set_memory_map(MemoryMap m) { g_map = m; }
 
 void set_regions(std::vector<Region> r) { regions() = std::move(r); }
 void set_current(rt::Context* c) { g_current = c; }

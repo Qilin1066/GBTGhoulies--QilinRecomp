@@ -263,6 +263,10 @@ class EmuFixups:
       - rdtsc returns the host's time-stamp counter: replaced by a counter that
         restarts every trial and steps by a fixed amount;
       - fcomi/fcomip/fucomi/fucomip leave OF, SF and AF unchanged: Intel clears them;
+      - legacy SSE instructions with a 16-byte memory operand (movaps,
+        mulps, shufps …) don't check its alignment; the hardware raises #GP,
+        and the lifted code traps. A misaligned one is sent to an unmapped
+        address, so the original faults too;
       - after each x87 instruction of the C runtime's maths, a register value
         outside double's exponent range (pow's underflow and overflow paths
         rescale such values by 2^1536) is a known, documented limitation of
@@ -281,6 +285,7 @@ class EmuFixups:
 
     def __init__(self, insns_path):
         self.rdtsc, self.fcomi, self.fyl2x, self.trans, self.fst_reg, self.crt_x87, self.fnsave = [], [], [], [], [], [], []
+        self.sse_aligned = []  # (address, operand text) of SSE instructions that need a 16-byte aligned m128
         for line in open(insns_path):
             parts = line.split(None, 3)
             a, n, m = int(parts[0], 16), int(parts[1]), parts[3].split("\t")[0]
@@ -292,6 +297,9 @@ class EmuFixups:
                 self.fyl2x.append(a)
             if m.startswith("f") and 0x165C00 <= a < 0x1707B0 and m not in ("fwait", "fnstcw", "fldcw", "fnstsw"):
                 self.crt_x87.append(a + n)
+            text = parts[3].split("\t")[1] if "\t" in parts[3] else ""
+            if "xmmword ptr [" in text and m not in ("movups", "movupd", "movdqu", "lddqu"):
+                self.sse_aligned.append((a, text[text.index("xmmword ptr [") + 13:text.index("]", text.index("xmmword ptr ["))]))
             if m == "fnsave":
                 self.fnsave.append((a, a + n))
             if m in ("fst", "fstp"):
@@ -363,6 +371,30 @@ class EmuFixups:
         for a, nxt in self.fnsave:
             uc.hook_add(UC_HOOK_CODE, on_fnsave, None, a, a)
             uc.hook_add(UC_HOOK_CODE, after_fnsave, None, nxt, nxt)
+
+        regs = {"eax": UC_X86_REG_EAX, "ecx": UC_X86_REG_ECX, "edx": UC_X86_REG_EDX, "ebx": UC_X86_REG_EBX,
+                "esp": UC_X86_REG_ESP, "ebp": UC_X86_REG_EBP, "esi": UC_X86_REG_ESI, "edi": UC_X86_REG_EDI}
+
+        def on_sse_aligned(u, a, size, expr):
+            ea = 0
+            for term in expr.replace("-", "+-").split("+"):
+                term = term.strip()
+                if not term:
+                    continue
+                neg = term.startswith("-")
+                term = term.lstrip("-")
+                if "*" in term:
+                    r, k = term.split("*")
+                    v = u.reg_read(regs[r]) * int(k, 0)
+                elif term in regs:
+                    v = u.reg_read(regs[term])
+                else:
+                    v = int(term, 16)
+                ea += -v if neg else v
+            if ea & 15:
+                u.reg_write(UC_X86_REG_EIP, 0xFFFFF000)  # #GP stand-in: fetch from an unmapped page
+        for a, expr in self.sse_aligned:
+            uc.hook_add(UC_HOOK_CODE, on_sse_aligned, expr, a, a)
 
         def after_crt_x87(u, a, size, ud):
             fx = x87_read(u)
@@ -607,7 +639,7 @@ class Runner:
         self.write_both(STACK_TOP, stack)
         for a, data in setup:
             self.write_both(a, data)
-        extra = [(a, len(data)) for a, data in setup]
+        setup_ranges = [(a, len(data)) for a, data in setup]
         # x87: the variant's control word, and half the time a value already in
         # ST(0) (an argument passed on the register stack); the C runtime's
         # register-stack helpers always get their arguments.
@@ -653,7 +685,7 @@ class Runner:
             why = f"{e} at {uc_eip(uc):08X}"
         self.last_why = why  # for debugging a single trial
         if status == "budget" or self.fixups.quirk:  # never run the lifted code on a state the original didn't finish
-            self.restore(list(self.uc_writes) + [(STACK_TOP, len(stack))] + extra)
+            self.restore(list(self.uc_writes) + [(STACK_TOP, len(stack))] + setup_ranges)
             return "skip", "", regs
         uc_regs = [uc.reg_read(r) for r in UC_GPR]
         uc_xmm = [uc.reg_read(UC_X86_REG_XMM0 + k) for k in range(8)]
@@ -755,7 +787,7 @@ class Runner:
                 result = "pass-nan"
             elif self.wide_reg:
                 result = "pass-x87wide"  # equal once the original's 64-bit register value is rounded to double
-        self.restore(uc_w + h_w + [(STACK_TOP, len(stack))] + extra)
+        self.restore(uc_w + h_w + [(STACK_TOP, len(stack))] + setup_ranges)
         return result, detail, regs
 
 

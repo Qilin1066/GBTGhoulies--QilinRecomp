@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.25)
 # The single source of the version number (see CHANGELOG.md for the scheme).
-project(GBTGQilincomp VERSION 0.11.0 LANGUAGES C CXX)
+project(GBTGQilincomp VERSION 0.12.0 LANGUAGES C CXX)
 
 # ---- Language: C++23 everywhere (recompiler, runtime, generated code) ----
 set(CMAKE_CXX_STANDARD 23)
@@ -94,7 +94,7 @@ target_link_libraries(qilin_x87_consistency PRIVATE qilin_runtime qilin_warnings
 add_test(NAME qilin_x87_consistency COMMAND qilin_x87_consistency 200000)
 
 # ---- Runtime host side: native replacements (HLE) for code that isn't lifted ----
-add_library(qilin_host STATIC recomp/runtime/host/host.cpp recomp/runtime/host/xapi.cpp)
+add_library(qilin_host STATIC recomp/runtime/host/host.cpp recomp/runtime/host/xapi.cpp recomp/runtime/host/kernel.cpp)
 target_include_directories(qilin_host PUBLIC recomp/runtime/host)
 target_link_libraries(qilin_host PUBLIC qilin_runtime PRIVATE qilin_warnings)
 add_executable(qilin_host_tests recomp/runtime/host/host_tests.cpp)

@@ -135,6 +135,8 @@ FlagFx flag_fx(const Insn& i) {
             if (n == 0) return {0, 0, 0};
             return {0, ALLF, uint8_t(CF | ZF | SF | PF | (n == 1 ? OF : 0))};
         }
+        case ZYDIS_MNEMONIC_BSF: case ZYDIS_MNEMONIC_BSR:
+            return {0, ALLF, ZF};
         case ZYDIS_MNEMONIC_RCL: case ZYDIS_MNEMONIC_RCR:
             if (!shift_by_cl(i) && shift_imm(i) == 1) return {CF, CF | OF, CF | OF};
             return {i.flags_read, 0, 0};  // other counts aren't lifted
@@ -757,6 +759,13 @@ void FnEmitter::emit(const Insn& i, uint8_t live_out) {
             }
             return;
         }
+        case ZYDIS_MNEMONIC_BSF: case ZYDIS_MNEMONIC_BSR: {
+            // Zero source: ZF set, destination unchanged (as the Pentium III and the emulator leave it).
+            if (width(i, d) != 32) unsupported(i, "16-bit bit scan");
+            line(std::format("{{ const uint32_t v_ = {}; if (v_ == 0u) {{ zf = true; }} else {{ zf = false; {} }} }}", read(i, s, 32),
+                             write(i, d, 32, M == ZYDIS_MNEMONIC_BSF ? "uint32_t(std::countr_zero(v_))" : "uint32_t(31 - std::countl_zero(v_))")));
+            return;
+        }
         case ZYDIS_MNEMONIC_JECXZ: {  // flags untouched
             use(ECX);
             const uint32_t t = *i.rel_target();
@@ -926,6 +935,53 @@ void FnEmitter::emit(const Insn& i, uint8_t live_out) {
             const char* e = M == ZYDIS_MNEMONIC_XORPS ? "a ^ b" : M == ZYDIS_MNEMONIC_ANDPS ? "a & b" : M == ZYDIS_MNEMONIC_ORPS ? "a | b" : "~a & b";
             line(std::format("{{ const rt::Xmm s = {1}; for (int k = 0; k < 4; ++k) {{ const uint32_t a = xmm{0}.u[k], b = s.u[k]; xmm{0}.u[k] = {2}; }} }}",
                              x, xmm128(i, s, true), e));
+            return;
+        }
+        // ---- packed SSE (XGraphics maths): each lane exactly as the scalar op
+        case ZYDIS_MNEMONIC_ADDPS: case ZYDIS_MNEMONIC_SUBPS: case ZYDIS_MNEMONIC_MULPS: case ZYDIS_MNEMONIC_DIVPS:
+        case ZYDIS_MNEMONIC_MINPS: case ZYDIS_MNEMONIC_MAXPS: {
+            const char* op = M == ZYDIS_MNEMONIC_ADDPS ? "addss" : M == ZYDIS_MNEMONIC_SUBPS ? "subss" : M == ZYDIS_MNEMONIC_MULPS ? "mulss"
+                           : M == ZYDIS_MNEMONIC_DIVPS ? "divss" : M == ZYDIS_MNEMONIC_MINPS ? "minss" : "maxss";
+            const int x = xmm_dst(i, d);
+            line(std::format("{{ const rt::Xmm s_ = {1}; for (int k = 0; k < 4; ++k) xmm{0}.u[k] = rt::{2}(xmm{0}.u[k], s_.u[k]); }}", x,
+                             xmm128(i, s, true), op));
+            return;
+        }
+        case ZYDIS_MNEMONIC_SHUFPS: {
+            const int x = xmm_dst(i, d);
+            const uint32_t imm = uint32_t(i.op[2].imm & 0xFF);
+            line(std::format("{{ const rt::Xmm d_ = xmm{0}, s_ = {1}; xmm{0} = rt::Xmm{{{{d_.u[{2}], d_.u[{3}], s_.u[{4}], s_.u[{5}]}}}}; }}", x,
+                             xmm128(i, s, true), imm & 3, (imm >> 2) & 3, (imm >> 4) & 3, (imm >> 6) & 3));
+            return;
+        }
+        case ZYDIS_MNEMONIC_UNPCKLPS: case ZYDIS_MNEMONIC_UNPCKHPS: {
+            const int x = xmm_dst(i, d);
+            const int b = M == ZYDIS_MNEMONIC_UNPCKLPS ? 0 : 2;
+            line(std::format("{{ const rt::Xmm d_ = xmm{0}, s_ = {1}; xmm{0} = rt::Xmm{{{{d_.u[{2}], s_.u[{2}], d_.u[{3}], s_.u[{3}]}}}}; }}", x,
+                             xmm128(i, s, true), b, b + 1));
+            return;
+        }
+        case ZYDIS_MNEMONIC_MOVLPS: case ZYDIS_MNEMONIC_MOVHPS: {  // lanes 0-1 / 2-3 to or from 64 bits of memory
+            const int lo = M == ZYDIS_MNEMONIC_MOVLPS ? 0 : 2;
+            if (d.kind == Operand::Kind::Mem) {
+                const int x = xmm_index(s.reg);
+                if (x < 0) unsupported(i, "expected an xmm register");
+                use_xmm(x);
+                line(std::format("rt::st64(m, {}, uint64_t(xmm{}.u[{}]) | uint64_t(xmm{}.u[{}]) << 32, 0x{:X}u);", addr(i, d), x, lo, x, lo + 1, i.addr));
+            } else {
+                if (s.kind != Operand::Kind::Mem) unsupported(i, "register form");
+                const int x = xmm_dst(i, d);
+                line(std::format("{{ const uint64_t v_ = rt::ld64(m, {}, 0x{:X}u); xmm{}.u[{}] = uint32_t(v_); xmm{}.u[{}] = uint32_t(v_ >> 32); }}",
+                                 addr(i, s), i.addr, x, lo, x, lo + 1));
+            }
+            return;
+        }
+        case ZYDIS_MNEMONIC_MOVHLPS: case ZYDIS_MNEMONIC_MOVLHPS: {
+            const int x = xmm_dst(i, d), y = xmm_index(s.reg);
+            if (y < 0) unsupported(i, "expected an xmm register");
+            use_xmm(y);
+            if (M == ZYDIS_MNEMONIC_MOVHLPS) line(std::format("{{ const rt::Xmm s_ = xmm{1}; xmm{0}.u[0] = s_.u[2]; xmm{0}.u[1] = s_.u[3]; }}", x, y));
+            else line(std::format("{{ const rt::Xmm s_ = xmm{1}; xmm{0}.u[2] = s_.u[0]; xmm{0}.u[3] = s_.u[1]; }}", x, y));
             return;
         }
         case ZYDIS_MNEMONIC_COMISS: case ZYDIS_MNEMONIC_UCOMISS: {
@@ -1102,6 +1158,13 @@ bool FnEmitter::emit_x87(const Insn& i, uint8_t need) {
             mark_fx(FPSW);
             line(std::format("if (rt::x87_trig_in_range(ST(0u))) {{ ST(0u) = rt::{}(ST(0u)); fpsw &= ~0x600u; }} else {{ fpsw = (fpsw & ~0x200u) | 0x400u; }}",
                              M == ZYDIS_MNEMONIC_FSIN ? "fsin" : "fcos"));
+            return true;
+        case ZYDIS_MNEMONIC_FSINCOS:  // ST0 = sin, then push cos
+            mark_fx(FPSW);
+            line("if (rt::x87_trig_in_range(ST(0u))) {");
+            line("const double x_ = ST(0u); ST(0u) = rt::fsin(x_); fpsw &= ~0x600u;");
+            fpush("rt::fcos(x_)");
+            line("} else { fpsw = (fpsw & ~0x200u) | 0x400u; }");
             return true;
         case ZYDIS_MNEMONIC_FPTAN:
             mark_fx(FPSW);

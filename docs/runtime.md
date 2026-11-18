@@ -1,8 +1,10 @@
 # Runtime: status (roadmap step 3)
 
-Last updated 2026-11-18 (v0.11.0: the C runtime is lifted and its start-up runs).
+Last updated 2026-11-18 (v0.12.0: XAPI lifted too; the runtime implements the kernel beneath it; guest RAM size is a setting).
 
-The runtime is everything the lifted game code needs that isn't lifted: guest memory, the kernel, XAPI, D3D, DirectSound/XACT and the other XDK libraries. All of it is replaced natively (HLE); none of it is emulated. The C runtime (LIBCMT) is the exception: since v0.11.0 it's lifted with the game, so `sprintf`, `strtod` and the x87 maths give exactly the original's results (`recompiler-core.md`, "The C runtime").
+The runtime is everything the lifted game code needs that isn't lifted: guest memory, the Xbox kernel, D3D, DirectSound/XACT and the other XDK libraries. All of it is replaced natively (HLE); none of it is emulated.
+
+Two libraries are lifted with the game instead: the C runtime (since v0.11.0), so `sprintf`, `strtod` and the x87 maths give exactly the original's results, and XAPI (since v0.12.0), so the heap, file and thread wrappers and XGraphics' maths behave exactly as the original's. Below them is the kernel's documented interface (the `xboxkrnl.exe` exports), which the runtime implements. That boundary is narrower and better specified than XAPI's: lifted code imports 81 kernel functions and variables, against the 88 XAPI entry points the game calls. Four XAPI functions can't be lifted and are replaced natively (below).
 
 ## How it works
 
@@ -14,7 +16,11 @@ cmake -S . -B build -DQILIN_GEN_DIR=$PWD/gen && cmake --build build
 build/qilin_run default.xbe
 ```
 
-**Start-up.** The XBE entry point (`0x14FAE9`) is XAPI start-up code. It creates the main thread, whose procedure (`0x14FA75`) initialises XAPI, runs the initializer tables, then calls the game's `main(0, 0, 0)` at `0x32390`. The runtime replaces XAPI's part: it sets up memory, the stack and the thread information block. Then it runs the initializers in XAPI's order (`0x15172C`, then `0x1516D4`), which hold only library code, no game constructors:
+**Start-up.** The XBE entry point (`0x14FAE9`) is XAPI start-up code. It sizes the static TLS block, then creates the main thread, whose procedure (`0x14FA75`) initialises XAPI, runs the initializer tables, then calls the game's `main(0, 0, 0)` at `0x32390`. The runtime sets up memory, the main thread's stack, KPCR and KTHREAD, then follows the same steps:
+
+1. The entry point's prologue, natively: the certificate size fix-up and the TLS size (`0x549528`) and index.
+2. XAPI's process initialisation, lifted (`0x151011`): critical sections, the auto power-off timer, the process heap (`RtlCreateHeap` over `NtAllocateVirtualMemory`), console settings, drive letters. The step before it in the thread procedure, `0x1517B9`, patches kernel code for known kernel builds (`cli`, writes into the kernel, `sti`); it's left out.
+3. The C runtime's initializers, in XAPI's order (`0x15172C`, then `0x1516D4`). They hold only library code, no game constructors:
 
 | Step | Entries | What |
 |---|---|---|
@@ -25,15 +31,18 @@ build/qilin_run default.xbe
 
 An entry runs if it's lifted (`rt::is_lifted`); otherwise `qilin_run` names it and skips it.
 
-**Guest memory.** The Xbox's 64 MB of RAM, flat from address 0:
+**Guest memory.** RAM flat from address 0: 64 MB by default, the retail Xbox's, or more with `qilin_run --ram-mb N` (a multiple of 4, up to 1024). The game reads the size from `GlobalMemoryStatus` and records 128 MB, the development kit's size, when there's more than 64 MB; testing found no change in behaviour. The host allocates RAM with `calloc`, so pages the guest never touches cost nothing. Rendering at higher resolutions, SMAA and similar features don't need guest RAM: render targets and textures live in the Vulkan renderer's host memory.
 
-| Range | What |
+| Range (for R bytes of RAM) | What |
 |---|---|
 | `0x00010000` … end of image | The XBE image, BSS zeroed |
-| End of image … `0x03EE0000` | Guest heap: whole 4 KB pages, first fit, zeroed (`host::GuestHeap`) |
-| `0x03EE0000–0x03FE0000` | The main thread's stack (1 MB) |
-| `0x03FE0000` | The main thread's information block: `fs:[0]`, the exception chain, starts as `0xFFFFFFFF` |
-| `0x03FF0000` | Objects behind the kernel's data exports, 256 bytes each |
+| End of image (64 KB aligned) … stack | Virtual memory (`host::VirtualMemory`): `NtAllocateVirtualMemory` and contiguous allocations |
+| R − 0x120000 … R − 0x20000 | The main thread's stack (1 MB) |
+| R − 0x20000 | The main thread's KPCR: `fs:[0]` (the exception chain, starts as `0xFFFFFFFF`), stack limits, `Prcb`, `CurrentThread` at `+0x28` |
+| R − 0x1F000 | The main thread's KTHREAD |
+| R − 0x10000 | Objects behind the kernel's data exports, 256 bytes each |
+
+**Virtual memory** works as on the Xbox: 4 KB pages, reservations on 64 KB boundaries (lowest first, or highest with `MEM_TOP_DOWN`), pages committed inside a reservation and zeroed when committed, `NtQueryVirtualMemory` reporting reserved, committed and free runs. Contiguous allocations (`MmAllocateContiguousMemory[Ex]`) come from the top, within the caller's address limits. On the Xbox they're mapped at `0x80000000` + physical; here the guest gets the RAM address, since the address space is flat.
 
 `qilin_run` is built with checked memory for bring-up, so an access outside RAM stops with the guest address of the instruction.
 
@@ -49,25 +58,39 @@ Replacements read stdcall arguments with `host::arg(c, i)` and return with `host
 
 ## Replacements so far
 
-| Address | Function | Replacement |
-|---|---|---|
-| `0x14C29C` | `QueryPerformanceCounter` | Host steady clock, scaled to the Xbox's 733,333,333 Hz (XAPI reads `rdtsc`) |
-| `0x14C2AD` | `QueryPerformanceFrequency` | 733,333,333 |
-| `0x14AD17` | `GlobalMemoryStatus` | 64 MB total, available from the guest heap, XAPI's fixed virtual figures |
-| `0x14AE89` | `XGetLaunchInfo` | `ERROR_NOT_FOUND`: always a cold boot |
-| `0x14FA3B` | `XGetLanguage` | English (1); there are no console settings yet |
+**XAPI functions that can't be lifted** (`kNative` in `recomp/src/main.cpp`, replacements in `recomp/runtime/host/xapi.cpp`):
 
-Each was identified from its disassembly, and the source comment says what the original does.
+| Address | Function | Why | Replacement |
+|---|---|---|---|
+| `0x14C29C` | `QueryPerformanceCounter` | `rdtsc` | Host steady clock, scaled to the Xbox's 733,333,333 Hz |
+| `0x14B924` | `OutputDebugStringA` | `int 0x2D`, the kernel debugger's print service | Prints the string to stderr as `[guest] …` |
+| `0x1517B9` | Kernel patch at start-up | `cli`, writes into kernel code | Not run |
+| `0x151B45` | Shutdown notification | reloads the GDT | Never called: the runtime doesn't shut down |
 
-**Where it stops now:** in the C runtime's start-up, at the kernel's `RtlInitializeCriticalSection` (ordinal 291), called from `0x16D9F2`. In v0.10.0, without the C runtime, `main` stopped at `sprintf`; with the lifted CRT and no start-up it ran on to an XAPI call at `0x14B280` (from `0xFF34A`).
+**Kernel functions** (`recomp/runtime/host/kernel.cpp`). Each one is registered with its stdcall argument size, checked against the export table, and works on the guest's own structures:
+
+| Kernel function | Implementation |
+|---|---|
+| `RtlInitializeCriticalSection`, `RtlEnterCriticalSection`, `RtlLeaveCriticalSection`, `RtlTryEnterCriticalSection` | The kernel's algorithm on the guest's `RTL_CRITICAL_SECTION` (event, `LockCount`, `RecursionCount`, `OwningThread`). A wait for another thread stops the runtime, which has one thread so far |
+| `NtAllocateVirtualMemory`, `NtFreeVirtualMemory`, `NtQueryVirtualMemory` | Virtual memory above |
+| `MmAllocateContiguousMemory[Ex]`, `MmFreeContiguousMemory`, `MmPersistContiguousMemory` | Contiguous allocations above; persisting is a no-op |
+| `MmQueryStatistics` | Pages of RAM, available pages after the image, stack, kernel area and committed memory |
+| `KeInitializeDpc`, `KeInitializeTimerEx`, `KeSetTimer[Ex]`, `KeCancelTimer` | The guest objects are initialised as the kernel does. Timers are recorded with their due time and DPC; firing them waits for the scheduler. XAPI's first timer is its six-hour auto power-off |
+| `ExQueryNonVolatileSetting` | A North American retail console with factory settings: English, 60 Hz, NTSC-M, region 1. An unmodelled setting stops the runtime |
+| `RtlNtStatusToDosError` | The NT table for the statuses the runtime and the file system return; any other status stops the runtime |
+| `HalRegisterShutdownNotification` | Accepted; the routines never run |
+
+**Where it stops now:** XAPI's process initialisation opens a file with `NtOpenFile` (from `0x150EAE`): the file system is next. In v0.11.0 it stopped at the CRT's first critical section; before that, at `sprintf`.
 
 ## Tests
 
-`qilin_host_tests` (CI, no game files) covers the kernel export table, a replacement called through `rt::call_unlifted` with stdcall argument popping, `describe()`, and the guest heap.
+`qilin_host_tests` (CI, no game files) covers the kernel export table, a replacement called through `rt::call_unlifted` with stdcall argument popping, `describe()`, and virtual memory (granularity, top-down reservations, commit zeroing, queries, release).
 
 ## Next
 
-1. **Keep running `qilin_run`** and replace each function it stops at, in order: the kernel's critical sections, TLS and the heap behind the C runtime's start-up, then XAPI. The 252 library entry points that lifted code calls directly are the list, plus kernel imports used through XAPI.
-2. **Hot C runtime functions** (`memcpy`, `strlen` …) may get native versions once the runtime shows which are hot, each checked against the lifted original.
-3. **Names:** XbSymbolDatabase can name the XDK library functions by signature, which would speed up identifying them.
-4. **Threads, the file system over the extracted disc, then D3D on Vulkan** (roadmap steps 3–4).
+1. **The file system:** the object namespace (`\Device\CdRom0`, the hard disk partitions, `\??\D:` and the other symbolic links XAPI creates), handles, and `Nt*File` over host directories: the extracted disc read-only, save data and cache partitions writable.
+2. **The scheduler:** guest threads (`PsCreateSystemThreadEx`), waits, events, timers and DPCs. Until then a second thread stops the runtime.
+3. **Keep running `qilin_run`** and implement each kernel function it stops at. Lifted code imports 81; the rest of the list is the 167 library entry points (D3D, XACT, DSOUND …) it calls directly.
+4. **Hot C runtime functions** (`memcpy`, `strlen` …) may get native versions once the runtime shows which are hot, each checked against the lifted original.
+5. **Names:** XbSymbolDatabase can name the XDK library functions by signature, which would speed up identifying them.
+6. **D3D on Vulkan** (roadmap step 4).

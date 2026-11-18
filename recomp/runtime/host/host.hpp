@@ -10,19 +10,35 @@
 #pragma once
 
 #include <cstdint>
+#include <map>
+#include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "guest.hpp"
 
 namespace qilin::host {
 
-// ---- Guest memory: the Xbox's 64 MB of RAM, flat from address 0.
-inline constexpr uint32_t kRamSize = 64u << 20;
-inline constexpr uint32_t kKernelData = 0x03FF0000;  // objects behind the kernel's data exports, 256 bytes each
-inline constexpr uint32_t kTib = 0x03FE0000;         // the main thread's information block (fs)
-inline constexpr uint32_t kStackTop = 0x03FE0000;    // the main thread's stack grows down from here
-inline constexpr uint32_t kStackSize = 1u << 20;
+// ---- Guest memory: RAM flat from address 0. 64 MB is the retail Xbox's;
+// qilin_run --ram-mb raises it (the game reads the size from
+// GlobalMemoryStatus and works with more). The top 128 KB holds the kernel's
+// data-export objects and the main thread's KPCR and KTHREAD; the main
+// stack sits below that, and the rest above the image is the guest's to
+// allocate.
+inline constexpr uint32_t kRetailRamMb = 64;
+inline constexpr uint32_t kMaxRamMb = 1024;  // guest pointers stay below 0x80000000, where the kernel's addresses start
+struct MemoryMap {
+    uint32_t ram_size;
+    uint32_t kernel_data() const { return ram_size - 0x10000; }  // objects behind the kernel's data exports, 256 bytes each
+    uint32_t kpcr() const { return ram_size - 0x20000; }          // the main thread's processor control region (fs)
+    uint32_t kthread() const { return kpcr() + 0x1000; }
+    uint32_t stack_top() const { return kpcr(); }                // the main thread's stack grows down from here
+    static constexpr uint32_t kStackSize = 1u << 20;
+    uint32_t stack_bottom() const { return stack_top() - kStackSize; }
+};
+const MemoryMap& memory_map();
+void set_memory_map(MemoryMap m);
 inline constexpr uint32_t kReturnSentinel = 0xFFFFFFF0u;  // return address of the outermost call
 
 // ---- Kernel exports (third_party/nxdk/xboxkrnl.exe.def).
@@ -34,6 +50,7 @@ struct KernelExport {
     bool fastcall;
 };
 const KernelExport* kernel_export(uint32_t ordinal);  // nullptr if unknown
+const KernelExport* kernel_export(std::string_view name);
 inline constexpr uint32_t kernel_addr(uint32_t ordinal) { return 0x80000000u | ordinal; }
 
 // ---- Replacements.
@@ -46,26 +63,60 @@ size_t hle_count();
 uint32_t arg(const rt::Context& c, int i);
 void ret(rt::Context& c, uint32_t eax, uint32_t arg_bytes);
 
-// ---- Guest RAM allocation: whole 4 KB pages between the end of the image
-// and the bottom of the main stack, first fit. Allocations are zeroed.
-class GuestHeap {
+// ---- Guest virtual memory (the kernel's Nt*VirtualMemory and Mm*
+// contiguous allocations) over the RAM between the end of the image and the
+// main stack. As on the Xbox: 4 KB pages, reservations on 64 KB boundaries,
+// pages committed inside a reservation, committed pages zeroed. The address
+// space is flat (guest address = RAM offset), so a reservation is backed by
+// RAM from the start; "committed" is bookkeeping, which the statistics and
+// NtQueryVirtualMemory report.
+class VirtualMemory {
 public:
-    void init(uint8_t* ram, uint32_t lo, uint32_t hi);  // lo, hi: page-aligned guest addresses
-    uint32_t alloc(uint32_t bytes);                    // 0 when out of memory
-    bool free(uint32_t addr);                          // false if addr isn't an allocation
-    uint32_t size_of(uint32_t addr) const;             // 0 if addr isn't an allocation
-    uint32_t total() const { return hi_ - lo_; }
-    uint32_t available() const;
+    static constexpr uint32_t kPage = 0x1000, kGranularity = 0x10000;
+    static constexpr uint32_t kMemCommit = 0x1000, kMemReserve = 0x2000, kMemFree = 0x10000, kMemPrivate = 0x20000;
+    struct Info {
+        uint32_t base, allocation_base, allocation_protect, size, state, protect, type;
+    };
+    void init(uint8_t* ram, uint32_t lo, uint32_t hi);  // lo, hi: 64 KB aligned
+    // Reserves `size` bytes (rounded up to pages) at `base` (rounded down to
+    // 64 KB), or anywhere free if base is 0, lowest first or highest first.
+    // Returns the base, or 0 if that range isn't free.
+    // lowest/highest bound the whole reservation (contiguous allocations' limits).
+    uint32_t reserve(uint32_t base, uint32_t size, uint32_t protect, bool top_down, uint32_t align = kGranularity,
+                     uint32_t lowest = 0, uint32_t highest = 0xFFFFFFFFu);
+    // Commits pages of one reservation, zeroing those not already committed.
+    bool commit(uint32_t base, uint32_t size, uint32_t protect);
+    bool decommit(uint32_t base, uint32_t size);
+    bool release(uint32_t base);                         // a whole reservation, by its base
+    std::optional<Info> query(uint32_t addr) const;      // nullopt outside the managed range
+    uint32_t region_size(uint32_t base) const;           // a reservation's size, 0 if base isn't one
+    uint32_t lo() const { return lo_; }
+    uint32_t hi() const { return hi_; }
+    uint64_t committed_bytes() const;
+    uint64_t reserved_bytes() const;
 
 private:
+    struct Region {
+        uint32_t size, protect;
+        std::vector<uint32_t> page_protect;  // 0: reserved only
+    };
     uint8_t* ram_ = nullptr;
     uint32_t lo_ = 0, hi_ = 0;
-    std::vector<std::pair<uint32_t, uint32_t>> used_;  // (address, bytes), sorted
+    std::map<uint32_t, Region> regions_;
+    const std::pair<const uint32_t, Region>* find(uint32_t addr) const;
 };
-GuestHeap& heap();
+VirtualMemory& vm();
 
 // The replacements for Ghoulies' XAPI, registered by address (xapi.cpp).
 void register_xapi();
+// The kernel replacements, registered at kernel_addr(ordinal) (kernel.cpp).
+void register_kernel();
+
+// ---- Threads. fs points at the KPCR, whose PrcbData.CurrentThread (+0x28)
+// is the running thread's KTHREAD (kernel.cpp).
+inline constexpr uint32_t kKThreadSize = 0x200;
+void init_main_thread(rt::Context& c, uint32_t kpcr, uint32_t kthread, uint32_t stack_top, uint32_t stack_size);
+uint32_t current_thread(const rt::Context& c);
 
 // ---- Reports.
 struct Region {
