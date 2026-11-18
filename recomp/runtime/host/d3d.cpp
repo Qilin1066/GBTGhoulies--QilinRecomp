@@ -8,7 +8,9 @@
 // - Resources (surfaces, textures, buffers): the game passes their headers
 //   around and may read them. Each header the runtime makes is in contiguous
 //   guest memory; its pixels live in the renderer.
-// The device object itself is the runtime's: the game never reads it.
+// The device object itself is the runtime's: the game never reads it. The
+// lifted D3D resource code (recomp/src/main.cpp, kLiftedD3d) reads a few of
+// its fields, which mirror_device keeps current in the original layout.
 //
 // Anything not modelled yet (a Swap flag, a partial colour clear, a call
 // that isn't registered) stops the runtime with its name.
@@ -39,6 +41,9 @@ constexpr uint32_t kRefMask = 0xFFFF, kTypeMask = 0x70000, kTypeSurface = 0x5000
 constexpr uint32_t kIntRef1 = 0x80000, kIntRefMask = 0x780000, kD3DCreated = 0x01000000;
 
 // D3DFORMAT values (D3DPixelContainer.Format bits 8-15)
+constexpr uint32_t kMultisampleNone = 0x11;  // D3DMULTISAMPLE_NONE on the Xbox (1x1 samples)
+// Device fields the lifted resource code reads (offsets in the original device object).
+constexpr uint32_t kDevMultisample = 0x195C, kDevRenderTarget = 0x19F4, kDevDepth = 0x19F8, kDevFrameBuffers = 0x1A04;
 constexpr uint32_t kFmtA8R8G8B8 = 0x06, kFmtX8R8G8B8 = 0x07, kFmtLinA8R8G8B8 = 0x12, kFmtLinX8R8G8B8 = 0x1E,
                    kFmtD24S8 = 0x2A, kFmtLinD24S8 = 0x2E;
 
@@ -94,13 +99,31 @@ uint32_t guest_alloc(Device& d, uint32_t bytes) {
 // and the pitch in 64-byte units, less one.
 uint32_t make_surface(rt::Context& c, Device& d, uint32_t format, uint32_t width, uint32_t height, uint32_t bytes_per_pixel) {
     const uint32_t s = guest_alloc(d, 24), pitch = width * bytes_per_pixel;
+    // The pixels: contiguous memory, as the original allocates frame
+    // buffers, so a CPU lock (the disc-error screen draws into the front
+    // buffer) writes guest memory. The renderer's image is what's drawn and shown.
+    const uint32_t data = contiguous(pitch * height, 0, kPhysicalLimit - 1, 0x10000, 4);
+    if (!data) rt::trap(0, "D3D: out of contiguous memory for a frame buffer");
     st(c, s, kTypeSurface | kIntRef1 | kD3DCreated);  // held by the device; no outside reference yet
-    st(c, s + 4, 0);                                   // Data: the pixels are the renderer's
+    st(c, s + 4, data);                                // Data: the physical address
     st(c, s + 8, 0);
     st(c, s + 12, (format << 8) | (2u << 4) | 1u);     // 2 dimensions, DMA context A
     st(c, s + 16, (width - 1) | ((height - 1) << 12) | ((pitch / 64 - 1) << 24));
     st(c, s + 20, 0);
     return s;
+}
+
+// The device fields the lifted resource code reads: the frame buffers (the
+// one being drawn, the front buffer, the next), the render target, the
+// depth buffer and the multisample type.
+void mirror_device(rt::Context& c, const Device& d) {
+    const uint32_t n = uint32_t(d.frame_buffers.size()), back = d.renderer->back_index();
+    st(c, kDeviceStorage + kDevFrameBuffers, d.frame_buffers[back]);
+    st(c, kDeviceStorage + kDevFrameBuffers + 4, d.frame_buffers[d.renderer->front_index()]);
+    st(c, kDeviceStorage + kDevFrameBuffers + 8, n > 2 ? d.frame_buffers[(back + 1) % n] : 0);
+    st(c, kDeviceStorage + kDevRenderTarget, d.frame_buffers[back]);
+    st(c, kDeviceStorage + kDevDepth, d.depth);
+    st(c, kDeviceStorage + kDevMultisample, kMultisampleNone);
 }
 
 uint32_t add_ref(rt::Context& c, uint32_t r) {  // D3DResource_AddRef, as the original
@@ -217,9 +240,11 @@ void create_device(rt::Context& c) {
     std::printf("qilin_run: D3D device %ux%u, %u back buffer%s, %s, presentation interval %u, multisample type %#x; Vulkan on %s\n",
                 width, height, count, count == 1 ? "" : "s", auto_depth ? "D24S8 depth" : "no depth buffer", d->interval,
                 multisample, d->renderer->device_name().c_str());
-    if (multisample) std::printf("qilin_run: multisampling isn't modelled yet: frames are rendered at %ux%u, one sample per pixel\n", width, height);
+    if (multisample != kMultisampleNone && multisample != 0)
+        unmodelled("Direct3D_CreateDevice", strf("multisample type %#x", multisample));
     g_device = d.release();
     st(c, kGlobalDevice, kDeviceStorage);
+    mirror_device(c, *g_device);
     if (out) st(c, out, kDeviceStorage);
     ret(c, 0, 24);  // D3D_OK
 }
@@ -254,8 +279,15 @@ void get_render_target2(rt::Context& c) {
     ret(c, s, 0);
 }
 
-// ULONG D3DResource_AddRef(D3DResource*)
-void resource_add_ref(rt::Context& c) { ret(c, add_ref(c, arg(c, 0)), 4); }
+// VOID D3D_BlockOnResource(D3DResource*): waits until the GPU is done with
+// the resource, before the CPU writes it. The renderer copies what it draws
+// from guest memory when it draws, so the GPU never holds guest memory.
+void block_on_resource(rt::Context& c) { ret(c, c.eax, 4); }
+
+// BYTE* D3DVertexBuffer_Lock2(D3DVertexBuffer*, DWORD Flags): the data's
+// address in the contiguous-memory window, as the original returns it. (The
+// original also puts a wait for the GPU in the command buffer; see BlockOnResource.)
+void vertex_buffer_lock2(rt::Context& c) { ret(c, ld(c, arg(c, 0) + 4) | rt::kRamCachedAlias, 8); }
 
 // ULONG D3DResource_Release(D3DResource*): as the original. A surface's
 // parent texture is released with it, and a resource the device still holds
@@ -351,6 +383,7 @@ void swap(rt::Context& c) {
     const uint32_t target = std::max(d.vblanks + d.interval, vblanks_elapsed(d) + 1);
     std::this_thread::sleep_until(d.epoch + std::chrono::duration_cast<std::chrono::steady_clock::duration>(
                                                 std::chrono::duration<double>(double(target) / kVblankHz)));
+    mirror_device(c, d);
     run_vblanks(c, d, target, true);
     deliver_frame(d);
     ret(c, d.swaps, 4);
@@ -367,7 +400,8 @@ constexpr D3dFn kD3d[] = {
     {"D3DDevice_GetBackBuffer2", 4, get_back_buffer2},
     {"D3DDevice_GetDepthStencilSurface2", 0, get_depth_stencil_surface2},
     {"D3DDevice_GetRenderTarget2", 0, get_render_target2},
-    {"D3DResource_AddRef", 4, resource_add_ref},
+    {"D3D_BlockOnResource", 4, block_on_resource},
+    {"D3DVertexBuffer_Lock2", 8, vertex_buffer_lock2},
     {"D3DResource_Release", 4, resource_release},
     {"D3DResource_Register", 8, resource_register},
     {"D3DDevice_SetVerticalBlankCallback", 4, set_vertical_blank_callback},

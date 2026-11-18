@@ -1,6 +1,6 @@
 # Runtime: status (roadmap step 3)
 
-Last updated 2026-11-18 (v0.15.0: audio starts (XACT lifted, DirectSound native, `audio.md`); the game loads its first assets and stops at its first texture; the renderer and Direct3D are in `graphics.md`).
+Last updated 2026-11-18 (v0.16.0: guest RAM mapped at the kernel's windows too; D3D's resource code lifted; the game creates its textures and stops at its first vertex shader. v0.15.0: audio starts, `audio.md`; the renderer and Direct3D are in `graphics.md`).
 
 The runtime is everything the lifted game code needs that isn't lifted: guest memory, the Xbox kernel, D3D, DirectSound/XACT and the other XDK libraries. All of it is replaced natively (HLE); none of it is emulated.
 
@@ -33,11 +33,12 @@ build/qilin_run [--game-dir DIR] [--data-dir DIR] [--ram-mb N] [--dump-frames DI
 
 An entry runs if it's lifted (`rt::is_lifted`); otherwise `qilin_run` names it and skips it.
 
-**Guest memory.** RAM flat from address 0: 64 MB by default, the retail Xbox's, or more with `qilin_run --ram-mb N` (a multiple of 4, up to 1024). The game reads the size from `GlobalMemoryStatus` and records 128 MB, the development kit's size, when there's more than 64 MB; testing found no change in behaviour. The host allocates RAM with `calloc`, so pages the guest never touches cost nothing. Rendering at higher resolutions, SMAA and similar features don't need guest RAM: render targets and textures live in the Vulkan renderer's host memory.
+**Guest memory.** RAM flat from address 0: 64 MB by default, the retail Xbox's, or more with `qilin_run --ram-mb N` (a multiple of 4, up to 1024). The game reads the size from `GlobalMemoryStatus` and records 128 MB, the development kit's size, when there's more than 64 MB; testing found no change in behaviour. Guest RAM is a shared-memory object mapped into a 4 GB host reservation three times, as the Xbox's kernel maps physical memory: at 0, at `0x80000000` (contiguous memory, which D3D hands out as `Data | 0x80000000`) and at `0xF0000000` (the write-combined window D3D's surface locks return). The game writes vertices and pixels through those windows, so they're the same pages, and lifted code still addresses memory as base + address with nothing extra per access (`recomp/runtime/host/guest_ram.cpp`: `memfd` on Linux, `shm_open` on macOS, placeholder views with `MapViewOfFile3` on Windows 10 1803 and later). Pages cost nothing until touched. These two windows are the only aliases the game uses so far; the checked build stops on any other address outside RAM. Rendering at higher resolutions, SMAA and similar features don't need guest RAM: render targets and textures live in the Vulkan renderer's host memory.
 
 | Range (for R bytes of RAM) | What |
 |---|---|
 | `0x00010000` … end of image | The XBE image, BSS zeroed |
+| `0x80000000` + address, `0xF0000000` + address | The same RAM again: the kernel's contiguous and write-combined windows |
 | End of image (64 KB aligned) … stack | Virtual memory (`host::VirtualMemory`): `NtAllocateVirtualMemory` and contiguous allocations |
 | R − 0x120000 … R − 0x20000 | The main thread's stack (1 MB), with its TLS block at the top |
 | R − 0x20000 | The main thread's KPCR: `fs:[0]` (the exception chain, starts as `0xFFFFFFFF`), stack limits, `Prcb`, `CurrentThread` at `+0x28` |
@@ -122,7 +123,7 @@ Names are matched case-insensitively, as on FATX and the disc's XDVDFS (an exact
 
 **DirectSound** (`recomp/runtime/host/dsound.cpp`) over the software mixer, beneath the lifted XACT. See `audio.md`.
 
-**Where it stops now:** the game's `main` creates its graphics device on Vulkan, starts XACT (the engine, DirectSound, the effects image, the mix-bin headroom), checks its wave banks and the controller ports, loads `bundles/common.bnl` and the font, registers their resources, and stops at its first texture: `D3DDevice_CreateTexture2` from `0x620DC`. Earlier, start-up writes the title's save metadata and images to `partition1/UDATA/4d530053/`, gets cache partition 5 formatted with 64 KB clusters and mounted as Z:, and checks that `D:\loctext\english` exists. With a disc file missing, the game shows its disc-error screen, as the console does: it loads `dirtydisk_bitmap` and draws the message into the front buffer (`LockRect`). In v0.14.0 it stopped at the audio engine; in v0.13.0 at the first Direct3D call; in v0.12.0 at the first `NtOpenFile`.
+**Where it stops now:** the game's `main` creates its graphics device on Vulkan, starts XACT (the engine, DirectSound, the effects image, the mix-bin headroom), checks its wave banks and the controller ports, loads `bundles/common.bnl` and the font, registers their resources, creates its textures, and stops at its first vertex shader: `D3DDevice_CreateVertexShader` from `0x65F37`. In v0.15.0 it stopped at the first texture. Earlier, start-up writes the title's save metadata and images to `partition1/UDATA/4d530053/`, gets cache partition 5 formatted with 64 KB clusters and mounted as Z:, and checks that `D:\loctext\english` exists. With a disc file missing, the game shows its disc-error screen, as the console does: it loads `dirtydisk_bitmap` and draws the message into the front buffer (`LockRect`). In v0.14.0 it stopped at the audio engine; in v0.13.0 at the first Direct3D call; in v0.12.0 at the first `NtOpenFile`.
 
 ## Tests
 
@@ -130,7 +131,7 @@ Names are matched case-insensitively, as on FATX and the disc's XDVDFS (an exact
 
 ## Next
 
-1. **Textures and drawing** (`graphics.md`): the game creates its first texture next.
+1. **Shaders and drawing** (`graphics.md`): the game creates its first vertex shader next.
 2. **A window, input and audio output** on SDL3 (the controller to test against: an Xbox One pad over Bluetooth).
 3. **Audio still to come** (`audio.md`): streams (streamed wave banks, music), WMA, the I3DL2 reverb, envelopes, LFOs, filters, 3D.
 4. **The scheduler:** guest threads (`PsCreateSystemThreadEx`), waits, events, timers and DPCs. Until then a second thread stops the runtime.

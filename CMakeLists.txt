@@ -7,7 +7,7 @@ if(APPLE AND NOT CMAKE_OSX_DEPLOYMENT_TARGET)
     set(CMAKE_OSX_DEPLOYMENT_TARGET 10.15 CACHE STRING "oldest macOS the runtime runs on")
 endif()
 # The single source of the version number (see CHANGELOG.md for the scheme).
-project(GBTGQilincomp VERSION 0.15.0 LANGUAGES C CXX)
+project(GBTGQilincomp VERSION 0.16.0 LANGUAGES C CXX)
 
 # ---- Language: C++23 everywhere (recompiler, runtime, generated code) ----
 set(CMAKE_CXX_STANDARD 23)
@@ -140,7 +140,7 @@ add_test(NAME qilin_audio_tests COMMAND qilin_audio_tests)
 add_library(qilin_host STATIC recomp/runtime/host/host.cpp recomp/runtime/host/xapi.cpp recomp/runtime/host/kernel.cpp
                               recomp/runtime/host/kernel_io.cpp recomp/runtime/host/xinput.cpp
                               recomp/runtime/host/call_guest.cpp recomp/runtime/host/d3d.cpp
-                              recomp/runtime/host/dsound.cpp)
+                              recomp/runtime/host/dsound.cpp recomp/runtime/host/guest_ram.cpp)
 target_include_directories(qilin_host PUBLIC recomp/runtime/host)
 target_link_libraries(qilin_host PUBLIC qilin_runtime qilin_gfx qilin_audio PRIVATE qilin_warnings)
 add_executable(qilin_host_tests recomp/runtime/host/host_tests.cpp)

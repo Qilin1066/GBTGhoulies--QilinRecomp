@@ -164,6 +164,12 @@ void init_main_thread(rt::Context& c, uint32_t kpcr, uint32_t kthread, uint32_t 
                       uint32_t tls_size);
 uint32_t current_thread(const rt::Context& c);
 
+// ---- Guest RAM (guest_ram.cpp): ram_size bytes, seen at 0 and again at
+// rt::kRamCachedAlias and rt::kRamWriteCombinedAlias, in a 4 GB host
+// reservation whose base is returned (the guest's address 0). Pages start
+// zero and cost nothing until touched. Null with the reason in *error.
+uint8_t* map_guest_ram(uint32_t ram_size, std::string* error);
+
 // ---- Device registers lifted code reads or writes (rt::mmio_read32 and
 // rt::mmio_write32). An unregistered register stops the runtime, named.
 using MmioRead = uint32_t (*)();

@@ -186,12 +186,18 @@ int main(int argc, char** argv) {
     }
 
     // Guest RAM, with the image at its base address.
-    // calloc: the host maps zeroed pages lazily, so RAM the guest never touches costs nothing.
-    const std::unique_ptr<uint8_t, decltype(&std::free)> ram(static_cast<uint8_t*>(std::calloc(mm.ram_size, 1)), &std::free);
-    if (!ram) {
-        std::fprintf(stderr, "qilin_run: can't allocate %u MB of guest RAM\n", ram_mb);
+    // Mapped at 0 and at the kernel's two windows onto it; pages the guest
+    // never touches cost nothing. The mapping lasts until the process exits.
+    std::string ram_error;
+    uint8_t* const ram_base = host::map_guest_ram(mm.ram_size, &ram_error);
+    if (!ram_base) {
+        std::fprintf(stderr, "qilin_run: can't set up %u MB of guest RAM: %s\n", ram_mb, ram_error.c_str());
         return 2;
     }
+    struct {
+        uint8_t* p;
+        uint8_t* get() const { return p; }
+    } ram{ram_base};
     std::memcpy(ram.get() + xbe.base, xbe.image().data(), xbe.image().size());
     rt::Context c{};
     c.mem = ram.get();

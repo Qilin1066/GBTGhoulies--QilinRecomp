@@ -80,6 +80,33 @@ constexpr Range kLibraries[] = {kXapi, kCrt, kXact, kXgrph};
 // WAVEFORMATEX builders (each a jump stub and its body).
 constexpr uint32_t kLiftedDsound[] = {0x1C5AF1, 0x1C5849, 0x1C586E, 0x1CB40D, 0x1C5B3B, 0x1C8BDF, 0x1C5B40, 0x1C8C29};
 
+// Direct3D is replaced natively, except its resource code, which is pure
+// computation over the game's allocator (0xF7270): creating textures,
+// surfaces and vertex buffers, surface levels, descriptions and locks.
+// Lifted, the headers, sizes, pitches and swizzled layouts are exactly the
+// original's. What it calls that touches the GPU or the command buffer
+// (D3D_BlockOnResource, MakeSpace, kick-offs, fences) stays native.
+constexpr uint32_t kLiftedD3d[] = {
+    0x177840,  // D3DDevice_CreateTexture2
+    0x1779C0,  // D3DDevice_CreateVertexBuffer2
+    0x175C90,  // D3DDevice_CreateSurface2
+    0x17B5D0,  // the pixel-container header builder they share
+    0x175C00,  // a texture's surface-level header
+    0x177900,  // D3DTexture_GetSurfaceLevel2
+    0x17B300,  // a level's size, pitch and offset
+    0x177950,  // D3DTexture_LockRect
+    0x175D40,  // D3DSurface_LockRect
+    0x17B530,  // Lock2DSurface
+    0x175D20,  // D3DSurface_GetDesc
+    0x1778F0,  // D3DTexture_GetLevelDesc (a jump to Get2DSurfaceDesc)
+    0x17B240,  // Get2DSurfaceDesc
+    0x17B0F0,  // a pixel container's dimensions
+    0x17AE00,  // format tables
+    0x175A40,  // D3DResource_GetType
+    0x175930,  // whether a surface is a level of a texture
+    0x1759B0,  // D3DResource_AddRef
+};
+
 // Entry points the runtime calls itself: XAPI's process start-up (heap,
 // drive letters), which XAPI's main-thread procedure (0x14FA75) runs first.
 constexpr uint32_t kStartupRoots[] = {0x151011};
@@ -209,7 +236,8 @@ std::vector<uint32_t> library_closure(const Xbe& xbe, Decoder& dec, const Cfg& c
     const auto& fns = cfg.functions();
     auto in_lib = [](uint32_t a) {
         return std::ranges::any_of(kLibraries, [&](const Range& r) { return a >= r.lo && a < r.hi; }) ||
-               std::ranges::find(kLiftedDsound, a) != std::end(kLiftedDsound);
+               std::ranges::find(kLiftedDsound, a) != std::end(kLiftedDsound) ||
+               std::ranges::find(kLiftedD3d, a) != std::end(kLiftedD3d);
     };
     std::set<uint32_t> seen;
     std::vector<uint32_t> work;
@@ -339,7 +367,7 @@ int cmd_lift(const Xbe& xbe, Decoder& dec, std::span<const std::string_view> arg
     write_file(dir / "failures.txt", failures);
 
     std::println("lifted {} of {} functions ({} call targets without a lifted body get stubs)", done.size(), total, stubs.size());
-    if (lib_n) std::println("  {} of them are C runtime, XAPI, XACT, XGraphics and DirectSound-helper functions that lifted code can reach", lib_n);
+    if (lib_n) std::println("  {} of them are C runtime, XAPI, XACT, XGraphics, DirectSound-helper and D3D-resource functions that lifted code can reach", lib_n);
     if (lib_failed) {
         std::println(stderr, "qilin: error: {} reachable library functions don't lift (see failures.txt)", lib_failed);
         return 3;

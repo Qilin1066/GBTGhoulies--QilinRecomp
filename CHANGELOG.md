@@ -11,6 +11,20 @@ Each release is a git tag (`vX.Y.Z`) with a matching GitHub release. The version
 
 ## [Unreleased]
 
+## [0.16.0] - 2026-11-18
+Guest RAM is mapped at the Xbox kernel's windows, D3D's resource code is lifted, and the game creates its textures. It stops at its first vertex shader.
+
+### Added
+- **Guest RAM at three addresses** (`recomp/runtime/host/guest_ram.cpp`): one shared-memory object mapped at 0, `0x80000000` and `0xF0000000` in a 4 GB host reservation, as the kernel maps physical memory. D3D's locks hand out addresses in those windows and the game writes vertices and pixels through them. Linux `memfd`, macOS `shm_open`, Windows placeholder views (`MapViewOfFile3`, Windows 10 1803+). The checked build accepts the two windows and still stops on anything else outside RAM. A host test checks the views share pages on every CI platform.
+- **D3D's resource code lifted** (18 functions, `kLiftedD3d`): creating textures, surfaces and vertex buffers, surface levels, descriptions, locks. Native: `D3D_BlockOnResource` (no GPU holds guest memory) and `D3DVertexBuffer_Lock2`. The device fields the lifted code reads are kept current in the original layout.
+- **Function discovery:** an immediate pointer right after a `ret n` of a function already found is an entry. Six callbacks found, including XAPI's thread start routine and XACT's DPC routine; game code unchanged; 594 difftest trials, 0 mismatches.
+- **`audio.md`: the surround plan** (5.1 and 7.1 output from the engine's six speaker bins, with the game told the console is set to surround).
+
+### Fixed
+- **Multisampling:** `0x11` is `D3DMULTISAMPLE_NONE` on the Xbox; the game asks for none, and the runtime no longer says it's unmodelled. Other types now stop the runtime.
+- **Frame buffers have guest memory** behind them, as the original's do, so a CPU lock (the disc-error screen) writes RAM and not address 0.
+
+
 ## [0.15.0] - 2026-11-18
 Audio starts. XACT, the audio engine, is lifted; DirectSound beneath it is replaced over a software mixer. XGraphics is lifted too. The game gets through its audio start-up and first asset loads, and stops at its first texture.
 

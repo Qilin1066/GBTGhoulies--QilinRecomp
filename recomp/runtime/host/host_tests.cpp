@@ -130,6 +130,23 @@ int main() {
     CHECK(v.decommit(r1 + 0x1000, 0x1000) && v.commit(r1 + 0x1000, 1, 4) && vram[r1 + 0x1000] == 0);  // recommitted: zero again
     CHECK(v.release(r1) && !v.release(r1) && v.reserve(0, 0x1000, 4, false) == 0x10000);
 
+    // Guest RAM: the same pages at 0, 0x80000000 and 0xF0000000, zero to start.
+    {
+        std::string error;
+        uint8_t* g = host::map_guest_ram(0x100000, &error);
+        CHECK(g != nullptr);
+        if (g) {
+            CHECK(g[0x1234] == 0 && g[rt::kRamCachedAlias + 0xFFFFF] == 0);
+            g[0x1234] = 0x5A;
+            CHECK(g[rt::kRamCachedAlias + 0x1234] == 0x5A && g[rt::kRamWriteCombinedAlias + 0x1234] == 0x5A);
+            g[rt::kRamWriteCombinedAlias + 0xFFFF0] = 0xA5;
+            CHECK(g[0xFFFF0] == 0xA5);
+        } else {
+            std::fprintf(stderr, "map_guest_ram: %s\n", error.c_str());
+        }
+        rt::g_ram_aliases = false;
+    }
+
     // The I/O manager, over a disc and a hard disk in a scratch directory.
     {
         namespace fs = std::filesystem;

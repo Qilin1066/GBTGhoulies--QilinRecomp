@@ -749,8 +749,15 @@ bool Cfg::imm_round() {
         // After padding/ret anywhere; in the aligned regions an aligned,
         // clean entry is evidence enough (the byte before may be a table).
         const bool after_pad = prev == 0xCC || prev == 0x90 || prev == 0xC3;
+        // Or right after a `ret n` (an instruction of a function already
+        // found, owned_ holding instruction starts) that ends there:
+        // the previous function's end (unaligned library code packs functions so).
+        const bool after_ret_n = v >= 3 && xbe_.mapped(v - 3) && xbe_.u8(v - 3) == 0xC2 && owned_.contains(v - 3) && [&] {
+                                     const Insn* r = dec_.decode(v - 3);
+                                     return r && r->len == 3 && r->mnem == ZYDIS_MNEMONIC_RET;
+                                 }();
         if (!entry_ok(v)) continue;
-        if (after_pad || (in_aligned_region(v) && (clean_seed(v) || displaces_weak_seed(v)))) ok.push_back(v);
+        if (after_pad || after_ret_n || (in_aligned_region(v) && (clean_seed(v) || displaces_weak_seed(v)))) ok.push_back(v);
     }
     bool added = false;
     if (!ok.empty()) {

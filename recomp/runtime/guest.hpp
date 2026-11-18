@@ -18,6 +18,7 @@
 //                         address is (a tail-called callee returns there)
 #pragma once
 
+#include <algorithm>
 #include <bit>
 #include <cmath>
 #include <cstddef>
@@ -134,9 +135,20 @@ struct Mem {
     uint64_t size;
 };
 
+// RAM's two kernel windows (the runtime maps them over the same pages,
+// host::map_guest_ram): contiguous memory as D3D hands it out, and the
+// write-combined view its surface locks return. g_ram_aliases says they're
+// mapped (not in tests that use a plain buffer).
+inline constexpr uint32_t kRamCachedAlias = 0x80000000u, kRamWriteCombinedAlias = 0xF0000000u;
+inline bool g_ram_aliases = false;
+
 inline void check(const Mem& m, uint32_t a, uint64_t n, uint32_t at) {
 #if defined(QILIN_CHECKED_MEMORY)
-    if (uint64_t(a) + n > m.size) trap(at, "guest memory access out of bounds");
+    auto inside = [&](uint32_t lo, uint64_t limit) { return a >= lo && uint64_t(a - lo) + n <= std::min<uint64_t>(m.size, limit); };
+    if (uint64_t(a) + n > m.size &&
+        !(g_ram_aliases && (inside(kRamCachedAlias, kMmioLo - kRamCachedAlias) ||
+                            inside(kRamWriteCombinedAlias, kMmioLo - kRamWriteCombinedAlias))))
+        trap(at, "guest memory access out of bounds");
 #else
     (void)m; (void)a; (void)n; (void)at;
 #endif

@@ -35,6 +35,14 @@ These are accepted and recorded, and `qilin_run` names each once when the game f
 
 Not modelled, and stopping the runtime if reached: submix buffers (`SetOutputBuffer`, `DSBCAPS_MIXIN`), effect-input buffers, buffers with their own memory, `DSBPLAY_SYNCHPLAYBACK`, stopping at a time stamp, streams (`CreateSoundStream`: streamed wave banks and music, still to come), and WMA decoding (WMADEC, for music).
 
+## Surround (planned)
+
+The Xbox mixed in 5.1 natively, and so does this engine: every voice already goes to the six speaker bins (front left, front right, centre, LFE, back left, back right). Only the last step folds them to stereo. The plan:
+
+1. **3D positioning**, which decides a positioned sound's speaker volumes: DirectSound's 3D calculator (`CDirectSound3DCalculator`, and the full-HRTF path the game turns on with `DirectSoundUseFullHRTF`) looks like pure computation, so it would be lifted, like `XAudioCalculatePitch`, giving the console's exact panning. To confirm when it's reached.
+2. **A speaker setting** (stereo, 5.1, and 7.1 with the back channels copied to the sides), reported to the game as the console's audio setting (`ExQueryNonVolatileSetting`'s audio flags, Stereo today), and used as the mixer's output layout: the six bins go to SDL3 as six channels, LFE included, and the OS carries them to HDMI, optical or a surround headset. The Xbox's real-time Dolby Digital encoder (the `DOLBY` section) existed because its optical output could only carry surround that way; it isn't needed.
+3. **The game does the rest**, as on a console set to surround: it and XACT send to the back speakers themselves.
+
 ## Output
 
 There's no audio device yet: the mix goes to `--dump-audio` or nowhere. The plan is SDL3 for the window, controller and audio output (the user's controller is an Xbox One pad over Bluetooth, which SDL3 supports with rumble on every target). Output then pulls from the mixer on SDL's audio thread, which is the roadmap's "audio mixing off the game thread".
