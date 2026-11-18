@@ -54,15 +54,7 @@ std::filesystem::path default_data_dir() {
     return base / "qilin" / "ghoulies";
 }
 
-// Calls a guest function (cdecl) with the given arguments.
-void call_guest(rt::Context& c, uint32_t fn, std::initializer_list<uint32_t> args) {
-    const uint32_t esp = c.esp;
-    for (auto it = std::rbegin(args); it != std::rend(args); ++it) push(c, *it);
-    push(c, host::kReturnSentinel);
-    rt::call(c, fn);
-    if (c.ret_to != host::kReturnSentinel) rt::trap(fn, "an initializer returned somewhere else");
-    c.esp = esp;
-}
+using host::call_guest;
 
 // One initializer table, [lo, hi): null and -1 entries are empty slots.
 void run_table(rt::Context& c, uint32_t lo, uint32_t hi) {
@@ -137,6 +129,7 @@ int main(int argc, char** argv) {
     const char* path = nullptr;
     const char* game_dir = nullptr;
     const char* data_dir = nullptr;
+    host::D3dConfig d3d;
     uint32_t ram_mb = host::kRetailRamMb;
     for (int k = 1; k < argc; ++k) {
         const std::string_view a = argv[k];
@@ -150,6 +143,12 @@ int main(int argc, char** argv) {
             game_dir = argv[++k];
         } else if (a == "--data-dir" && k + 1 < argc) {
             data_dir = argv[++k];
+        } else if (a == "--dump-frames" && k + 1 < argc) {
+            d3d.dump_dir = argv[++k];
+        } else if (a == "--frames" && k + 1 < argc) {
+            d3d.max_frames = std::strtoull(argv[++k], nullptr, 10);
+        } else if (a == "--gpu" && k + 1 < argc) {
+            d3d.gpu = int(std::strtol(argv[++k], nullptr, 10));
         } else if (!path) {
             path = argv[k];
         } else {
@@ -159,10 +158,13 @@ int main(int argc, char** argv) {
     }
     if (!path) {
         std::fprintf(stderr,
-                     "usage: qilin_run [--ram-mb N] [--game-dir DIR] [--data-dir DIR] <default.xbe>\n"
+                     "usage: qilin_run [--ram-mb N] [--game-dir DIR] [--data-dir DIR] [--dump-frames DIR] [--frames N] [--gpu N] <default.xbe>\n"
                      "  --ram-mb N       guest RAM in MB (%u by default, as the retail Xbox)\n"
                      "  --game-dir DIR   the extracted disc (default: default.xbe's directory)\n"
-                     "  --data-dir DIR   the hard disk: saves and caches (default: %s)\n",
+                     "  --data-dir DIR   the hard disk: saves and caches (default: %s)\n"
+                     "  --dump-frames DIR  write every frame shown there as a PNG\n"
+                     "  --frames N       stop after N frames\n"
+                     "  --gpu N          the Vulkan device to use, by index (default: the best one)\n",
                      host::kRetailRamMb, default_data_dir().string().c_str());
         return 2;
     }
@@ -234,6 +236,8 @@ int main(int argc, char** argv) {
     // Guest virtual memory: the RAM between the image and the main stack.
     host::vm().init(c.mem, (xbe.image_end() + 0xFFFFu) & ~0xFFFFu, mm.stack_bottom() & ~0xFFFFu);
     host::register_xapi();
+    host::register_xinput();
+    host::register_d3d(d3d);
     host::register_kernel();
     const std::filesystem::path disc = game_dir ? std::filesystem::path(game_dir) : std::filesystem::path(path).parent_path();
     const std::filesystem::path data = data_dir ? std::filesystem::path(data_dir) : default_data_dir();

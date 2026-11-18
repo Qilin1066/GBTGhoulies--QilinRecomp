@@ -194,14 +194,6 @@ void nt_query_virtual_memory(rt::Context& c) {
 // The Xbox hands out physical pages from the top of RAM, mapped at
 // 0x80000000 + physical; the runtime's address space is flat, so the guest
 // gets the RAM address itself, from the top down, within the limits.
-uint32_t contiguous(uint32_t bytes, uint32_t lowest, uint32_t highest, uint32_t align, uint32_t protect) {
-    VirtualMemory& v = vm();
-    const uint32_t a = std::max<uint32_t>(align, VirtualMemory::kPage);
-    const uint32_t at = v.reserve(0, bytes, protect, true, a & (a - 1) ? VirtualMemory::kPage : a, lowest & 0x7FFFFFFFu,
-                                  highest >= 0x80000000u ? 0x7FFFFFFFu : highest);
-    if (at) v.commit(at, v.region_size(at), protect);
-    return at;
-}
 void mm_allocate_contiguous_memory_ex(rt::Context& c) {
     ret(c, contiguous(arg(c, 0), arg(c, 1), arg(c, 2), arg(c, 3), arg(c, 4)), 20);
 }

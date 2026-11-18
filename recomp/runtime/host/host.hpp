@@ -10,6 +10,7 @@
 #pragma once
 
 #include <cstdint>
+#include <initializer_list>
 #include <filesystem>
 #include <map>
 #include <optional>
@@ -62,6 +63,9 @@ size_t hle_count();
 // stdcall: argument i (from 0) is at [esp + 4 + 4i]; returning pops the
 // return address into ret_to and the callee's arguments, as `ret n` does.
 uint32_t arg(const rt::Context& c, int i);
+// Calls a lifted guest function (cdecl) from the runtime, e.g. a callback the
+// game registered; esp is restored afterwards.
+void call_guest(rt::Context& c, uint32_t fn, std::initializer_list<uint32_t> args);
 void ret(rt::Context& c, uint32_t eax, uint32_t arg_bytes);
 
 // ---- Guest virtual memory (the kernel's Nt*VirtualMemory and Mm*
@@ -110,6 +114,17 @@ VirtualMemory& vm();
 
 // The replacements for Ghoulies' XAPI, registered by address (xapi.cpp).
 void register_xapi();
+// Direct3D (d3d.cpp), over the Vulkan renderer.
+struct D3dConfig {
+    std::string dump_dir;     // write each presented frame there as frame_NNNNN.png (--dump-frames)
+    uint64_t max_frames = 0;  // stop after this many frames, 0 for never (--frames)
+    int gpu = -1;             // Vulkan device index, -1 for the best one (--gpu)
+};
+void register_d3d(const D3dConfig& config);
+const D3dConfig& d3d_config();
+
+// XInput (xinput.cpp): the controller ports, with nothing plugged in so far.
+void register_xinput();
 // The kernel replacements, registered at kernel_addr(ordinal) (kernel.cpp).
 void register_kernel();
 // The I/O manager (kernel_io.cpp): \\Device\\CdRom0 is `disc` (read-only), the
@@ -130,6 +145,11 @@ struct DemandSection {
 };
 void set_demand_sections(std::vector<DemandSection> sections);
 
+// Contiguous memory (MmAllocateContiguousMemory and the runtime's own guest
+// objects): committed, top-down, below kPhysicalLimit; 0 if there's no room.
+inline constexpr uint32_t kPhysicalLimit = 0x10000000u;
+uint32_t contiguous(uint32_t bytes, uint32_t lowest, uint32_t highest, uint32_t align, uint32_t protect);
+
 // ---- Threads. fs points at the KPCR, whose PrcbData.CurrentThread (+0x28)
 // is the running thread's KTHREAD (kernel.cpp).
 inline constexpr uint32_t kKThreadSize = 0x200;
@@ -138,13 +158,23 @@ void init_main_thread(rt::Context& c, uint32_t kpcr, uint32_t kthread, uint32_t 
                       uint32_t tls_size);
 uint32_t current_thread(const rt::Context& c);
 
+// ---- XDK library symbols: the functions and variables of the Microsoft
+// libraries linked into the game (D3D8, DSOUND, XACT …), by address.
+struct XdkSymbol {
+    uint32_t address;
+    const char* library;
+    const char* name;
+};
+const XdkSymbol* xdk_symbol(uint32_t guest_addr);
+const XdkSymbol* xdk_symbol(std::string_view name);  // the first symbol of that name
+
 // ---- Reports.
 struct Region {
     uint32_t lo, hi;
     std::string name;
 };
 void set_regions(std::vector<Region> regions);  // the loader's map of code regions, for describe()
-std::string describe(uint32_t guest_addr);      // "kernel NtCreateFile (ordinal 190)", "XAPI code at ..."
+std::string describe(uint32_t guest_addr);      // "kernel NtCreateFile (ordinal 190)", "D3D8 D3DDevice_Clear (00176970)", "XAPI code at ..."
 void set_current(rt::Context* c);               // the context trap() reports registers from
 
 }  // namespace qilin::host

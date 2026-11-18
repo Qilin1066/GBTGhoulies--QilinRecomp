@@ -7,7 +7,7 @@ if(APPLE AND NOT CMAKE_OSX_DEPLOYMENT_TARGET)
     set(CMAKE_OSX_DEPLOYMENT_TARGET 10.15 CACHE STRING "oldest macOS the runtime runs on")
 endif()
 # The single source of the version number (see CHANGELOG.md for the scheme).
-project(GBTGQilincomp VERSION 0.13.0 LANGUAGES C CXX)
+project(GBTGQilincomp VERSION 0.14.0 LANGUAGES C CXX)
 
 # ---- Language: C++23 everywhere (recompiler, runtime, generated code) ----
 set(CMAKE_CXX_STANDARD 23)
@@ -116,11 +116,28 @@ add_executable(qilin_x87_consistency tools/check/x87/consistency.cpp)
 target_link_libraries(qilin_x87_consistency PRIVATE qilin_runtime qilin_warnings)
 add_test(NAME qilin_x87_consistency COMMAND qilin_x87_consistency 200000)
 
+# ---- Renderer: Vulkan 1.3, loaded at run time through volk (no SDK or link-time Vulkan needed) ----
+add_library(qilin_volk STATIC third_party/volk/volk.c)
+target_include_directories(qilin_volk PUBLIC third_party/volk third_party/vulkan-headers/include)
+target_link_libraries(qilin_volk PUBLIC ${CMAKE_DL_LIBS})
+add_library(qilin_gfx STATIC recomp/runtime/gfx/renderer.cpp recomp/runtime/gfx/png.cpp)
+target_include_directories(qilin_gfx PUBLIC recomp/runtime/gfx)
+target_link_libraries(qilin_gfx PUBLIC qilin_volk PRIVATE qilin_warnings)
+if(NOT MSVC)
+    # Vulkan structures are zero-initialised by naming only their sType: VkFoo f{VK_STRUCTURE_TYPE_FOO}.
+    target_compile_options(qilin_gfx PRIVATE -Wno-missing-field-initializers)
+endif()
+add_executable(qilin_gfx_tests recomp/runtime/gfx/gfx_tests.cpp)
+target_link_libraries(qilin_gfx_tests PRIVATE qilin_gfx qilin_warnings)
+add_test(NAME qilin_gfx_tests COMMAND qilin_gfx_tests)
+set_tests_properties(qilin_gfx_tests PROPERTIES SKIP_RETURN_CODE 77)
+
 # ---- Runtime host side: native replacements (HLE) for code that isn't lifted ----
 add_library(qilin_host STATIC recomp/runtime/host/host.cpp recomp/runtime/host/xapi.cpp recomp/runtime/host/kernel.cpp
-                              recomp/runtime/host/kernel_io.cpp)
+                              recomp/runtime/host/kernel_io.cpp recomp/runtime/host/xinput.cpp
+                              recomp/runtime/host/call_guest.cpp recomp/runtime/host/d3d.cpp)
 target_include_directories(qilin_host PUBLIC recomp/runtime/host)
-target_link_libraries(qilin_host PUBLIC qilin_runtime PRIVATE qilin_warnings)
+target_link_libraries(qilin_host PUBLIC qilin_runtime qilin_gfx PRIVATE qilin_warnings)
 add_executable(qilin_host_tests recomp/runtime/host/host_tests.cpp)
 target_link_libraries(qilin_host_tests PRIVATE qilin_host qilin_warnings)
 add_test(NAME qilin_host_tests COMMAND qilin_host_tests)

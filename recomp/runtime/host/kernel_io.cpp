@@ -882,12 +882,18 @@ void nt_query_symbolic_link_object(rt::Context& c) {
     ret(c, kSuccess, 12);
 }
 
+// NTSTATUS FscSetCacheSize(ULONG NumberOfCachePages) (37): the size of the
+// kernel's file cache, which the title takes out of its 64 MB. The host
+// caches files itself, so the pages aren't taken from guest RAM.
+void fsc_set_cache_size(rt::Context& c) { ret(c, kSuccess, 4); }
+
 struct IoFn {
     const char* name;
     uint16_t arg_bytes;
     HleFn fn;
 };
 constexpr IoFn kIo[] = {
+    {"FscSetCacheSize", 4, fsc_set_cache_size},
     {"NtCreateFile", 36, nt_create_file},
     {"NtOpenFile", 24, nt_open_file},
     {"NtClose", 4, nt_close},

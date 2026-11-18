@@ -1,6 +1,7 @@
 #include "host.hpp"
 #include "strf.hpp"
 
+#include <initializer_list>
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
@@ -49,6 +50,17 @@ void ret(rt::Context& c, uint32_t eax, uint32_t arg_bytes) {
     c.ret_to = rt::ld32(m, c.esp, 0);
     c.esp += 4u + arg_bytes;
     c.eax = eax;
+}
+
+// Physical addresses are 28 bits on the Xbox (D3D masks resource addresses to
+// them), so contiguous memory stays below 256 MB whatever the RAM size.
+uint32_t contiguous(uint32_t bytes, uint32_t lowest, uint32_t highest, uint32_t align, uint32_t protect) {
+    VirtualMemory& v = vm();
+    const uint32_t a = std::max<uint32_t>(align, VirtualMemory::kPage);
+    const uint32_t at = v.reserve(0, bytes, protect, true, a & (a - 1) ? VirtualMemory::kPage : a, lowest & 0x0FFFFFFFu,
+                                  std::min<uint32_t>(highest, kPhysicalLimit - 1));
+    if (at) v.commit(at, v.region_size(at), protect);
+    return at;
 }
 
 void VirtualMemory::init(uint8_t* ram, uint32_t lo, uint32_t hi) {
@@ -184,11 +196,36 @@ void set_memory_map(MemoryMap m) { g_map = m; }
 void set_regions(std::vector<Region> r) { regions() = std::move(r); }
 void set_current(rt::Context* c) { g_current = c; }
 
+namespace {
+// XDK library symbols found by signature (tools/gen/xdk_symbols.py), then the
+// ones identified by reading them, which the signature database lacks.
+constexpr XdkSymbol kXdkSymbols[] = {
+#include "xdk_symbols.inc"
+    {0x00173F30, "D3D8", "D3DDevice_BlockUntilIdle"},
+    {0x00175C90, "D3D8", "D3DDevice_CreateSurface2"},
+    {0x001778F0, "D3D8", "D3DTexture_GetLevelDesc"},
+    {0x00177980, "D3D8", "D3D_AllocContiguousMemory"},
+    {0x0017F890, "D3D8", "Direct3D_SetPushBufferSize"},
+};
+}  // namespace
+
+const XdkSymbol* xdk_symbol(uint32_t a) {
+    for (const XdkSymbol& s : kXdkSymbols)
+        if (s.address == a) return &s;
+    return nullptr;
+}
+const XdkSymbol* xdk_symbol(std::string_view name) {
+    for (const XdkSymbol& s : kXdkSymbols)
+        if (name == s.name) return &s;
+    return nullptr;
+}
+
 std::string describe(uint32_t a) {
     if (a >= 0x80000000u && a < 0x80001000u) {
         const KernelExport* e = kernel_export(a & 0xFFFu);
         return e ? strf("kernel %s (ordinal %u)", e->name, unsigned(e->ordinal)) : strf("kernel ordinal %u", a & 0xFFFu);
     }
+    if (const XdkSymbol* s = xdk_symbol(a)) return strf("%s %s (%08X)", s->library, s->name, a);
     for (const Region& r : regions())
         if (a >= r.lo && a < r.hi) return strf("%s code at %08X", r.name.c_str(), a);
     return strf("%08X", a);

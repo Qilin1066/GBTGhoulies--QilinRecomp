@@ -11,6 +11,24 @@ Each release is a git tag (`vX.Y.Z`) with a matching GitHub release. The version
 
 ## [Unreleased]
 
+## [0.14.0] - 2026-11-18
+The renderer, on Vulkan 1.3, and the first Direct3D replacements over it. The game creates its graphics device on Vulkan and runs as far as its audio engine.
+
+### Added
+- **The renderer** (`recomp/runtime/gfx/`): Vulkan 1.3 core with dynamic rendering and synchronization2, loaded at run time through volk, so building needs no Vulkan SDK. Picks the best GPU (`--gpu N` to choose), uses `VK_KHR_portability_subset` on MoltenVK, D24S8 depth (D32S8 where there's none). Frame buffers are its own images: clears (whole-buffer clears become the render pass's load operation, for tile-based GPUs), flips, read-back, PNG output. `QILIN_VK_VALIDATION=1` turns on the validation layer.
+- **Direct3D** (`recomp/runtime/host/d3d.cpp`): `Direct3D_SetPushBufferSize`, `Direct3D_CreateDevice`, `GetBackBuffer2`, `GetDepthStencilSurface2`, `GetRenderTarget2`, `D3DResource_AddRef`/`Release`/`Register`, `SetVerticalBlankCallback`, `SetGammaRamp`, `BlockUntilIdle`, `Clear`, `Swap`. Resources are D3D headers in guest memory, as the original's; D3D's state tables stay in guest memory, where the game's inline state setters write them. `Swap` waits for the vblank the presentation interval asks for, at the NTSC rate, and runs the game's vblank callback for each vblank, which is what the game's time step comes from. Each replacement's argument size matches the original's.
+- **XDK library names:** `tools/gen/xdk_symbols.py` runs XbSymbolDatabase (MIT) on the XBE and writes `recomp/runtime/host/xdk_symbols.inc`: 390 functions and variables of D3D8, DSOUND, XACT, XAPI and XGraphics, plus five identified by reading them. Reports name them.
+- **XInput** with nothing plugged in (`XInitDevices`, `XGetDevices`, `XGetDeviceChanges`), and the kernel's `FscSetCacheSize`.
+- **`qilin_run --dump-frames DIR`, `--frames N`, `--gpu N`.**
+- **`host::call_guest`:** the runtime calls a lifted guest function, such as a callback the game registered.
+- **Third-party:** the Vulkan C headers (Apache-2.0 or MIT) and volk (MIT), vendored at `vulkan-sdk-1.3.296.0`.
+- **Tests:** `qilin_gfx_tests`: clears, rectangles, flips and read-back on any Vulkan device, with validation; skipped without one. Linux CI installs Mesa's software Vulkan driver, so it runs on x64 and ARM64.
+- **`docs/graphics.md`.**
+
+### Changed
+- **Contiguous memory stays below 256 MB** whatever the RAM size, as the Xbox's 28-bit physical addresses do: D3D masks resource addresses to them.
+
+
 ## [0.13.0] - 2026-11-18
 The file system. XAPI's and the C runtime's start-up now complete, and the game's `main` runs until its first Direct3D call.
 

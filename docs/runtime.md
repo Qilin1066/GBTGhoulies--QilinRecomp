@@ -1,6 +1,6 @@
 # Runtime: status (roadmap step 3)
 
-Last updated 2026-11-18 (v0.13.0: the file system; XAPI's and the C runtime's start-up complete and the game's `main` runs, as far as its first Direct3D call).
+Last updated 2026-11-18 (v0.14.0: the game's `main` creates its graphics device on Vulkan and runs as far as the audio engine; the renderer and Direct3D are in `graphics.md`).
 
 The runtime is everything the lifted game code needs that isn't lifted: guest memory, the Xbox kernel, D3D, DirectSound/XACT and the other XDK libraries. All of it is replaced natively (HLE); none of it is emulated.
 
@@ -13,10 +13,10 @@ Two libraries are lifted with the game instead: the C runtime (since v0.11.0), s
 ```sh
 qilin lift default.xbe --out gen
 cmake -S . -B build -DQILIN_GEN_DIR=$PWD/gen && cmake --build build
-build/qilin_run [--game-dir DIR] [--data-dir DIR] [--ram-mb N] path/to/default.xbe
+build/qilin_run [--game-dir DIR] [--data-dir DIR] [--ram-mb N] [--dump-frames DIR] [--frames N] [--gpu N] path/to/default.xbe
 ```
 
-`--game-dir` is the extracted disc (by default, `default.xbe`'s folder). `--data-dir` holds the hard disk: saves and caches, by default `%LOCALAPPDATA%\qilin\ghoulies` on Windows, `~/Library/Application Support/qilin/ghoulies` on macOS and `$XDG_DATA_HOME/qilin/ghoulies` (`~/.local/share/…`) elsewhere. Set `QILIN_TRACE_HLE=1` to log every replacement call (caller, arguments, result) and every object name the file system resolves, with where it went.
+`--game-dir` is the extracted disc (by default, `default.xbe`'s folder). `--data-dir` holds the hard disk: saves and caches, by default `%LOCALAPPDATA%\qilin\ghoulies` on Windows, `~/Library/Application Support/qilin/ghoulies` on macOS and `$XDG_DATA_HOME/qilin/ghoulies` (`~/.local/share/…`) elsewhere. `--dump-frames DIR` writes every frame shown as a PNG, `--frames N` stops after N frames, and `--gpu N` picks the Vulkan device (see `graphics.md`). Set `QILIN_TRACE_HLE=1` to log every replacement call (caller, arguments, result) and every object name the file system resolves, with where it went.
 
 **Start-up.** The XBE entry point (`0x14FAE9`) is XAPI start-up code. It sizes the static TLS block, then creates the main thread, whose procedure (`0x14FA75`) initialises XAPI, runs the initializer tables, then calls the game's `main(0, 0, 0)` at `0x32390`. The runtime sets up memory, the main thread's stack, KPCR and KTHREAD, then follows the same steps:
 
@@ -44,7 +44,7 @@ An entry runs if it's lifted (`rt::is_lifted`); otherwise `qilin_run` names it a
 | R − 0x1F000 | The main thread's KTHREAD |
 | R − 0x10000 | Objects behind the kernel's data exports, 256 bytes each |
 
-**Virtual memory** works as on the Xbox: 4 KB pages, reservations on 64 KB boundaries (lowest first, or highest with `MEM_TOP_DOWN`), pages committed inside a reservation and zeroed when committed, `NtQueryVirtualMemory` reporting reserved, committed and free runs. Contiguous allocations (`MmAllocateContiguousMemory[Ex]`) come from the top, within the caller's address limits. On the Xbox they're mapped at `0x80000000` + physical; here the guest gets the RAM address, since the address space is flat.
+**Virtual memory** works as on the Xbox: 4 KB pages, reservations on 64 KB boundaries (lowest first, or highest with `MEM_TOP_DOWN`), pages committed inside a reservation and zeroed when committed, `NtQueryVirtualMemory` reporting reserved, committed and free runs. Contiguous allocations (`MmAllocateContiguousMemory[Ex]`, and the runtime's own D3D resource headers) come from the top, within the caller's address limits and below 256 MB whatever the RAM size: physical addresses are 28 bits on the Xbox, and D3D masks resource addresses to them. On the Xbox they're mapped at `0x80000000` + physical; here the guest gets the RAM address, since the address space is flat.
 
 `qilin_run` is built with checked memory for bring-up, so an access outside RAM stops with the guest address of the instruction.
 
@@ -52,7 +52,7 @@ An entry runs if it's lifted (`rt::is_lifted`); otherwise `qilin_run` names it a
 
 **XBE sections.** Sections without the preload flag (`$$XTIMAGE`, `$$XSIMAGE`, `.XTLID`) start as zero, as the kernel's loader leaves them, and `XeLoadSection` reads them in. Their reference counts and the shared-page counts live in the section headers, as the kernel keeps them.
 
-**Replacements** (`recomp/runtime/host/host.hpp`). Every call from lifted code to code that isn't lifted reaches `rt::call_unlifted`: a direct call to a stub, an indirect call the function table doesn't know, or a kernel import. It runs the replacement registered for that guest address. There's no fallback: anything unregistered stops the game and names the target and its caller, for example:
+**Replacements** (`recomp/runtime/host/host.hpp`). Every call from lifted code to code that isn't lifted reaches `rt::call_unlifted`: a direct call to a stub, an indirect call the function table doesn't know, or a kernel import. It runs the replacement registered for that guest address. There's no fallback: anything unregistered stops the game and names the target and its caller (XDK library functions by name, from `xdk_symbols.inc`), for example:
 
 ```
 qilin: stopped at 80000123: no replacement for kernel RtlInitializeCriticalSection (ordinal 291), called from 0016D9F2
@@ -109,10 +109,15 @@ Names are matched case-insensitively, as on FATX and the disc's XDVDFS (an exact
 | `NtDeviceIoControlFile` | Disk geometry and partition information from the retail 8 GB disk's table. On the disc, SCSI pass-through fails as on an empty drive: XAPI's DVD authentication check at start-up ignores the result |
 | `NtFsControlFile` | Dismount, which XAPI's formatter sends |
 | `IoCreateSymbolicLink`, `IoDeleteSymbolicLink`, `NtOpenSymbolicLinkObject`, `NtQuerySymbolicLinkObject` | The link table |
+| `FscSetCacheSize` | Accepted: the host caches files, so the kernel's file cache takes no guest RAM |
 
 **Cache partitions.** XAPI gives each title one of the three cache partitions, recorded in the configuration area, and formats it the first time: it writes a FATX volume header, FAT and root directory as raw sectors. The runtime takes the header as the format: it empties the partition's folder and keeps the header (`partitionN.fatx`), whose cluster size the volume reports from then on. This title asks for 64 KB clusters on its Z: drive (XBE init flags), and XAPI refuses to mount a volume whose cluster size differs. Raw writes to a partition that aren't part of a format, and raw reads of one, stop the runtime.
 
-**Where it stops now:** XAPI and the C runtime start up completely, and the game's `main` runs until its first Direct3D call (`0x17F890`, from `0x1549D4`). Before that, start-up writes the title's save metadata and images to `partition1/UDATA/4d530053/`, gets cache partition 5 formatted with 64 KB clusters and mounted as Z:, and checks that `D:\loctext\english` exists. In v0.12.0 it stopped at the first `NtOpenFile`; in v0.11.0 at the CRT's first critical section.
+**XInput** (`recomp/runtime/host/xinput.cpp`): the controller ports with nothing plugged in, until there's an input backend. `XInitDevices`, `XGetDevices` (no devices) and `XGetDeviceChanges` (none arrive); opening a port stops the runtime.
+
+**Direct3D** (`recomp/runtime/host/d3d.cpp`) over the Vulkan renderer: the device, its frame buffers, clears and swaps at the display's vblank. See `graphics.md`.
+
+**Where it stops now:** The game's `main` creates its graphics device on Vulkan (640×480, interval 2: 30 frames per second), registers its vblank callback, sets the gamma ramp, registers its first resources from `bundles/common.bnl`, checks the controller ports, and stops when it starts the audio engine: XACT, at `0x1BBC66` from `0x15B76C`. Earlier, start-up writes the title's save metadata and images to `partition1/UDATA/4d530053/`, gets cache partition 5 formatted with 64 KB clusters and mounted as Z:, and checks that `D:\loctext\english` exists. In v0.13.0 it stopped at the first Direct3D call; in v0.12.0 at the first `NtOpenFile`; in v0.11.0 at the CRT's first critical section.
 
 ## Tests
 
@@ -120,8 +125,8 @@ Names are matched case-insensitively, as on FATX and the disc's XDVDFS (an exact
 
 ## Next
 
-1. **D3D:** the game's `main` calls Direct3D first. The D3D entry points it uses need replacements; the first ones create the device and set up the frame, before any drawing. They're the start of D3D on Vulkan (roadmap step 4).
-2. **The scheduler:** guest threads (`PsCreateSystemThreadEx`), waits, events, timers and DPCs. Until then a second thread stops the runtime.
-3. **Keep running `qilin_run`** and implement each function it stops at: the rest of the 81 kernel imports, and the 167 library entry points (D3D, XACT, DSOUND …).
-4. **Hot C runtime functions** (`memcpy`, `strlen` …) may get native versions once the runtime shows which are hot, each checked against the lifted original.
-5. **Names:** XbSymbolDatabase can name the XDK library functions by signature, which would speed up identifying them.
+1. **Audio:** the game starts XACT (Microsoft's audio engine, over DirectSound) before its first frame: 27 XACT entry points and one DirectSound one. The roadmap has a native mixer on SDL3 or miniaudio, with WMA through FFmpeg.
+2. **A window and input**, then drawing (`graphics.md`).
+3. **The scheduler:** guest threads (`PsCreateSystemThreadEx`), waits, events, timers and DPCs. Until then a second thread stops the runtime.
+4. **Keep running `qilin_run`** and implement each function it stops at: the rest of the 81 kernel imports and the library entry points.
+5. **Hot C runtime functions** (`memcpy`, `strlen` …) may get native versions once the runtime shows which are hot, each checked against the lifted original.
