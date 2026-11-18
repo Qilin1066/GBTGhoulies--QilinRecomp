@@ -21,6 +21,20 @@
 #include <cstdint>
 #include <initializer_list>
 
+// Every operation here must round exactly as written: no contraction into
+// fused multiply-add (which Clang and GCC do by default on FMA hardware such
+// as ARM64), no fast-math. Clang and MSVC take pragmas; GCC needs
+// -ffp-contract=off on the command line (the qilin_runtime CMake target adds it).
+#if defined(__FAST_MATH__)
+#error "x87_math.hpp must not be built with -ffast-math: results would differ between hosts"
+#endif
+#if defined(__clang__)
+#pragma STDC FP_CONTRACT OFF
+#elif defined(_MSC_VER)
+#pragma fp_contract(off)
+#pragma float_control(precise, on)
+#endif
+
 // Counts slow-path fallbacks in tools/check/x87/consistency.cpp; nothing otherwise.
 #ifndef QILIN_XM_FALLBACK
 #define QILIN_XM_FALLBACK(fn)
