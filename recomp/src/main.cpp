@@ -111,11 +111,28 @@ constexpr uint32_t kLiftedD3d[] = {
     0x175350,  // D3DDevice_DeletePixelShader
     0x177980,  // D3D_AllocContiguousMemory: the game's allocator with alignment flags
     0x173EC0,  // D3DDevice_GetTransform: reads the device's matrices
+    0x179FE0,  // the device's default state: identity transforms, render and texture-stage state defaults
+    0x1731A0,  // a vertex shader declaration's constant loads (size, or written out)
+    0x173000,  // a vertex shader declaration into the shader object's attribute slots
+    0x172F90,  // a vertex program into the shader object's push-buffer form
+    0x172EE0,  // LoadVertexShader's shadow copies (program at device +0x1098, constants at 0x180D50)
+    0x175970,  // a surface's internal reference (and its texture's)
+    0x175B90,  // dropping one (freeing the resource at none)
+    0x17B080,  // a depth buffer's largest depth value, into the device (+0x944)
+    0x174080,  // a depth buffer's format bits (+0x948)
+    0x17AF60,  // the render target's anti-aliasing mode (+0x19FC)
+    0x171F40,  // D3D_CommonSetMultiSampleModeAndScale: the device's multisample scale and viewport
+    0x1782C0,  // float to int, truncating (cvttss2si)
+    0x173900,  // the fixed-function viewport program's GPU methods (into the push-buffer sink)
+    0x172DA0,  // the fixed-function vertex shader object (0x184478) for an FVF
+    0x173610,  // D3DDevice_SetStreamSource: the stream table (0x1842A0), references and dirty bits; no GPU commands
 };
 
 // Entry points the runtime calls itself: XAPI's process start-up (heap,
-// drive letters), which XAPI's main-thread procedure (0x14FA75) runs first.
-constexpr uint32_t kStartupRoots[] = {0x151011};
+// drive letters), which XAPI's main-thread procedure (0x14FA75) runs first,
+// and the D3D internals the native D3D calls (the device's default state,
+// the fixed-function shader object for an FVF).
+constexpr uint32_t kStartupRoots[] = {0x151011, 0x179FE0, 0x172DA0, 0x1731A0, 0x173000, 0x172F90, 0x172EE0, 0x175970, 0x175B90, 0x17B080, 0x174080, 0x17AF60, 0x171F40};
 
 // Library functions the runtime replaces natively instead: never lifted, and
 // the closure doesn't follow them. Each needs a registered replacement.

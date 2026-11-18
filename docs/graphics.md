@@ -1,6 +1,6 @@
 # Graphics: Direct3D on Vulkan (roadmap step 4)
 
-Last updated 2026-11-18 (v0.17.0: vertex programs decoded, pixel-shader objects lifted; v0.16.0: D3D's resource code lifted; guest RAM's kernel windows; v0.14.0: the renderer and the Direct3D device).
+Last updated 2026-11-18 (v0.20.0: state setters, draws recorded, push-buffer sink; v0.17.0: vertex programs decoded, pixel-shader objects lifted; v0.16.0: D3D's resource code lifted; guest RAM's kernel windows; v0.14.0: the renderer and the Direct3D device).
 
 The game draws through the Xbox's Direct3D 8 library (D3D8, XDK 5659), which is linked into the XBE. Its calls stay in the recompiled code; what answers them is the runtime. Every D3D function the game calls is replaced natively (`recomp/runtime/host/d3d.cpp`) over a Vulkan 1.3 renderer (`recomp/runtime/gfx/`). There is no DirectX anywhere, and the Xbox's GPU (the NV2A) isn't emulated: the replacements see what the game asks for (clear this, draw that mesh with this texture) and do it with Vulkan.
 
@@ -28,7 +28,7 @@ The game has 24 vertex shaders, written in Xbox shader assembly (`vs.1.0` and `x
 
 **Checked against the sources:** each of the game's 24 programs disassembles to its source text, after what the assembler itself does: it renames temporaries, writes `sub` as `add` with a negated operand, narrows write masks, expands `m4x4` into four `dp4`, pairs ILU operations with MAC ones, and appends the screen-space transform (`mul oPos.xyz, oPos, c-38` with `rcc r1.x, oPos.w`, then `mad oPos.xyz, oPos, r1.x, c-37`: D3D's reserved viewport constants). `qilin_gfx_tests` checks one of them, as the assembler produced it, against its disassembly. `QILIN_DUMP_VSH=1` prints every program and its declaration as it's created (`=2` adds the raw words).
 
-`CreateVertexShader` keeps each program with its declaration (`D3DVSD` stream and register tokens) and returns the original's kind of handle: the object's address with bit 0 set, which tells programmable shaders from fixed-function vertex formats. Next, the programs become SPIR-V.
+`CreateVertexShader` builds the shader object as the original does (v0.20.0), with D3D's own helpers, lifted, over the game's allocator: a reference count, flags (`0x10` a program), the instruction count, 16 attribute slots `{stream, offset, format}` filled from the declaration (format `2` is disabled), then the program and the declaration's constant loads in push-buffer form at `+0x114`. The handle is the object's address with bit 0 set, which tells programmable shaders from fixed-function vertex formats (an FVF becomes D3D's fixed-function object at `0x184478`). `SetVertexShader` with a program loads it at slot 0 and selects it, as the original's `LoadVertexShader` and `SelectVertexShader`: the runtime keeps the GPU's 136-slot program memory and 192 constants (`vs_program`, `vs_constants`), filled from the object's push-buffer form and by the `SetVertexShaderConstant*` calls. The renderer decodes the program at the selected slot when it draws. Next, the programs become SPIR-V.
 
 **Pixel shaders** are the NV2A's register combiners: `CreatePixelShader` and `DeletePixelShader` are lifted (they only allocate, copy the game's `D3DPIXELSHADERDEF` and free), so the renderer reads the combiner settings from the original object.
 
@@ -59,11 +59,25 @@ The game has 24 vertex shaders, written in Xbox shader assembly (`vs.1.0` and `x
 
 **Vblanks and the game's clock.** The game's vblank callback (`0xFC3B0`) counts vblanks, and on the one flagged `D3DVBLANK_SWAPDONE` records how many passed since the last frame: that count is the game's time step (`frame-timing.md`). So `Swap` does what the hardware did: it waits for the vblank the interval asks for, at the NTSC rate of 60/1.001 Hz, then calls the callback once for every vblank that went by, the last one flagged. A frame that takes too long gets a bigger time step, as on the console. Higher refresh rates come later (roadmap step 8).
 
-**Not modelled yet:** CPU writes to a frame buffer reaching the screen (the disc-error screen draws into the front buffer this way), the device's own `Release`, drawing, textures, shaders, render targets other than the back buffer, the 17 functions that write GPU commands directly (`BeginPush`), a window.
+**State setters and draws (v0.20.0).** Each setter stores what the original stores where the original keeps it (D3D's tables, the device's fields, dirty bits) and nothing else; the GPU methods the original would push are left to the renderer, which reads the state when it draws. Where the original derives guest-visible state with internal helpers (the default state, shader objects, a render target's depth range and multisample scale), the runtime calls those helpers, lifted. They write GPU methods as they go, into the device's push buffer: here a **sink** that nothing reads, which `MakeSpace` and `BeginStateBig` rewind.
+
+| Function | Replacement |
+|---|---|
+| `SetTexture`, `SetStreamSource` (lifted), `SetVertexShaderInput` | The device's internal references, the slots, the dirty bits; a texture's format key |
+| `SetPixelShader`, `SetPixelShaderConstant` | The handle and the definition's flags in the device, its registers in `D3D__RenderState`; constants packed to colours (clamped, ×255, rounded to nearest even) into the combiner constants the shader maps to each register |
+| `SetVertexShader`, `LoadVertexShader`, `SelectVertexShader`, `SetVertexShaderConstant*` | Above (Vertex shaders) |
+| `SetRenderStateNotInline`, `SetTextureStageStateNotInline`, `SetTextureState_*`, `SetScreenSpaceOffset` | By state range, as the original: table slot and dirty bits, or the state's own setter |
+| `SetRenderTarget` | References, depth range and format bits, anti-aliasing mode, the multisample scale and the viewport reset to the whole target |
+| `DrawVertices`, `DrawIndexedVertices`, `BeginPush`/`EndPush` | Consume the dirty state as the original's flush does, and record the draw with a copy of the vertices it reads (attribute slots of the shader object, D3D's stream table at `0x1842A0`). The game's own methods are decoded: `SET_BEGIN_END` and `INLINE_ARRAY` are all it writes; any other stops the runtime |
+| `InsertFence`, `BlockOnFence` | The device's fence counter steps by 2, as the original; every fence has passed, since a draw copies what it reads |
+
+The draws are recorded but not drawn yet: the first frames print how many (`frame 0: 22 draws`).
+
+**Not modelled yet:** drawing, textures, CPU writes to a frame buffer reaching the screen (the disc-error screen draws into the front buffer this way), the device's own `Release`, freeing resources, draws from `SetVertexShaderInput` streams, `Swap` keeping a render target that isn't the back buffer, a window.
 
 ## Next
 
-1. **State** (decided in v0.19.0: API level, as designed). D3D's setters are rewritten natively, not lifted: each stores what the game or lifted code reads back where the original keeps it (render-state table slots, the device's transforms and viewport, dirty bits), and the renderer computes the GPU state D3D derives (fog, depth, the projection-viewport composite) at draw time. Anything derived the game can read back but that isn't reproduced yet stops the runtime (`GetProjectionViewportMatrix`). Done: `SetTransform`, `SetViewport` (clipped to the render target as the original), `SetRenderState_Simple` and the 30 `SetRenderState_X` functions (a table of slots and dirty bits, from reading each original). The game stops at `SetTexture` next.
+1. **State** (decided in v0.19.0: API level, as designed). D3D's setters are rewritten natively, not lifted: each stores what the game or lifted code reads back where the original keeps it (render-state table slots, the device's transforms and viewport, dirty bits), and the renderer computes the GPU state D3D derives (fog, depth, the projection-viewport composite) at draw time. Anything derived the game can read back but that isn't reproduced yet stops the runtime (`GetProjectionViewportMatrix`). Done through v0.20.0: the setters above, as the game reaches them.
 2. **Shaders to SPIR-V:** the decoded vertex programs, the fixed-function pipeline, and the pixel combiners.
 3. **A window** on SDL3, so frames are shown and not only saved.
 4. **Drawing:** vertex formats and buffers, the fixed-function pipeline and vertex shaders, the pixel-shader combiners (to SPIR-V), textures (swizzled and DXT formats), render states from the guest tables, render targets. Then the `BeginPush` immediate-mode draws.

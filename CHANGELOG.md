@@ -11,6 +11,22 @@ Each release is a git tag (`vX.Y.Z`) with a matching GitHub release. The version
 
 ## [Unreleased]
 
+## [0.20.0] - 2026-11-18
+The game gets through its first frames: shaders, streams, textures, constants, render targets and draws are in, and each frame's draws are recorded for the renderer (not drawn yet). The first frames are the attract sequence's loading; it stops next at a DirectSound submix buffer.
+
+### Added
+- **Shader and stream state, as the original:** `SetTexture`, `SetStreamSource` (lifted), `SetVertexShaderInput`, `SetPixelShader` (the definition's registers into `D3D__RenderState`), `SetPixelShaderConstant` (packed to colours and routed to the combiner constants the shader maps), `SetVertexShader`, `LoadVertexShader` and `SelectVertexShader` (the GPU's 136-slot program memory kept by the runtime), the four `SetVertexShaderConstant*`, `SetRenderStateNotInline`, `SetTextureStageStateNotInline` and the four `SetTextureState_*`, `SetScreenSpaceOffset`.
+- **The device's default state:** `CreateDevice` now does what the original's initialisation does to guest-visible state: the fixed-function shader for `XYZRHW` then `XYZ`, identity transforms, the render- and texture-stage-state defaults (D3D's own routine at `0x179FE0`, lifted).
+- **Vertex shader objects as the original builds them** (attribute slots from the declaration, the program and constant loads in push-buffer form), with D3D's own helpers, lifted, from the game's allocator. `SetVertexShader` and the draws read them.
+- **`SetRenderTarget`:** internal references, the depth buffer's range and format bits, the anti-aliasing mode and the multisample scale and viewport, with D3D's helpers.
+- **Draws:** `DrawVertices`, `DrawIndexedVertices`, and `BeginPush`/`EndPush` (the game's own GPU methods: `SET_BEGIN_END` and `INLINE_ARRAY`, decoded; any other method stops the runtime). Each draw consumes the dirty state as the original's state flush does and is recorded with a copy of the vertices it reads.
+- **Fences:** `InsertFence` (the device's counter, as the original) and `BlockOnFence`.
+- **A push-buffer sink:** D3D's internals that run lifted write their GPU methods into it; `MakeSpace` and `BeginStateBig` rewind it. Nothing reads it: the renderer works from D3D's state.
+- Lifted helpers difftested: 0 mismatches (`0x17B080`'s jump table is unbounded on purpose; random formats outside the depth formats fault).
+
+### Fixed
+- **`CreateVertexShader` made a 16-byte placeholder object;** `SetVertexShader` and the draws read the attribute slots and flags of a real one.
+
 ## [0.19.0] - 2026-11-18
 D3D state stays at API level (decided): the setters are rewritten natively. The game sets its viewport and render states and stops at its first `SetTexture`.
 
