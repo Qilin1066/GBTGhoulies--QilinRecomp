@@ -31,10 +31,10 @@
 ## Hardware scope
 **Supported: 64-bit hosts with a Vulkan 1.3 driver.** In practice that means:
 - **Windows and Linux** on x86-64 or ARM64 with a Vulkan-capable GPU and driver;
-- **macOS on Intel and Apple Silicon Macs**, through MoltenVK (Vulkan on top of Metal): any Mac with a Metal GPU running macOS 12 or later, the oldest release current MoltenVK supports (v1.4.2 raised its floor from 10.15 to 12). Builds target macOS 12 and CI builds both architectures;
+- **macOS on Intel and Apple Silicon Macs**, through MoltenVK (Vulkan on top of Metal): any 64-bit Mac with a Metal GPU running macOS 10.15 (Catalina) or later: officially the 2012 and later Intel models, and every Apple Silicon Mac. MoltenVK has Vulkan 1.3 from v1.3.0, and its releases up to v1.4.1 still run on 10.15 (v1.4.2 raised the floor to 12), so Macs on 10.15–11 get one of those. Builds target macOS 10.15, and CI builds both architectures. The C++ code avoids library features newer than that (floating-point `std::format` needs macOS 13.3's libc++);
 - **ARM boards** with Vulkan 1.3 drivers, e.g. Raspberry Pi 4 and newer (Mesa v3dv, Mesa 24.3 or later).
 
-**Out of scope:** anything without Vulkan 1.3 (or, on Apple, a Vulkan translation layer that provides it), and 32-bit hosts. That rules out the Raspberry Pi 1–3 and Zero (OpenGL ES 2 only), the first Intel Macs (32-bit Core Duo, 2006, and no Metal), and Macs without a Metal GPU or that can't run macOS 12. Because of this there is one renderer (Vulkan) and one memory model: the Xbox's 4 GB address space mapped flat into a 64-bit host's address space, with no windowing cost on memory accesses.
+**Out of scope:** anything without Vulkan 1.3 (or, on Apple, a Vulkan translation layer that provides it), and 32-bit hosts. That rules out the Raspberry Pi 1–3 and Zero (OpenGL ES 2 only), the first Intel Macs (32-bit Core Duo, 2006), and Macs without a Metal GPU or that can't run macOS 10.15. Because of this there is one renderer (Vulkan) and one memory model: the Xbox's 4 GB address space mapped flat into a 64-bit host's address space, with no windowing cost on memory accesses.
 
 ### Vulkan baseline: 1.3
 The renderer targets **Vulkan 1.3** as its minimum API version, chosen for how widely it's supported:

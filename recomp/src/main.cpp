@@ -63,10 +63,27 @@ constexpr Replaced kReplaced[] = {
     {0x162840, "Bink's MMX probe (pushfd, cpuid); its one caller is in BINK (0x1AE916), and only BINK reads its result"},
 };
 
-// The C runtime (LIBCMT) isn't lifted as a region: only the functions lifted
-// code can reach are (closure_of). Its hand-written assembly breaks the usual
-// function contract in a few reviewed places, listed here.
+// The C runtime (LIBCMT) and XAPI aren't lifted as regions: only the
+// functions lifted code can reach are (library_closure), and the runtime
+// implements the kernel beneath them. The CRT's hand-written assembly breaks
+// the usual function contract in a few reviewed places (crt_conventions).
 constexpr Range kCrt{0x165C00, 0x1707B0};
+constexpr Range kXapi{0x14A840, 0x152780};
+constexpr Range kLibraries[] = {kXapi, kCrt};
+
+// Entry points the runtime calls itself: XAPI's process start-up (heap,
+// drive letters), which XAPI's main-thread procedure (0x14FA75) runs first.
+constexpr uint32_t kStartupRoots[] = {0x151011};
+
+// Library functions the runtime replaces natively instead: never lifted, and
+// the closure doesn't follow them. Each needs a registered replacement.
+constexpr Replaced kNative[] = {
+    {0x1517B9, "XAPI start-up patch of kernel code for known kernel builds (cli; mov [kernel], …; sti)"},
+    {0x151B45, "XAPI's shutdown notification (registered with HalRegisterShutdownNotification at 0x32CF18): reloads the GDT; the runtime never shuts the console down"},
+    {0x14B924, "OutputDebugStringA: int 0x2D, the kernel debugger's print service; the runtime prints the string"},
+    {0x14C29C, "QueryPerformanceCounter: rdtsc; the runtime reads the host clock"},
+};
+bool is_native(uint32_t a) { return std::ranges::any_of(kNative, [&](const Replaced& r) { return r.addr == a; }); }
 
 Conventions crt_conventions() {
     constexpr uint8_t ZF = 8;
@@ -173,19 +190,21 @@ std::vector<std::string> check_replaced(const Xbe& xbe, Decoder& dec, const Cfg&
     return out;
 }
 
-// CRT functions reachable from `from`: direct calls and tail calls, and
-// function addresses as immediates or displacements (pointers for indirect
-// calls), followed transitively; plus every CRT function whose address is
-// stored in a data section (the CRT's own pointer tables, such as the
-// floating-point formatting hooks printf calls through).
-std::vector<uint32_t> crt_closure(const Xbe& xbe, Decoder& dec, const Cfg& cfg, std::span<const uint32_t> from) {
+// Library (CRT, XAPI) functions reachable from `from` and the start-up
+// roots: direct calls and tail calls, and function addresses as immediates or
+// displacements (pointers for indirect calls), followed transitively; plus
+// every library function whose address is stored in a data section (the
+// CRT's own pointer tables, such as the floating-point formatting hooks
+// printf calls through). Natively replaced functions aren't followed.
+std::vector<uint32_t> library_closure(const Xbe& xbe, Decoder& dec, const Cfg& cfg, std::span<const uint32_t> from) {
     const auto& fns = cfg.functions();
-    auto in_crt = [](uint32_t a) { return a >= kCrt.lo && a < kCrt.hi; };
+    auto in_lib = [](uint32_t a) { return std::ranges::any_of(kLibraries, [&](const Range& r) { return a >= r.lo && a < r.hi; }); };
     std::set<uint32_t> seen;
     std::vector<uint32_t> work;
     auto add = [&](uint32_t t) {
-        if (in_crt(t) && fns.contains(t) && seen.insert(t).second) work.push_back(t);
+        if (in_lib(t) && !is_native(t) && fns.contains(t) && seen.insert(t).second) work.push_back(t);
     };
+    for (uint32_t r : kStartupRoots) add(r);
     auto refs = [&](const Function& fn) {
         for (uint32_t t : fn.calls) add(t);
         for (uint32_t t : fn.tails) add(t);
@@ -253,7 +272,7 @@ int cmd_lift(const Xbe& xbe, Decoder& dec, std::span<const std::string_view> arg
         chunk.clear();
         in_chunk = 0;
     };
-    int crt_failed = 0;
+    int lib_failed = 0;
     auto lift_one = [&](uint32_t a, const Function& fn) {
         ++total;
         auto r = lifter.lift(fn);
@@ -271,13 +290,13 @@ int cmd_lift(const Xbe& xbe, Decoder& dec, std::span<const std::string_view> arg
     };
     for (auto& [a, fn] : cfg.functions())
         if (wanted(a)) lift_one(a, fn);
-    // The CRT functions lifted code can reach, transitively (default run only).
-    size_t crt_n = 0;
+    // The library (CRT, XAPI) functions lifted code can reach, transitively (default run only).
+    size_t lib_n = 0;
     if (!only && !opt(args, "--range")) {
-        std::vector<uint32_t> crt = crt_closure(xbe, dec, cfg, done);
-        crt_n = crt.size();
-        for (uint32_t a : crt)
-            if (!lift_one(a, cfg.functions().at(a))) ++crt_failed;
+        std::vector<uint32_t> lib = library_closure(xbe, dec, cfg, done);
+        lib_n = lib.size();
+        for (uint32_t a : lib)
+            if (!lift_one(a, cfg.functions().at(a))) ++lib_failed;
         std::ranges::sort(done);
     }
     flush();
@@ -308,9 +327,9 @@ int cmd_lift(const Xbe& xbe, Decoder& dec, std::span<const std::string_view> arg
     write_file(dir / "failures.txt", failures);
 
     std::println("lifted {} of {} functions ({} call targets without a lifted body get stubs)", done.size(), total, stubs.size());
-    if (crt_n) std::println("  {} of them are the C runtime functions lifted code can reach", crt_n);
-    if (crt_failed) {
-        std::println(stderr, "qilin: error: {} reachable C runtime functions don't lift (see failures.txt)", crt_failed);
+    if (lib_n) std::println("  {} of them are C runtime and XAPI functions that lifted code can reach", lib_n);
+    if (lib_failed) {
+        std::println(stderr, "qilin: error: {} reachable library functions don't lift (see failures.txt)", lib_failed);
         return 3;
     }
     if (!only) {
@@ -403,8 +422,8 @@ int run(std::string_view cmd, const std::string& path, std::span<const std::stri
         uint64_t lifted_unknown = 0;
         for (auto& r : cfg.coverage()) {
             const uint64_t total = r.code + r.table + r.padding + r.unknown;
-            std::println("{:<12} {:>7} {:>9} {:>8} {:>8} {:>8}  {:>8.3f}%", r.name, r.lifted ? "yes" : "no", r.code, r.table,
-                         r.padding, r.unknown, 100.0 * double(total - r.unknown) / double(std::max<uint64_t>(1, total)));
+            std::println("{:<12} {:>7} {:>9} {:>8} {:>8} {:>8}  {:>8}%", r.name, r.lifted ? "yes" : "no", r.code, r.table,
+                         r.padding, r.unknown, percent(total - r.unknown, total, 3));
             if (r.lifted) lifted_unknown += r.unknown;
             if (list && r.lifted)
                 for (auto& g : r.unknown_spans) std::println("    unknown {:08x} +{}", g.addr, g.size);

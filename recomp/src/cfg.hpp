@@ -116,6 +116,10 @@ struct Suspect {
     std::string why;
 };
 
+// part / whole as a percentage with `decimals` places, in integer arithmetic
+// (std::format of a double needs macOS 13.3's libc++; this builds for older).
+std::string percent(uint64_t part, uint64_t whole, int decimals);
+
 // MSVC alignment filler (mov r, r / lea r, [r + 0]); semantically a no-op.
 bool is_pad_filler(const Insn& i);
 // Does i (possibly) write 32-bit register r or part of it? Calls count as writing eax/ecx/edx.

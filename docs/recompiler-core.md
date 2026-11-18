@@ -11,7 +11,7 @@ CI builds with warnings as errors (`-Wall -Wextra -Wpedantic -Wshadow`, MSVC `/W
 - Linux x64 with GCC 14
 - Linux x64 with Clang 19
 - Linux ARM64 with GCC 14
-- macOS ARM64 and macOS x64 (Intel), both built for macOS 12
+- macOS ARM64 and macOS x64 (Intel), both built for macOS 10.15
 - Windows x64 with MSVC
 
 The generated code also has to be warning-free at `-Wall -Wextra`. The differential test compiles it with `-Werror`.

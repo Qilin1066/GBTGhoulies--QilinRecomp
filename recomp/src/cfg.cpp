@@ -1332,6 +1332,15 @@ std::vector<CoverageRegion> Cfg::coverage() {
     return out;
 }
 
+std::string percent(uint64_t part, uint64_t whole, int decimals) {
+    uint64_t scale = 1;
+    for (int k = 0; k < decimals; ++k) scale *= 10;
+    const uint64_t w = std::max<uint64_t>(1, whole);
+    const uint64_t v = (part * 100 * scale * 2 + w) / (2 * w);  // rounded half up
+    if (decimals == 0) return std::format("{}", v);
+    return std::format("{}.{:0{}}", v / scale, v % scale, decimals);
+}
+
 std::string Cfg::summary() const {
     std::string out;
     auto w = std::back_inserter(out);
@@ -1362,9 +1371,8 @@ std::string Cfg::summary() const {
             }
         }
         for (auto& g : sg.gaps) gap_bytes += g.size;
-        std::format_to(w, "  {:<10} {:>8} / {:>8}  ({:5.1f}% of non-pad)  gaps:{:>5} gapbytes:{}\n", s.name, covered,
-                       s.rsize, 100.0 * double(covered) / double(std::max<uint64_t>(1, nonpad)), sg.gaps.size(),
-                       gap_bytes);
+        std::format_to(w, "  {:<10} {:>8} / {:>8}  ({:>5}% of non-pad)  gaps:{:>5} gapbytes:{}\n", s.name, covered,
+                       s.rsize, percent(covered, nonpad, 1), sg.gaps.size(), gap_bytes);
     }
     std::map<std::string, int> how;
     size_t njt = 0, ntg = 0, nij = 0, nic = 0, nbad = 0, nov = 0;
