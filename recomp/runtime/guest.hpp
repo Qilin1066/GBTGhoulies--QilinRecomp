@@ -24,6 +24,8 @@
 #include <cstdint>
 #include <cstring>
 
+#include "x87_math.hpp"
+
 // ---- Floating point must be bit-exact IEEE single/double: no contraction into
 // fused multiply-add, no fast-math. Clang and MSVC take pragmas; GCC needs
 // -ffp-contract=off on the command line (the qilin_runtime CMake target adds it).
@@ -431,13 +433,41 @@ inline double fsqrt(uint32_t cw, double a) {
     const double rem = std::fma(-r, r, a);  // a - r*r, exact
     return round24(to_odd(r, rem));
 }
-// Transcendentals (precision control doesn't apply): the host's double maths.
-inline double x87_result1(double r, double a) { return r == r ? r : x87_nan1(a); }
-inline double fsin(double a) { return x87_result1(std::sin(a), a); }
-inline double fcos(double a) { return x87_result1(std::cos(a), a); }
-inline double ftan(double a) { return x87_result1(std::tan(a), a); }
-inline double fpatan(double y, double x) { const double r = std::atan2(y, x); return r == r ? r : x87_nan(y, x); }
-inline double fyl2x(double y, double x) { const double r = y * std::log2(x); return r == r ? r : x87_nan(y, x); }
+// Transcendentals (precision control doesn't apply): x87_math.hpp, the same
+// bits on every host. Special operands follow the x87 tables, which match
+// C's for atan2 and IEEE's for y * log2(x).
+inline double fsin(double a) {
+    if (!std::isfinite(a)) return x87_nan1(a);  // an infinity is invalid
+    return a == 0 ? a : xm::sin(a);
+}
+inline double fcos(double a) {
+    if (!std::isfinite(a)) return x87_nan1(a);
+    return a == 0 ? 1.0 : xm::cos(a);
+}
+inline double ftan(double a) {
+    if (!std::isfinite(a)) return x87_nan1(a);
+    return a == 0 ? a : xm::tan(a);
+}
+inline double fpatan(double y, double x) {  // atan2(y, x)
+    if (y != y || x != x) return x87_nan(y, x);
+    constexpr double pi = 0x1.921fb54442d18p+1, pi_2 = 0x1.921fb54442d18p+0, pi_4 = 0x1.921fb54442d18p-1,
+                     pi3_4 = 0x1.2d97c7f3321d2p+1;
+    if (y == 0) return x > 0 || (x == 0 && !std::signbit(x)) ? y : std::copysign(pi, y);
+    if (std::isinf(y)) return std::copysign(std::isinf(x) ? (x > 0 ? pi_4 : pi3_4) : pi_2, y);
+    if (x == 0) return std::copysign(pi_2, y);
+    if (std::isinf(x)) return std::copysign(x > 0 ? 0.0 : pi, y);
+    return xm::atan2(y, x);
+}
+inline double fyl2x(double y, double x) {  // y * log2(x)
+    if (y != y || x != x) return x87_nan(y, x);
+    if (std::isfinite(y) && y != 0 && std::isfinite(x) && x > 0 && x != 1.0) return xm::yl2x(y, x);
+    // Special operands: IEEE y * log2(x), with log2 of 0, +inf and 1 being
+    // -inf, +inf and 0, and of a negative number invalid. inf * 0 is invalid.
+    const double inf = dfrom(0x7FF0000000000000ull);
+    const double l = x < 0 ? dfrom(kX87Indefinite) : x == 0 ? -inf : x == inf ? inf : x == 1.0 ? 0.0 : x < 1.0 ? -1.0 : 1.0;
+    const double r = y * l;
+    return r == r ? r : x87_nan(y, x);
+}
 // fsin, fcos, fptan leave operands of magnitude 2^63 or more unchanged (C2 = 1).
 inline bool x87_trig_in_range(double a) { return std::fabs(a) < 9223372036854775808.0; }
 

@@ -42,6 +42,8 @@ import threading
 import time
 from collections import Counter
 
+import mpmath  # pip install mpmath: the reference for x87 transcendentals (EmuFixups)
+
 from unicorn import (UC_ARCH_X86, UC_ERR_WRITE_PROT, UC_HOOK_CODE, UC_HOOK_INTR, UC_HOOK_MEM_WRITE, UC_MODE_32, UC_PROT_ALL,
                      UC_PROT_EXEC, UC_PROT_READ, Uc, UcError)
 from unicorn.x86_const import (UC_X86_REG_CR0, UC_X86_REG_CR4, UC_X86_REG_CS, UC_X86_REG_DS, UC_X86_REG_EAX,
@@ -114,6 +116,46 @@ def x802d(v):
     q = fractions.Fraction(mant, 1 << 63) * fractions.Fraction(2) ** (e - 16383)
     d = float(q)  # correctly rounded
     return (-d if sign else d), fractions.Fraction(d) == q
+
+
+def x80_exact(v):
+    """80-bit -> exact Fraction, or None for an infinity or NaN."""
+    mant, se = v
+    sign, e = se >> 15, se & 0x7FFF
+    if e == 0x7FFF:
+        return None
+    q = fractions.Fraction(mant, 1 << 63) * fractions.Fraction(2) ** (max(e, 1) - 16383)
+    return -q if sign else q
+
+
+def correct_transcendental(mnem, x, y):
+    """The correctly rounded double of the x87 transcendental at exact operands
+    x = ST(0), y = ST(1), or None where the operands are special (zeros,
+    infinities, NaNs, out of range, x <= 0 or 1 for fyl2x): there the harness
+    leaves Unicorn's answer."""
+    if x is None or x == 0 or (mnem in ("fpatan", "fyl2x") and (y is None or y == 0)):
+        return None
+    if mnem in ("fsin", "fcos", "fptan") and abs(x) >= 2 ** 63:
+        return None
+    if mnem == "fyl2x" and (x <= 0 or x == 1):
+        return None
+    mpmath.mp.prec = 320
+    mx = mpmath.mpf(x.numerator) / x.denominator  # exact: the denominator is a power of two
+    if mnem == "fsin":
+        v = mpmath.sin(mx)
+    elif mnem == "fcos":
+        v = mpmath.cos(mx)
+    elif mnem == "fptan":
+        v = mpmath.tan(mx)
+    else:
+        my = mpmath.mpf(y.numerator) / y.denominator
+        v = mpmath.atan2(my, mx) if mnem == "fpatan" else my * mpmath.log(mx, 2)
+    sign, man, exp, _ = v._mpf_
+    q = fractions.Fraction(-int(man) if sign else int(man)) * fractions.Fraction(2) ** int(exp)
+    try:
+        return float(q)  # correctly rounded, subnormals included
+    except OverflowError:
+        return math.copysign(math.inf, q)
 
 
 TAG_EMPTY = 3
@@ -211,10 +253,16 @@ class EmuFixups:
       - rdtsc returns the host's time-stamp counter: replaced by a counter that
         restarts every trial and steps by a fixed amount;
       - fcomi/fcomip/fucomi/fucomip leave OF, SF and AF unchanged: Intel clears them;
-      - fyl2x with an operand <= 0 doesn't pop: the trial is skipped."""
+      - fyl2x with an operand <= 0 doesn't pop: the trial is skipped;
+      - fsin, fcos, fptan, fpatan and fyl2x return the host libm's answer
+        (fyl2x even rounds three times). The hardware's 64-bit results aren't
+        available, and the lifted code is specified to return the correctly
+        rounded double (recomp/runtime/x87_math.hpp), so for finite, ordinary
+        operands the result is replaced with that, computed with mpmath from
+        the exact 80-bit operands."""
 
     def __init__(self, insns_path):
-        self.rdtsc, self.fcomi, self.fyl2x = [], [], []
+        self.rdtsc, self.fcomi, self.fyl2x, self.trans = [], [], [], []
         for line in open(insns_path):
             parts = line.split(None, 3)
             a, n, m = int(parts[0], 16), int(parts[1]), parts[3].split("\t")[0]
@@ -222,8 +270,10 @@ class EmuFixups:
                 self.rdtsc.append(a)
             elif m in ("fcomi", "fcomip", "fucomi", "fucomip"):
                 self.fcomi.append((a, a + n))
-            elif m == "fyl2x":
+            if m == "fyl2x":
                 self.fyl2x.append(a)
+            if m in ("fsin", "fcos", "fptan", "fpatan", "fyl2x"):
+                self.trans.append((a, a + n, m))
         self.quirk = ""
 
     def install(self, uc):
@@ -256,6 +306,24 @@ class EmuFixups:
                 self_.quirk = f"fyl2x of {v} at {a:08X} (Unicorn doesn't pop)"
         for a in self.fyl2x:
             uc.hook_add(UC_HOOK_CODE, on_fyl2x, None, a, a)
+
+        def on_trans(u, a, size, mnem):
+            top = (u.reg_read(UC_X86_REG_FPSW) >> 11) & 7
+            st0 = x80_exact(u.reg_read(UC_X86_REG_FP0 + top))
+            st1 = x80_exact(u.reg_read(UC_X86_REG_FP0 + ((top + 1) & 7)))
+            state["trans"] = None
+            r = correct_transcendental(mnem, st0, st1)
+            if r is not None:  # the result lands in ST(0), or in ST(1) before the pop
+                state["trans"] = (a + size, top if mnem in ("fsin", "fcos", "fptan") else (top + 1) & 7, r)
+
+        def after_trans(u, a, size, ud):
+            t = state.get("trans")
+            if t and t[0] == a:
+                state["trans"] = None
+                u.reg_write(UC_X86_REG_FP0 + t[1], d2x80(t[2]))
+        for a, nxt, m in self.trans:
+            uc.hook_add(UC_HOOK_CODE, on_trans, m, a, a)
+            uc.hook_add(UC_HOOK_CODE, after_trans, None, nxt, nxt)
         return state
 
 
@@ -476,7 +544,7 @@ class Runner:
         x87_write(uc, self.fpcw, 0, ftop, fvalid, fst)
         self.wide_from_unlifted = self.wide_reg = False
         for st in (self.fix_uc, self.fix_uc2):
-            st["tsc"], st["fix_at"] = 0, None
+            st["tsc"], st["fix_at"], st["trans"] = 0, None, None
         self.fixups.quirk = ""
         self.uc_writes = []
         self.uc2_writes = []

@@ -5,6 +5,7 @@
 #include <cmath>
 #include <cstring>
 #include <limits>
+#include <iterator>
 #include <print>
 #include <stdexcept>
 #include <string>
@@ -334,6 +335,62 @@ int main() {
         CHECK(addss(0x3F800000u, 0x40000000u) == 0x40400000u);  // 1 + 2 = 3
     }
 
+    // ---------------------------------------------------------------- x87 transcendentals: the same bits on every host
+    {
+        // Correctly rounded results from mpmath (tools/check/x87/transcendental.py --golden).
+        // CI runs these on every platform, so a host whose arithmetic differs fails here.
+        namespace rt = qilin::rt;
+        const std::pair<uint64_t, uint64_t> golden[] = {
+        {rt::dbits(rt::fsin(rt::dfrom(0x3FE0000000000000ull))), 0x3FDEAEE8744B05F0ull},  // fsin(0.5) = 0.479425538604203
+        {rt::dbits(rt::fsin(rt::dfrom(0xC008000000000000ull))), 0xBFC210386DB6D55Bull},  // fsin(-3.0) = -0.1411200080598672
+        {rt::dbits(rt::fsin(rt::dfrom(0x412E848000000000ull))), 0xBFD6664B2568D867ull},  // fsin(1000000.0) = -0.34999350217129294
+        {rt::dbits(rt::fsin(rt::dfrom(0x400921FB54442D18ull))), 0x3CA1A62633145C07ull},  // fsin(3.141592653589793) = 1.2246467991473532e-16
+        {rt::dbits(rt::fsin(rt::dfrom(0x43DFFFFFFFFFFFFFull))), 0x3FEFA7299B17573Dull},  // fsin(9.223372036854775e+18) = 0.989155581390811
+        {rt::dbits(rt::fsin(rt::dfrom(0x0170000000000000ull))), 0x0170000000000000ull},  // fsin(9.332636185032189e-302) = 9.332636185032189e-302
+        {rt::dbits(rt::fsin(rt::dfrom(0x4076300000000000ull))), 0xBEFF9BD0307D1DE3ull},  // fsin(355.0) = -3.014435335948845e-05
+        {rt::dbits(rt::fsin(rt::dfrom(0x413921FB54442D18ull))), 0xBDD1A62633145C07ull},  // fsin(1647099.3291652855) = -6.420676210313675e-11
+        {rt::dbits(rt::fsin(rt::dfrom(0x4336AC5B262CA1FFull))), 0xBFE29E22E425CB7Dull},  // fsin(6381956970095103.0) = -0.5818037467964668
+        {rt::dbits(rt::fcos(rt::dfrom(0x3FE0000000000000ull))), 0x3FEC1528065B7D50ull},  // fcos(0.5) = 0.8775825618903728
+        {rt::dbits(rt::fcos(rt::dfrom(0x3FF921FB54442D18ull))), 0x3C91A62633145C07ull},  // fcos(1.5707963267948966) = 6.123233995736766e-17
+        {rt::dbits(rt::fcos(rt::dfrom(0x4036000000000000ull))), 0xBFEFFFADD8D4ACDAull},  // fcos(22.0) = -0.9999608263946371
+        {rt::dbits(rt::fcos(rt::dfrom(0x430C6BF526340000ull))), 0xBFE06C154609D33Full},  // fcos(1000000000000000.0) = -0.5131937377869703
+        {rt::dbits(rt::fcos(rt::dfrom(0xC01C000000000000ull))), 0x3FE81FF79ED92017ull},  // fcos(-7.0) = 0.7539022543433046
+        {rt::dbits(rt::fcos(rt::dfrom(0x427921FB5445D85Aull))), 0xBEE19DC06A22DBBCull},  // fcos(1727108826205.522) = -8.400066978315561e-06
+        {rt::dbits(rt::ftan(rt::dfrom(0x3FE8000000000000ull))), 0x3FEDCFA36110EEECull},  // ftan(0.75) = 0.9315964599440725
+        {rt::dbits(rt::ftan(rt::dfrom(0x3FF921FB54442D18ull))), 0x434D02967C31CDB5ull},  // ftan(1.5707963267948966) = 1.633123935319537e+16
+        {rt::dbits(rt::ftan(rt::dfrom(0xC059000000000000ull))), 0x3FE2CA74D62B5D38ull},  // ftan(-100.0) = 0.5872139151569291
+        {rt::dbits(rt::ftan(rt::dfrom(0x4202A05F20000000ull))), 0xBFE1DE000F443F50ull},  // ftan(10000000000.0) = -0.5583496378112418
+        {rt::dbits(rt::fpatan(rt::dfrom(0x3FF0000000000000ull), rt::dfrom(0x3FF0000000000000ull))), 0x3FE921FB54442D18ull},  // fpatan(1.0, 1.0) = 0.7853981633974483
+        {rt::dbits(rt::fpatan(rt::dfrom(0xC004000000000000ull), rt::dfrom(0x4008000000000000ull))), 0xBFE63B4BC3F16A8Aull},  // fpatan(-2.5, 3.0) = -0.6947382761967031
+        {rt::dbits(rt::fpatan(rt::dfrom(0x01A56E1FC2F8F359ull), rt::dfrom(0xBFF0000000000000ull))), 0x400921FB54442D18ull},  // fpatan(1e-300, -1.0) = 3.141592653589793
+        {rt::dbits(rt::fpatan(rt::dfrom(0x4008000000000000ull), rt::dfrom(0xBDDB7CDFD9D7BDBBull))), 0x3FF921FB54467780ull},  // fpatan(3.0, -1e-10) = 1.57079632682823
+        {rt::dbits(rt::fpatan(rt::dfrom(0x0000000000004000ull), rt::dfrom(0x0000000000000010ull))), 0x3FF91DFB5459826Dull},  // fpatan(8.095e-320, 8e-323) = 1.5698197646053373
+        {rt::dbits(rt::fpatan(rt::dfrom(0x16687E92154EF7ACull), rt::dfrom(0x54B249AD2594C37Dull))), 0x01A56E1FC2F8F359ull},  // fpatan(1e-200, 1e+100) = 1e-300
+        {rt::dbits(rt::fpatan(rt::dfrom(0xBFF0000000000000ull), rt::dfrom(0xBFF0000000000000ull))), 0xC002D97C7F3321D2ull},  // fpatan(-1.0, -1.0) = -2.356194490192345
+        {rt::dbits(rt::fpatan(rt::dfrom(0x01A56E1FC2F8F359ull), rt::dfrom(0x4202A05F20000000ull))), 0x000012688B70E62Bull},  // fpatan(1e-300, 10000000000.0) = 1e-310
+        {rt::dbits(rt::fyl2x(rt::dfrom(0x3FF0000000000000ull), rt::dfrom(0x4008000000000000ull))), 0x3FF95C01A39FBD68ull},  // fyl2x(1.0, 3.0) = 1.584962500721156
+        {rt::dbits(rt::fyl2x(rt::dfrom(0xC004000000000000ull), rt::dfrom(0x3FB999999999999Aull))), 0x40209C1165EC0627ull},  // fyl2x(-2.5, 0.1) = 8.304820237218406
+        {rt::dbits(rt::fyl2x(rt::dfrom(0x4008000000000000ull), rt::dfrom(0x3FF0000000000001ull))), 0x3CD14FF58BE0A23Eull},  // fyl2x(3.0, 1.0000000000000002) = 9.610279511444752e-16
+        {rt::dbits(rt::fyl2x(rt::dfrom(0x000012688B70E62Bull), rt::dfrom(0x401C000000000000ull))), 0x000033ADC918D1D7ull},  // fyl2x(1e-310, 7.0) = 2.8073549220576e-310
+        {rt::dbits(rt::fyl2x(rt::dfrom(0x7E5DDD4BAA009303ull), rt::dfrom(0x01A56E1FC2F8F359ull))), 0xFEFD109028C6770Eull},  // fyl2x(5e+300, 1e-300) = -4.9828921423310436e+303
+        {rt::dbits(rt::fyl2x(rt::dfrom(0x3FE0000000000000ull), rt::dfrom(0x0000000000000001ull))), 0xC080C80000000000ull},  // fyl2x(0.5, 5e-324) = -537.0
+        {rt::dbits(rt::fyl2x(rt::dfrom(0x3FF0000000000000ull), rt::dfrom(0x3FEFFFFFFFFFFFFFull))), 0xBCA71547652B82FEull},  // fyl2x(1.0, 0.9999999999999999) = -1.6017132519074588e-16
+        };
+        for (size_t k = 0; k < std::size(golden); ++k)
+            if (golden[k].first != golden[k].second) {
+                std::println(stderr, "x87 transcendental vector {}: got {:016X}, want {:016X}", k, golden[k].first, golden[k].second);
+                CHECK(false);
+            }
+        // Special operands follow the x87 tables.
+        CHECK(rt::dbits(rt::fsin(rt::dfrom(0x8000000000000000ull))) == 0x8000000000000000ull);  // sin(-0) = -0
+        CHECK(rt::dbits(rt::fsin(rt::dfrom(0x7FF0000000000000ull))) == rt::kX87Indefinite);   // sin(inf): invalid
+        CHECK(rt::dbits(rt::fpatan(rt::dfrom(0x8000000000000000ull), -1.0)) == 0xC00921FB54442D18ull);  // atan2(-0, -1) = -pi
+        CHECK(rt::fpatan(-1.0, 0.0) == -0x1.921fb54442d18p+0);
+        CHECK(rt::fyl2x(2.0, 0.0) == -rt::dfrom(0x7FF0000000000000ull));                     // 2 log2(0) = -inf
+        CHECK(rt::dbits(rt::fyl2x(0.0, 0.0)) == rt::kX87Indefinite);                          // 0 log2(0): invalid
+        CHECK(rt::dbits(rt::fyl2x(1.0, -2.0)) == rt::kX87Indefinite);                         // log2 of a negative
+        CHECK(rt::dbits(rt::fyl2x(rt::dfrom(0x8000000000000000ull), 0.5)) == 0x0000000000000000ull);  // -0 * log2(0.5) = +0
+    }
     // ---------------------------------------------------------------- x87 arithmetic (24-bit precision control)
     {
         using namespace qilin::rt;

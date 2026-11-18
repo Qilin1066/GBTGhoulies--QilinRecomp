@@ -60,7 +60,7 @@ Code that compiles lifted C++ must link the `qilin_runtime` CMake target (or pas
 tools/check/check_xbe.sh path/to/default.xbe
 ```
 
-This runs the unit tests and the CFG pass, then cross-checks Zydis against LLVM's disassembler. Finally it runs the differential test, which compares each lifted function with the original x86 code run in the Unicorn emulator. It needs Python 3, `libLLVM` (Debian/Ubuntu: `apt install libllvm18`) and `pip install unicorn`. Set `CXX` to a C++23 compiler for the differential test, which builds the lifted code at `-O2` with warnings as errors. Pass `--sanitize` to `tools/difftest/difftest.py` for an UndefinedBehaviorSanitizer build, and `--variants 4` to add two float-heavy heap images, which make rounding differences more likely to show. `tools/check/x87/rounding.py` checks the x87 precision-control arithmetic against exact rational results. The decoder check is:
+This runs the unit tests and the CFG pass, then cross-checks Zydis against LLVM's disassembler. Finally it runs the differential test, which compares each lifted function with the original x86 code run in the Unicorn emulator. It needs Python 3, `libLLVM` (Debian/Ubuntu: `apt install libllvm18`) and `pip install unicorn`. Set `CXX` to a C++23 compiler for the differential test, which builds the lifted code at `-O2` with warnings as errors. Pass `--sanitize` to `tools/difftest/difftest.py` for an UndefinedBehaviorSanitizer build, and `--variants 4` to add two float-heavy heap images, which make rounding differences more likely to show. `tools/check/x87/rounding.py` checks the x87 precision-control arithmetic against exact rational results, and `tools/check/x87/transcendental.py` checks `fsin`, `fcos`, `fptan`, `fpatan` and `fyl2x` against mpmath (`pip install mpmath`, which the differential test also needs). The decoder check is:
 
 - **Strict on every reachable instruction:** same length and same mnemonic.
 - **Strict on a linear sweep of every code section too**, except for three classes it reports instead of failing, because they only occur in data bytes:
@@ -76,7 +76,7 @@ This runs the unit tests and the CFG pass, then cross-checks Zydis against LLVM'
 | `recomp/tests/` | Unit tests on a synthetic in-memory XBE, so they need no game files |
 | `tools/analysis/` | The original Python analysis prototype, using LLVM via ctypes. Kept as the reference the C++ port is checked against |
 | `recomp/runtime/` | Runtime header the generated C++ includes (guest memory, flag and float helpers) |
-| `tools/check/` | The LLVM decoder cross-check, the x87 rounding cross-check, the C++ exception-handling report and the full local check script |
+| `tools/check/` | The LLVM decoder cross-check, the x87 rounding and transcendental cross-checks, the C++ exception-handling report and the full local check script |
 | `tools/difftest/` | Differential test: lifted C++ against the original x86 under Unicorn |
 | `third_party/` | Vendored dependencies: Zydis and Zycore, MIT licensed. See `third_party/README.md` |
 | `docs/` | Design notes |

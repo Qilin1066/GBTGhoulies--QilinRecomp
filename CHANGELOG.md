@@ -11,6 +11,23 @@ Each release is a git tag (`vX.Y.Z`) with a matching GitHub release. The version
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-11-18
+The x87 transcendentals give the same bits on every host. That was the last open item in the recompiler core.
+
+### Added
+- **`recomp/runtime/x87_math.hpp`:** `fsin`, `fcos`, `fptan`, `fpatan` and `fyl2x` now return the correctly rounded double of the true function at their operands, except where the true value lies within about 2^-100 of a rounding boundary.
+  - **Portable:** only IEEE add, subtract, multiply, divide and square root. Exact products use hardware `fma` where the target has it and Dekker's method otherwise, with identical bits either way.
+  - **Fast:** each function evaluates to below 2^-64, then checks the rounding. About 99.7% of calls finish there; the rest take a double-double slow path with exact Payne–Hanek reduction. That's about 50–100 ns per call on x86-64, against 4–23 ns for glibc, which isn't portable and, as measured, often isn't correctly rounded.
+- **Checks:**
+  - `tools/check/x87/transcendental.py` checks against mpmath: 480,000 cases per seed over 24 operand ranges, 0 wrong, with GCC and Clang, with and without FMA, and for ARM64 under qemu.
+  - `tools/check/x87/consistency.cpp`, the new `qilin_x87_consistency` CTest, checks fast paths against slow paths on every CI platform.
+  - 34 golden vectors in the unit tests.
+- **Difftest:** Unicorn's transcendentals (the host libm; `fyl2x` rounds three times) are replaced in both emulators with the correctly rounded result from mpmath. The 626 x87 functions: 10,015 trials, 0 mismatches. The difftest now needs `pip install mpmath`.
+
+### Changed
+- **Special operands** of the five instructions are handled explicitly, following the x87 tables (C's for `atan2`, IEEE's for `y * log2(x)`). Before, they depended on the host libm.
+- **`fyl2x` rounds once.** Before, it computed `y * log2(x)`, rounding twice.
+
 ## [0.8.0] - 2026-11-18
 Every function in the lifted set lifts: all 5,743 in the game code and Rare libraries, with zero failures. That closes check 4 of "How we'll know everything is recompiled".
 

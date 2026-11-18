@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.25)
 # The single source of the version number (see CHANGELOG.md for the scheme).
-project(GBTGQilincomp VERSION 0.8.0 LANGUAGES C CXX)
+project(GBTGQilincomp VERSION 0.9.0 LANGUAGES C CXX)
 
 # ---- Language: C++23 everywhere (recompiler, runtime, generated code) ----
 set(CMAKE_CXX_STANDARD 23)
@@ -87,3 +87,8 @@ enable_testing()
 add_executable(qilin_tests recomp/tests/tests.cpp)
 target_link_libraries(qilin_tests PRIVATE qilin_core qilin_warnings)
 add_test(NAME qilin_tests COMMAND qilin_tests)
+
+# x87 transcendentals: fast paths against slow paths on each CI platform's compiler and CPU.
+add_executable(qilin_x87_consistency tools/check/x87/consistency.cpp)
+target_link_libraries(qilin_x87_consistency PRIVATE qilin_runtime qilin_warnings)
+add_test(NAME qilin_x87_consistency COMMAND qilin_x87_consistency 200000)
