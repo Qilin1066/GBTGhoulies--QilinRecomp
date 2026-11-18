@@ -29,6 +29,67 @@ struct Rect {
 
 enum ClearFlags : uint32_t { kClearColor = 1, kClearDepth = 2, kClearStencil = 4 };
 
+struct TextureData;
+
+// ---- Drawing. The enums are in Vulkan's order.
+enum class Primitive : uint8_t { Points, Lines, LineStrip, Triangles, TriangleStrip };
+enum class Compare : uint8_t { Never, Less, Equal, LessEqual, Greater, NotEqual, GreaterEqual, Always };
+enum class BlendFactor : uint8_t {
+    Zero, One, SrcColor, OneMinusSrcColor, DstColor, OneMinusDstColor, SrcAlpha, OneMinusSrcAlpha, DstAlpha,
+    OneMinusDstAlpha, ConstantColor, OneMinusConstantColor, ConstantAlpha, OneMinusConstantAlpha, SrcAlphaSaturate
+};
+enum class BlendOp : uint8_t { Add, Subtract, ReverseSubtract, Min, Max };
+enum class StencilOp : uint8_t { Keep, Zero, Replace, IncrementClamp, DecrementClamp, Invert, IncrementWrap, DecrementWrap };
+enum class Cull : uint8_t { None, Clockwise, CounterClockwise };  // which screen-space winding is culled
+enum class Filter : uint8_t { Nearest, Linear };
+enum class Address : uint8_t { Wrap, Mirror, Clamp, Border };
+
+struct SamplerDesc {
+    Filter mag = Filter::Linear, min = Filter::Linear, mip = Filter::Nearest;
+    bool mipmaps = false;
+    Address u = Address::Wrap, v = Address::Wrap, w = Address::Wrap;
+    uint32_t border = 0;  // A8R8G8B8
+    float lod_bias = 0;
+    uint32_t max_level = 0, anisotropy = 1;
+    bool operator==(const SamplerDesc&) const = default;
+};
+
+// One draw: shaders (SPIR-V, made once per key; code is read only the
+// first time a key is seen), fixed-function state, and its data: up to 16
+// vertex attributes as vec4 floats, optional 32-bit indices, the shader
+// uniforms (nv2a::kVsUniformVec4s and kFsUniformVec4s vec4s), textures.
+struct DrawCmd {
+    uint64_t vs_key = 0, fs_key = 0;
+    const std::vector<uint32_t>* vs_code = nullptr;
+    const std::vector<uint32_t>* fs_code = nullptr;
+    uint32_t inputs = 0;  // attribute n present: bit n
+    Primitive primitive = Primitive::Triangles;
+
+    bool blend = false;
+    BlendFactor src_color = BlendFactor::One, dst_color = BlendFactor::Zero, src_alpha = BlendFactor::One, dst_alpha = BlendFactor::Zero;
+    BlendOp color_op = BlendOp::Add, alpha_op = BlendOp::Add;
+    uint8_t write_mask = 0xF;  // R G B A: bits 0-3
+    float blend_constant[4] = {};
+
+    bool depth_test = false, depth_write = false;
+    Compare depth_compare = Compare::LessEqual;
+    bool stencil_test = false;
+    Compare stencil_compare = Compare::Always;
+    StencilOp stencil_fail = StencilOp::Keep, stencil_depth_fail = StencilOp::Keep, stencil_pass = StencilOp::Keep;
+    uint8_t stencil_ref = 0, stencil_read_mask = 0xFF, stencil_write_mask = 0xFF;
+    Cull cull = Cull::None;
+    Rect scissor;
+
+    uint32_t vertex_count = 0;
+    const float* attributes[16] = {};
+    const uint32_t* indices = nullptr;
+    uint32_t index_count = 0;
+    const float* vs_uniforms = nullptr;
+    const float* fs_uniforms = nullptr;
+    uint32_t textures[4] = {};  // from create_texture; 0 none
+    SamplerDesc samplers[4];
+};
+
 struct Image {  // 8-bit RGBA, rows top to bottom
     uint32_t width = 0, height = 0;
     std::vector<uint8_t> rgba;
@@ -63,6 +124,13 @@ public:
     // or the back buffer as drawn so far.
     virtual Image read_front_buffer() = 0;
     virtual Image read_back_buffer() = 0;
+
+    // Textures: made from decoded texels (texture.hpp), named by a non-zero id.
+    virtual uint32_t create_texture(const TextureData& data) = 0;
+    virtual void destroy_texture(uint32_t id) = 0;
+
+    // Draws into the back buffer.
+    virtual void draw(const DrawCmd& cmd) = 0;
 
     // Validation messages of error severity so far (0 without the layers).
     virtual uint32_t validation_errors() const = 0;

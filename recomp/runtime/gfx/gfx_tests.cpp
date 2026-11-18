@@ -1,9 +1,12 @@
 // Renderer tests: clears and presents on whatever Vulkan device there is,
 // checked by reading the frames back. Exits 77 (skipped) without Vulkan.
 #include <cstdio>
+#include <cstdlib>
 #include <string>
 
 #include "gfx.hpp"
+#include "nv2a_shaders.hpp"
+#include "texture.hpp"
 #include "vsh.hpp"
 
 using namespace qilin;
@@ -79,10 +82,45 @@ mul oD0, r11.w, c4
 mad oPos.xyz, oPos.xyzz, r1.x, c-37.xyzz
 )") std::fprintf(stderr, "%s", text.c_str());
             CHECK(p->code[6].ilu == gfx::vsh::Ilu::Rcc && p->code[6].ilu_temp() == 1);  // the ILU writes r1 beside a MAC
+            // The program as SPIR-V; QILIN_SPV_DIR writes it out (for spirv-val).
+            const auto spv = gfx::nv2a::vertex_program(*p, 1);
+            CHECK(spv.size() > 5 && spv[0] == 0x07230203u);
+            if (const char* dir = std::getenv("QILIN_SPV_DIR"))
+                if (std::FILE* f = std::fopen((std::string(dir) + "/test_vs.spv").c_str(), "wb")) {
+                    std::fwrite(spv.data(), 4, spv.size(), f);
+                    std::fclose(f);
+                }
         }
         const uint32_t not_vsh[] = {0x12345678u};
         CHECK(!gfx::vsh::decode(not_vsh, 1, &error).has_value());
     }
+
+    // A combiner setup (one stage: r0 = t0 * v0, final r0 with alpha test), as SPIR-V.
+    {
+        gfx::nv2a::CombinerSetup cs{};
+        cs.combiner_count = 1;
+        cs.rgb_inputs[0] = 0x08040000u;    // A = t0, B = v0, C = D = 0
+        cs.alpha_inputs[0] = 0x18140000u;  // t0.a * v0.a
+        cs.rgb_outputs[0] = 0x00C00u;      // sum to r0
+        cs.alpha_outputs[0] = 0x00C00u;
+        cs.final_abcd = 0x0000000Cu;       // D = r0
+        cs.final_efgh = 0x00001C00u;       // G = r0.a
+        cs.texture_modes = 1;              // stage 0 PROJECT2D
+        cs.texture_dims[0] = 2;
+        cs.alpha_func = 0x204;
+        CHECK(gfx::nv2a::combiners_unsupported(cs) == nullptr);
+        const auto spv = gfx::nv2a::combiners(cs);
+        CHECK(spv.size() > 5 && spv[0] == 0x07230203u);
+        if (const char* dir = std::getenv("QILIN_SPV_DIR"))
+            if (std::FILE* f = std::fopen((std::string(dir) + "/test_ps.spv").c_str(), "wb")) {
+                std::fwrite(spv.data(), 4, spv.size(), f);
+                std::fclose(f);
+            }
+    }
+    // Swizzling: a 4x4 texture interleaves x and y bits, x first.
+    CHECK(gfx::swizzle_offset(1, 0, 0, 4, 4, 1) == 1 && gfx::swizzle_offset(0, 1, 0, 4, 4, 1) == 2 &&
+          gfx::swizzle_offset(3, 3, 0, 4, 4, 1) == 15 && gfx::swizzle_offset(0, 1, 0, 8, 2, 1) == 2 &&
+          gfx::swizzle_offset(4, 0, 0, 8, 2, 1) == 8);
 
     gfx::Config cfg;
     cfg.width = 64;
@@ -129,6 +167,56 @@ mad oPos.xyz, oPos.xyzz, r1.x, c-37.xyzz
 
     if (argc > 1) CHECK(gfx::write_png(argv[1], front));
     CHECK(r->validation_errors() == 0);
+    // A draw: a vertex program (oPos = v0, oD0 = v3) and the final combiner
+    // passing v0 through, a triangle over the top-left of the buffer.
+    {
+        gfx::vsh::Program prog;
+        gfx::vsh::Instruction mov_pos;
+        mov_pos.mac = gfx::vsh::Mac::Mov;
+        mov_pos.a.kind = gfx::vsh::Src::Input;
+        mov_pos.a.index = 0;
+        mov_pos.out_mask = 0xF;
+        mov_pos.out_address = gfx::vsh::kPos;
+        gfx::vsh::Instruction mov_d0 = mov_pos;
+        mov_d0.a.index = 3;
+        mov_d0.out_address = gfx::vsh::kD0;
+        mov_d0.final = true;
+        prog.code = {mov_pos, mov_d0};
+        const auto vs = gfx::nv2a::vertex_program(prog, 0b1001);
+        gfx::nv2a::CombinerSetup cs{};
+        cs.final_abcd = 0x00000004u;  // D = v0
+        cs.final_efgh = 0x00001400u;  // G = v0.a
+        const auto fs = gfx::nv2a::combiners(cs);
+        const float pos[3][4] = {{0, 0, 0.5f, 1}, {40, 0, 0.5f, 1}, {0, 40, 0.5f, 1}};
+        const float col[3][4] = {{0, 1, 0, 1}, {0, 1, 0, 1}, {0, 1, 0, 1}};
+        std::vector<float> vsu(gfx::nv2a::kVsUniformVec4s * 4, 0.0f), fsu(gfx::nv2a::kFsUniformVec4s * 4, 0.0f);
+        vsu[gfx::nv2a::kVsScreen * 4 + 0] = 2.0f / float(cfg.width);
+        vsu[gfx::nv2a::kVsScreen * 4 + 1] = 2.0f / float(cfg.height);
+        vsu[gfx::nv2a::kVsScreen * 4 + 2] = 1.0f;
+        gfx::DrawCmd d;
+        d.vs_key = 1, d.fs_key = 2, d.vs_code = &vs, d.fs_code = &fs;
+        d.inputs = 0b1001;
+        d.vertex_count = 3;
+        d.attributes[0] = &pos[0][0];
+        d.attributes[3] = &col[0][0];
+        d.vs_uniforms = vsu.data();
+        d.fs_uniforms = fsu.data();
+        d.scissor = {0, 0, cfg.width, cfg.height};
+        const float black[4] = {0, 0, 0, 1};
+        r->clear(nullptr, 0, gfx::kClearColor, black, 1, 0);
+        r->draw(d);
+        const gfx::Image im = r->read_back_buffer();
+        CHECK(pixel_is(im, 5, 5, 0, 255, 0, 255));      // inside the triangle
+        CHECK(pixel_is(im, 60, 40, 0, 0, 0, 255));      // outside
+        // A texture: a 2x2 checker sampled by PASSTHRU-free PROJECT2D at texel centres.
+        gfx::TextureData t;
+        t.width = t.height = 2;
+        t.rgba = {255, 0, 0, 255, 0, 0, 255, 255, 0, 0, 255, 255, 255, 0, 0, 255};
+        const uint32_t tex = r->create_texture(t);
+        CHECK(tex != 0);
+        r->destroy_texture(tex);
+    }
+
     if (failures) std::fprintf(stderr, "%d check(s) failed\n", failures);
     else std::printf("all renderer tests passed\n");
     return failures != 0;

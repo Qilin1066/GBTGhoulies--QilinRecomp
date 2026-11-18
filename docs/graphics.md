@@ -1,6 +1,6 @@
 # Graphics: Direct3D on Vulkan (roadmap step 4)
 
-Last updated 2026-11-18 (v0.21.0: resources destroyed as the original; v0.20.0: state setters, draws recorded, push-buffer sink; v0.17.0: vertex programs decoded, pixel-shader objects lifted; v0.16.0: D3D's resource code lifted; guest RAM's kernel windows; v0.14.0: the renderer and the Direct3D device).
+Last updated 2026-11-18 (v0.22.0: drawing; v0.21.0: resources destroyed as the original; v0.20.0: state setters, draws recorded, push-buffer sink; v0.17.0: vertex programs decoded, pixel-shader objects lifted; v0.16.0: D3D's resource code lifted; guest RAM's kernel windows; v0.14.0: the renderer and the Direct3D device).
 
 The game draws through the Xbox's Direct3D 8 library (D3D8, XDK 5659), which is linked into the XBE. Its calls stay in the recompiled code; what answers them is the runtime. Every D3D function the game calls is replaced natively (`recomp/runtime/host/d3d.cpp`) over a Vulkan 1.3 renderer (`recomp/runtime/gfx/`). There is no DirectX anywhere, and the Xbox's GPU (the NV2A) isn't emulated: the replacements see what the game asks for (clear this, draw that mesh with this texture) and do it with Vulkan.
 
@@ -71,9 +71,17 @@ The game has 24 vertex shaders, written in Xbox shader assembly (`vs.1.0` and `x
 | `DrawVertices`, `DrawIndexedVertices`, `BeginPush`/`EndPush` | Consume the dirty state as the original's flush does, and record the draw with a copy of the vertices it reads (attribute slots of the shader object, D3D's stream table at `0x1842A0`). The game's own methods are decoded: `SET_BEGIN_END` and `INLINE_ARRAY` are all it writes; any other stops the runtime |
 | `InsertFence`, `BlockOnFence` | The device's fence counter steps by 2, as the original; every fence has passed, since a draw copies what it reads |
 
-The draws are recorded but not drawn yet: the first frames print how many (`frame 0: 22 draws`).
+## Drawing (v0.22.0)
 
-**Not modelled yet:** drawing, textures, CPU writes to a frame buffer reaching the screen (the disc-error screen draws into the front buffer this way), the device's own `Release`, draws from `SetVertexShaderInput` streams, `Swap` keeping a render target that isn't the back buffer, a window.
+Each draw call (and each `SET_BEGIN_END` pair the game pushes itself) becomes a renderer draw at once, in order with clears.
+
+- **Vertices** are read from the shader object's attribute slots and D3D's stream table and converted to vec4 floats, attribute by attribute, as the NV2A reads its formats (D3DCOLOR's byte order, normalized shorts as (2s + 1) / 65535, the packed 11:11:10 format), missing components (0, 0, 0, 1). Quads, quad strips, fans, polygons and line loops become indexed lists (Vulkan has no quads, and Apple's Vulkan no fans).
+- **Shaders are generated as SPIR-V** by the runtime's own builder (`gfx/spirv.*`), so nothing compiles shaders at build or run time. A vertex program comes from the GPU's program memory at the selected slot (`gfx/nv2a_vs.cpp`); registers are SSA values, as the program runs straight through. The program's screen-space output (D3D appends the viewport transform to every program) is mapped back to clip space with the target's size and depth scale, times w. The pixel side is the register combiners (`gfx/nv2a_ps.cpp`), keyed by everything in the shader definition but the constants, which are uniforms. Floats replace the hardware's 9-bit fixed point.
+- **Derived state at draw time,** as D3D's state flush would push it: the viewport constants c-38 and c-37 (computed as D3D's `0x1710E0` does), blend, depth, stencil, cull and colour-write state from the render states, the combiner constants.
+- **Textures** (`gfx/texture.*`): swizzled, linear and DXT1/3/5, every level, face and slice, decoded to RGBA8 and cached; texels are hashed once a frame and re-uploaded when they change. Linear textures are addressed in texels, as the hardware does.
+- **Culling:** the original sends `CULLMODE` to the GPU as GL's front/back against `FRONTFACE`, so the winding culled is the one `CULLMODE` names in GL's terms, y up. On the screen, y down, `D3DCULL_CW` culls what looks counter-clockwise.
+
+**Not modelled yet:** the fixed-function vertex and pixel pipelines (the game's draws so far are all programs and combiners), texture modes beyond the six above (bump mapping, dot products), fog factors (the vertex fog value is used as is), rendering into textures (named once and skipped), palettized textures, point sprites, the combiners' fixed-point precision, CPU writes to a frame buffer reaching the screen (the disc-error screen draws into the front buffer this way), the device's own `Release`, draws from `SetVertexShaderInput` streams, `Swap` keeping a render target that isn't the back buffer, a window.
 
 ## Next
 

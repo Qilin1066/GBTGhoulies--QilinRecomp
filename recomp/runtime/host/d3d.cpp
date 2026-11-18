@@ -24,6 +24,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <map>
+#include <unordered_map>
 #include <memory>
 #include <optional>
 #include <string>
@@ -32,6 +33,8 @@
 #include <vector>
 
 #include "gfx.hpp"
+#include "nv2a_shaders.hpp"
+#include "texture.hpp"
 #include "vsh.hpp"
 #include "host.hpp"
 #include "strf.hpp"
@@ -55,6 +58,7 @@ constexpr uint32_t kDevMultisample = 0x195C, kDevRenderTarget = 0x19F4, kDevDept
 constexpr uint32_t kDirtyFlags = 0x181968;      // D3D__DirtyFlags
 constexpr uint32_t kRenderStateTable = 0x181B70;  // D3D__RenderState (the pixel shader's registers first)
 constexpr uint32_t kDevFence = 0x2C;  // the device's current fence
+constexpr uint32_t kDevViewport = 0xED0;
 constexpr uint32_t kDevVertexShader = 0x790, kFixedFunctionShader = 0x184478;
 constexpr uint32_t kFmtA8R8G8B8 = 0x06, kFmtX8R8G8B8 = 0x07, kFmtLinA8R8G8B8 = 0x12, kFmtLinX8R8G8B8 = 0x1E,
                    kFmtD24S8 = 0x2A, kFmtLinD24S8 = 0x2E;
@@ -95,20 +99,18 @@ struct Device {
     // The game's own push-buffer writes (BeginPush/EndPush): a guest buffer.
     uint32_t push = 0, push_dwords = 0, push_begun = 0;
     // Draws decoded since the last Swap, until the renderer draws them.
-    struct Attribute {
-        uint32_t slot = 0, format = 0, bytes = 0;  // the shader object's attribute slot, NV2A format byte, size of one
-        std::vector<uint8_t> data;                 // vertices first_vertex.. tightly packed
+    // Shaders made so far, by key, and textures uploaded, by their header and address.
+    std::unordered_map<uint64_t, std::vector<uint32_t>> shaders;
+    struct CachedTexture {
+        uint32_t id = 0;
+        uint64_t content = 0;  // a hash of the texels when uploaded
+        uint32_t checked = ~0u;  // the frame the texels were last compared
+        uint32_t dims = 2;
+        bool linear = false;
+        uint32_t width = 0, height = 0, depth = 1;
     };
-    struct Draw {
-        uint32_t primitive = 0;              // NV097_SET_BEGIN_END's D3DPRIMITIVETYPE-like value
-        std::vector<uint32_t> inline_data;   // NV097_INLINE_ARRAY: whole vertices in the current layout
-        uint32_t vertex_shader = 0, pixel_shader = 0;
-        uint32_t first_vertex = 0, vertex_count = 0;  // the vertices captured (vertex arrays)
-        std::vector<uint16_t> indices;                // indexed draws, relative to first_vertex
-        std::vector<Attribute> attributes;            // vertex arrays, captured when drawn
-    };
-    std::vector<Draw> draws;
-    uint32_t draws_reported = 0;
+    std::unordered_map<uint64_t, CachedTexture> textures;
+    std::vector<std::string> said;  // notices given once
 };
 Device* g_device = nullptr;
 
@@ -158,9 +160,12 @@ void mirror_device(rt::Context& c, const Device& d) {
     st(c, kDeviceStorage + kDevFrameBuffers, d.frame_buffers[back]);
     st(c, kDeviceStorage + kDevFrameBuffers + 4, d.frame_buffers[d.renderer->front_index()]);
     st(c, kDeviceStorage + kDevFrameBuffers + 8, n > 2 ? d.frame_buffers[(back + 1) % n] : 0);
-    st(c, kDeviceStorage + kDevRenderTarget, d.frame_buffers[back]);
-    st(c, kDeviceStorage + kDevDepth, d.depth);
     st(c, kDeviceStorage + kDevMultisample, kMultisampleNone);
+    // The multisample type's horizontal and vertical sample factors as
+    // floats (+0x968, +0x96C), as the original's frame-buffer set-up keeps
+    // them: D3D_CommonSetMultiSampleModeAndScale derives the scale from them.
+    st(c, kDeviceStorage + 0x968, std::bit_cast<uint32_t>(float(kMultisampleNone >> 4 & 0xF)));
+    st(c, kDeviceStorage + 0x96C, std::bit_cast<uint32_t>(float(kMultisampleNone & 0xF)));
 }
 
 uint32_t add_ref(rt::Context& c, uint32_t r) {  // D3DResource_AddRef, as the original
@@ -200,8 +205,10 @@ void deliver_frame(Device& d) {
     const uint64_t n = d.renderer->frames_presented();
     if (!d.config.dump_dir.empty()) {
         gfx::Image im = d.renderer->read_front_buffer();
-        for (size_t i = 0; i < im.rgba.size(); i += 4)  // the display's gamma ramp, as the TV gets it
+        for (size_t i = 0; i < im.rgba.size(); i += 4) {  // as the TV gets it: through the gamma ramp, alpha unused
             for (int k = 0; k < 3; ++k) im.rgba[i + k] = d.gamma[k][im.rgba[i + k]];
+            im.rgba[i + 3] = 255;
+        }
         const std::string path = d.config.dump_dir + strf("/frame_%05llu.png", (unsigned long long)n);
         if (!gfx::write_png(path, im)) std::fprintf(stderr, "qilin: can't write %s\n", path.c_str());
     }
@@ -239,6 +246,11 @@ void init_device_state(rt::Context& c) {
     host::call_guest(c, 0x1739F0, {2});  // D3DFVF_XYZ
     for (uint32_t k = 0; k < 0x46; ++k) st(c, 0x184360 + 4 * k, 0);
     st(c, 0x184364, 0x10);
+    // SetRenderTarget(back buffer, depth buffer), which also sets the
+    // multisample scale and the viewport the vertex programs depend on.
+    st(c, kDeviceStorage + kDevRenderTarget, 0);
+    st(c, kDeviceStorage + kDevDepth, 0);
+    host::call_guest(c, 0x174170, {ld(c, kDeviceStorage + kDevFrameBuffers), g_device->depth});
     host::call_guest(c, 0x179FE0, {});
 }
 
@@ -445,16 +457,18 @@ void swap(rt::Context& c) {
     Device& d = device("D3DDevice_Swap");
     const uint32_t flags = arg(c, 0);
     if (flags & ~4u) unmodelled("D3DDevice_Swap", strf("flags %#x", flags));  // D3DSWAP_FINISH (4) only waits
-    if (!d.draws.empty() && d.draws_reported < 3) {
-        ++d.draws_reported;
-        size_t dwords = 0, vertices = 0;
-        for (const auto& dr : d.draws) dwords += dr.inline_data.size(), vertices += dr.vertex_count;
-        std::printf("qilin_run: frame %u: %zu draws (%zu inline dwords, %zu array vertices) not drawn yet\n", d.swaps,
-                    d.draws.size(), dwords, vertices);
-    }
-    d.draws.clear();
+    const uint32_t old_back = d.frame_buffers[d.renderer->back_index()];
     d.renderer->present();
     ++d.swaps;
+    // A render target that was the back buffer becomes the new one (the
+    // device's internal reference moves with it).
+    if (ld(c, kDeviceStorage + kDevRenderTarget) == old_back) {
+        const uint32_t now = d.frame_buffers[d.renderer->back_index()];
+        host::call_guest(c, 0x175970, {now});
+        st(c, old_back + 8, ld(c, kDeviceStorage + kDevFence));
+        host::call_guest(c, 0x175B90, {old_back});
+        st(c, kDeviceStorage + kDevRenderTarget, now);
+    }
     // Wait for the vblank the interval asks for, counted from the last swap's.
     const uint32_t target = std::max(d.vblanks + d.interval, vblanks_elapsed(d) + 1);
     std::this_thread::sleep_until(d.epoch + std::chrono::duration_cast<std::chrono::steady_clock::duration>(
@@ -583,39 +597,442 @@ void consume_dirty_state(rt::Context& c, uint32_t base_vertex) {
         st(c, kDeviceStorage + 0x20, base_vertex);
 }
 
-Device::Draw& record_draw(rt::Context& c, Device& d, const char* fn, uint32_t primitive) {
-    if (primitive < 1 || primitive > 10) unmodelled(fn, strf("primitive type %u", primitive));
-    st(c, kDeviceStorage + 8, ld(c, kDeviceStorage + 8) | 0x800u);
-    auto& draw = d.draws.emplace_back();
-    draw.primitive = primitive;
-    draw.vertex_shader = ld(c, kDeviceStorage + kDevVertexShader + 4);
-    draw.pixel_shader = ld(c, kDeviceStorage + 0x780);
-    return draw;
+void notice_once(Device& d, const std::string& what) {
+    if (std::ranges::find(d.said, what) != d.said.end()) return;
+    d.said.push_back(what);
+    std::printf("qilin_run: D3D: %s isn't drawn yet\n", what.c_str());
 }
 
-void capture_vertex_arrays(rt::Context& c, Device::Draw& draw, const char* fn, uint32_t base, uint32_t first, uint32_t count) {
-    if (ld(c, kDirtyFlags) & 0x40000000u) unmodelled(fn, "a draw from SetVertexShaderInput streams");
-    const uint32_t vs = ld(c, kDeviceStorage + kDevVertexShader);
-    draw.first_vertex = first;
-    draw.vertex_count = count;
-    for (uint32_t slot = 0; slot < 16; ++slot) {
-        const uint32_t a = vs + 0x14 + 16 * slot;
-        const uint32_t stream = ld(c, a), offset = ld(c, a + 4), format = ld(c, a + 8);
-        if (format == 2) continue;
-        const uint32_t bytes = attribute_bytes(format);
-        if (!bytes || stream > 15) unmodelled(fn, strf("vertex attribute %u: format %#x, stream %u", slot, format, stream));
-        const uint32_t entry = 0x1842A0 + 12 * stream;
-        const uint32_t stride = ld(c, entry), vb = ld(c, entry + 8);
-        if (!vb) unmodelled(fn, strf("vertex attribute %u reads stream %u, which has no buffer", slot, stream));
-        const uint32_t at = ld(c, vb + 4) + ld(c, entry + 4) + offset + stride * (base + first);
-        auto& attr = draw.attributes.emplace_back();
-        attr.slot = slot;
-        attr.format = format;
-        attr.bytes = bytes;
-        attr.data.resize(size_t(bytes) * count);
-        for (uint32_t v = 0; v < count; ++v)
-            for (uint32_t b = 0; b < bytes; ++b) attr.data[size_t(v) * bytes + b] = rt::ld8(mem(c), at + stride * v + b, 0);
+// ---- Vertices: each hardware attribute as vec4 floats, NV2A formats
+// converted as the hardware reads them; missing components (0, 0, 0, 1).
+struct Vertices {
+    uint32_t count = 0, mask = 0;
+    std::vector<float> attr[16];
+};
+
+void convert_attribute(const uint8_t* p, uint32_t format, float* out) {
+    const uint32_t type = format & 0xF, size = (format >> 4) & 0xF;
+    out[0] = out[1] = out[2] = 0, out[3] = 1;
+    switch (type) {
+        case 0:  // UB_D3D: a D3DCOLOR (B, G, R, A in memory) reads as R, G, B, A
+            if (size == 4) {
+                out[0] = p[2] / 255.0f, out[1] = p[1] / 255.0f, out[2] = p[0] / 255.0f, out[3] = p[3] / 255.0f;
+                break;
+            }
+            [[fallthrough]];
+        case 4:  // UB_OGL
+            for (uint32_t k = 0; k < size && k < 4; ++k) out[k] = p[k] / 255.0f;
+            break;
+        case 1:  // S1: signed normalized, (2s + 1) / 65535
+            for (uint32_t k = 0; k < size && k < 4; ++k) {
+                int16_t v;
+                std::memcpy(&v, p + 2 * k, 2);
+                out[k] = (2.0f * v + 1.0f) / 65535.0f;
+            }
+            break;
+        case 5:  // S32K: signed, not normalized
+            for (uint32_t k = 0; k < size && k < 4; ++k) {
+                int16_t v;
+                std::memcpy(&v, p + 2 * k, 2);
+                out[k] = float(v);
+            }
+            break;
+        case 2:  // F
+            for (uint32_t k = 0; k < size && k < 4; ++k) std::memcpy(&out[k], p + 4 * k, 4);
+            break;
+        case 6: {  // CMP: 11, 11 and 10 signed bits, normalized
+            uint32_t v;
+            std::memcpy(&v, p, 4);
+            auto sn = [](uint32_t bits, uint32_t n) {
+                const int32_t s = int32_t(bits << (32 - n)) >> (32 - n);
+                return (2.0f * float(s) + 1.0f) / float((1u << n) - 1);
+            };
+            out[0] = sn(v & 0x7FF, 11), out[1] = sn(v >> 11 & 0x7FF, 11), out[2] = sn(v >> 22, 10);
+            break;
+        }
+        default: break;
     }
+}
+
+// The shader object's hardware attributes in order: slot n's {stream, offset, format}.
+struct Slot {
+    uint32_t stream, offset, format, bytes;
+};
+std::array<Slot, 16> slots(rt::Context& c, const char* fn) {
+    const uint32_t vs = ld(c, kDeviceStorage + kDevVertexShader);
+    std::array<Slot, 16> out{};
+    for (uint32_t n = 0; n < 16; ++n) {
+        const uint32_t a = vs + 0x14 + 16 * n;
+        out[n] = {ld(c, a), ld(c, a + 4), ld(c, a + 8), 0};
+        if (out[n].format == 2) continue;
+        out[n].bytes = attribute_bytes(out[n].format);
+        if (!out[n].bytes || out[n].stream > 15)
+            unmodelled(fn, strf("vertex attribute %u: format %#x, stream %u", n, out[n].format, out[n].stream));
+    }
+    return out;
+}
+
+Vertices vertex_arrays(rt::Context& c, const char* fn, uint32_t base, uint32_t first, uint32_t count) {
+    if (ld(c, kDirtyFlags) & 0x40000000u) unmodelled(fn, "a draw from SetVertexShaderInput streams");
+    Vertices v;
+    v.count = count;
+    const auto sl = slots(c, fn);
+    std::vector<uint8_t> buf;
+    for (uint32_t n = 0; n < 16; ++n) {
+        if (!sl[n].bytes) continue;
+        const uint32_t entry = 0x1842A0 + 12 * sl[n].stream;
+        const uint32_t stride = ld(c, entry), vb = ld(c, entry + 8);
+        if (!vb) unmodelled(fn, strf("vertex attribute %u reads stream %u, which has no buffer", n, sl[n].stream));
+        const uint32_t at = ld(c, vb + 4) + ld(c, entry + 4) + sl[n].offset + stride * (base + first);
+        v.mask |= 1u << n;
+        v.attr[n].resize(size_t(count) * 4);
+        buf.resize(sl[n].bytes);
+        for (uint32_t i = 0; i < count; ++i) {
+            for (uint32_t b = 0; b < sl[n].bytes; ++b) buf[b] = rt::ld8(mem(c), at + stride * i + b, 0);
+            convert_attribute(buf.data(), sl[n].format, &v.attr[n][size_t(i) * 4]);
+        }
+    }
+    return v;
+}
+
+// Inline vertices (INLINE_ARRAY): whole vertices, the enabled attributes in
+// hardware order, each its format's size.
+Vertices inline_vertices(rt::Context& c, const char* fn, const std::vector<uint32_t>& dwords) {
+    const auto sl = slots(c, fn);
+    uint32_t stride = 0;
+    for (const Slot& s : sl) stride += s.bytes;
+    if (!stride || stride % 4) unmodelled(fn, strf("inline vertices of %u bytes", stride));
+    Vertices v;
+    v.count = uint32_t(dwords.size() * 4 / stride);
+    const auto* bytes = reinterpret_cast<const uint8_t*>(dwords.data());
+    for (uint32_t n = 0, off = 0; n < 16; ++n) {
+        if (!sl[n].bytes) continue;
+        v.mask |= 1u << n;
+        v.attr[n].resize(size_t(v.count) * 4);
+        for (uint32_t i = 0; i < v.count; ++i) convert_attribute(bytes + size_t(i) * stride + off, sl[n].format, &v.attr[n][size_t(i) * 4]);
+        off += sl[n].bytes;
+    }
+    return v;
+}
+
+// NV2A primitives (D3DPRIMITIVETYPE has the same numbers) as Vulkan's:
+// loops, fans, quads, quad strips and polygons become indexed lists.
+gfx::Primitive convert_primitive(const char* fn, uint32_t prim, std::vector<uint32_t>& seq, bool& indexed) {
+    std::vector<uint32_t> out;
+    const size_t n = seq.size();
+    switch (prim) {
+        case 1: return gfx::Primitive::Points;
+        case 2: return gfx::Primitive::Lines;
+        case 4: return gfx::Primitive::LineStrip;
+        case 5: return gfx::Primitive::Triangles;
+        case 6: return gfx::Primitive::TriangleStrip;
+        case 3:
+            for (size_t i = 0; i < n && n >= 2; ++i) out.push_back(seq[i]), out.push_back(seq[(i + 1) % n]);
+            seq = std::move(out);
+            indexed = true;
+            return gfx::Primitive::Lines;
+        case 7: case 10:
+            for (size_t i = 1; i + 1 < n; ++i) out.insert(out.end(), {seq[0], seq[i], seq[i + 1]});
+            break;
+        case 8:
+            for (size_t i = 0; i + 3 < n; i += 4) out.insert(out.end(), {seq[i], seq[i + 1], seq[i + 2], seq[i], seq[i + 2], seq[i + 3]});
+            break;
+        case 9:
+            for (size_t i = 0; i + 3 < n; i += 2)
+                out.insert(out.end(), {seq[i], seq[i + 1], seq[i + 3], seq[i], seq[i + 3], seq[i + 2]});
+            break;
+        default: unmodelled(fn, strf("primitive type %u", prim));
+    }
+    seq = std::move(out);
+    indexed = true;
+    return gfx::Primitive::Triangles;
+}
+
+uint64_t hash_bytes(const uint8_t* p, size_t n, uint64_t h = 0x9E3779B97F4A7C15ull) {
+    size_t i = 0;
+    for (; i + 8 <= n; i += 8) {
+        uint64_t w;
+        std::memcpy(&w, p + i, 8);
+        h = (h ^ w) * 0xFF51AFD7ED558CCDull;
+        h ^= h >> 32;
+    }
+    for (; i < n; ++i) h = (h ^ p[i]) * 0x100000001B3ull;
+    return h ^ n;
+}
+
+void color_to_float(uint32_t argb, float* out) {
+    out[0] = float(argb >> 16 & 0xFF) / 255.0f, out[1] = float(argb >> 8 & 0xFF) / 255.0f, out[2] = float(argb & 0xFF) / 255.0f;
+    out[3] = float(argb >> 24) / 255.0f;
+}
+
+gfx::BlendFactor blend_factor(const char* fn, uint32_t v) {
+    switch (v) {
+        case 0: return gfx::BlendFactor::Zero;
+        case 1: return gfx::BlendFactor::One;
+        case 0x300: return gfx::BlendFactor::SrcColor;
+        case 0x301: return gfx::BlendFactor::OneMinusSrcColor;
+        case 0x302: return gfx::BlendFactor::SrcAlpha;
+        case 0x303: return gfx::BlendFactor::OneMinusSrcAlpha;
+        case 0x304: return gfx::BlendFactor::DstAlpha;
+        case 0x305: return gfx::BlendFactor::OneMinusDstAlpha;
+        case 0x306: return gfx::BlendFactor::DstColor;
+        case 0x307: return gfx::BlendFactor::OneMinusDstColor;
+        case 0x308: return gfx::BlendFactor::SrcAlphaSaturate;
+        case 0x8001: return gfx::BlendFactor::ConstantColor;
+        case 0x8002: return gfx::BlendFactor::OneMinusConstantColor;
+        case 0x8003: return gfx::BlendFactor::ConstantAlpha;
+        case 0x8004: return gfx::BlendFactor::OneMinusConstantAlpha;
+        default: unmodelled(fn, strf("blend factor %#x", v));
+    }
+}
+gfx::BlendOp blend_op(const char* fn, uint32_t v) {
+    switch (v) {
+        case 0x8006: return gfx::BlendOp::Add;
+        case 0x800A: return gfx::BlendOp::Subtract;
+        case 0x800B: return gfx::BlendOp::ReverseSubtract;
+        case 0x8007: return gfx::BlendOp::Min;
+        case 0x8008: return gfx::BlendOp::Max;
+        default: unmodelled(fn, strf("blend operation %#x", v));
+    }
+}
+gfx::Compare compare(const char* fn, uint32_t v) {
+    if (v < 0x200 || v > 0x207) unmodelled(fn, strf("compare function %#x", v));
+    return gfx::Compare(v - 0x200);
+}
+gfx::StencilOp stencil_op(const char* fn, uint32_t v) {
+    switch (v) {
+        case 0x1E00: return gfx::StencilOp::Keep;
+        case 0: return gfx::StencilOp::Zero;
+        case 0x1E01: return gfx::StencilOp::Replace;
+        case 0x1E02: return gfx::StencilOp::IncrementClamp;
+        case 0x1E03: return gfx::StencilOp::DecrementClamp;
+        case 0x150A: return gfx::StencilOp::Invert;
+        case 0x8507: return gfx::StencilOp::IncrementWrap;
+        case 0x8508: return gfx::StencilOp::DecrementWrap;
+        default: unmodelled(fn, strf("stencil operation %#x", v));
+    }
+}
+
+// D3D's render states this needs (XDK 5659 numbering).
+enum Rs : uint32_t {
+    kRsPsConstant0 = 10, kRsPsConstant1 = 18, kRsPsAlphaOutputs = 26, kRsPsRgbInputs = 34, kRsPsCompareMode = 42,
+    kRsPsFinalC0 = 43, kRsPsFinalC1 = 44, kRsPsRgbOutputs = 45, kRsPsCombinerCount = 53, kRsPsDotMapping = 55, kRsPsInputTexture = 56,
+    kRsZFunc = 57, kRsAlphaFunc = 58, kRsAlphaBlendEnable = 59, kRsAlphaTestEnable = 60, kRsAlphaRef = 61, kRsSrcBlend = 62,
+    kRsDestBlend = 63, kRsZWriteEnable = 64, kRsColorWriteEnable = 67, kRsStencilZFail = 68, kRsStencilPass = 69, kRsStencilFunc = 70,
+    kRsStencilRef = 71, kRsStencilMask = 72, kRsStencilWriteMask = 73, kRsBlendOp = 74, kRsBlendColor = 75,
+    kRsPsTextureModes = 136, kRsFogColor = 138, kRsZEnable = 143, kRsStencilEnable = 144, kRsStencilFail = 145, kRsCullMode = 147,
+};
+
+// A texture stage's texture, decoded and uploaded once (and again when its
+// texels change; they're compared once a frame).
+const Device::CachedTexture* stage_texture(rt::Context& c, Device& d, const char* fn, uint32_t tex) {
+    const uint32_t format = ld(c, tex + 12), size = ld(c, tex + 16), data = ld(c, tex + 4);
+    gfx::TextureShape shape;
+    std::string why;
+    if (!gfx::texture_shape(format, size, &shape, &why)) unmodelled(fn, why);
+    if (size_t(data) + shape.bytes > c.mem_size) unmodelled(fn, strf("a texture past the end of memory (%08X)", data));
+    const uint64_t key = uint64_t(data) << 32 ^ uint64_t(format) * 0x9E3779B1u ^ size;
+    Device::CachedTexture& e = d.textures[key];
+    if (e.id && e.checked == d.swaps) return &e;
+    const uint8_t* texels = c.mem + data;
+    const uint64_t h = hash_bytes(texels, shape.bytes);
+    if (!e.id || e.content != h) {
+        if (e.id) d.renderer->destroy_texture(e.id);
+        const gfx::TextureData t = gfx::decode_texture(shape, texels);
+        e.id = d.renderer->create_texture(t);
+        e.content = h;
+        e.dims = t.dims(), e.linear = t.linear, e.width = t.width, e.height = t.height, e.depth = t.depth;
+    }
+    e.checked = d.swaps;
+    return &e;
+}
+
+gfx::SamplerDesc stage_sampler(rt::Context& c, const char* fn, uint32_t stage, const Device::CachedTexture& t, uint32_t levels) {
+    auto ts = [&](uint32_t i) { return ld(c, 0x181970 + 4 * (32 * stage + i)); };
+    auto address = [&](uint32_t v) {
+        switch (v) {
+            case 1: return gfx::Address::Wrap;
+            case 2: return gfx::Address::Mirror;
+            case 3: case 5: return gfx::Address::Clamp;
+            case 4: return gfx::Address::Border;
+            default: unmodelled(fn, strf("texture address mode %u", v));
+        }
+    };
+    auto filter = [](uint32_t v) { return v >= 2 ? gfx::Filter::Linear : gfx::Filter::Nearest; };
+    gfx::SamplerDesc s;
+    s.u = address(ts(0)), s.v = address(ts(1)), s.w = address(ts(2));
+    if (t.linear) s.u = s.v = s.w = gfx::Address::Clamp;  // the hardware only clamps linear textures
+    s.mag = filter(ts(3)), s.min = filter(ts(4));
+    s.mipmaps = ts(5) != 0 && levels > 1;
+    s.mip = ts(5) >= 2 ? gfx::Filter::Linear : gfx::Filter::Nearest;
+    s.max_level = levels ? levels - 1 : 0;
+    s.lod_bias = std::bit_cast<float>(ts(6));
+    s.border = ts(29);
+    return s;
+}
+
+// The derived state the original computes for the GPU, at draw time: the
+// viewport's screen-space scale and offset (0x1710E0, which the vertex
+// program reads as c-38 and c-37), from the viewport, the multisample
+// scale, the screen-space offset and the depth scale.
+void viewport_constants(rt::Context& c, float scale[4], float offset[4]) {
+    const uint32_t dev = kDeviceStorage;
+    auto f = [&](uint32_t a) { return std::bit_cast<float>(ld(c, a)); };
+    auto i2f = [&](uint32_t a) { return float(ld(c, a)); };  // fild of an unsigned field
+    const float sx = f(dev + 0x958), sy = f(dev + 0x95C), zscale = f(dev + 0x944);
+    float ox = i2f(dev + 0xED0) * sx + f(dev + 0xEE8);
+    float oy = i2f(dev + 0xED4) * sy + f(dev + 0xEEC);
+    if ((ld(c, dev + 8) & 0x8000) && ld(c, 0x181DD0)) ox -= 0.5f, oy -= 0.5f;
+    const float hw = i2f(dev + 0xED8) * sx * 0.5f, hh = i2f(dev + 0xEDC) * sy * -0.5f;
+    const float minz = f(dev + 0xEE0), maxz = f(dev + 0xEE4);
+    scale[0] = hw, scale[1] = hh, scale[2] = (maxz - minz) * zscale, scale[3] = 0;
+    offset[0] = hw + ox, offset[1] = -hh + oy, offset[2] = minz * zscale, offset[3] = 0;
+}
+
+// A draw, as the original's state flush leaves the GPU, into the renderer.
+void issue_draw(rt::Context& c, Device& d, const char* fn, uint32_t prim, Vertices&& v, std::vector<uint32_t> seq, bool indexed) {
+    st(c, kDeviceStorage + 8, ld(c, kDeviceStorage + 8) | 0x800u);
+    if (!v.count) return;
+    const uint32_t dev = kDeviceStorage;
+    auto rs = [&](uint32_t i) { return ld(c, kRenderStateTable + 4 * i); };
+
+    // Only the back buffer is drawn to yet.
+    const uint32_t target = ld(c, dev + kDevRenderTarget);
+    if (target != d.frame_buffers[d.renderer->back_index()]) return notice_once(d, "drawing into a render target other than the back buffer");
+
+    gfx::DrawCmd cmd;
+    // The vertex program at the selected slot of the GPU's program memory.
+    const uint32_t vs_flags = ld(c, ld(c, dev + kDevVertexShader) + 4);
+    if (!(vs_flags & 0x10)) unmodelled(fn, "a draw with the fixed-function vertex pipeline");
+    const uint32_t start = ld(c, dev + kDevVertexShader + 8);
+    if (start >= 136) unmodelled(fn, strf("a vertex program at slot %u", start));
+    std::vector<uint32_t> words{0x2078u};
+    for (uint32_t i = start; i < 136; ++i) {
+        words.insert(words.end(), d.vs_program[i], d.vs_program[i] + 4);
+        if (d.vs_program[i][3] & 1) break;  // FINAL
+    }
+    words[0] |= uint32_t((words.size() - 1) / 4) << 16;  // the instruction count, as the header has it
+    uint64_t vs_key = hash_bytes(reinterpret_cast<const uint8_t*>(words.data()), words.size() * 4) ^ (uint64_t(v.mask) << 40) ^ 1;
+    auto& vs_code = d.shaders[vs_key];
+    if (vs_code.empty()) {
+        std::string error;
+        const auto prog = gfx::vsh::decode(words.data(), words.size(), &error);
+        if (!prog) unmodelled(fn, "a vertex program that doesn't decode (" + error + ")");
+        try {
+            vs_code = gfx::nv2a::vertex_program(*prog, v.mask);
+        } catch (const std::exception& e) {
+            unmodelled(fn, e.what());
+        }
+    }
+
+    // The register combiners as the render states hold them.
+    if (!ld(c, dev + 0x780)) unmodelled(fn, "a draw with the fixed-function pixel pipeline (texture stage states)");
+    gfx::nv2a::CombinerSetup cs{};
+    for (uint32_t i = 0; i < 8; ++i) {
+        cs.alpha_inputs[i] = rs(i);
+        cs.alpha_outputs[i] = rs(kRsPsAlphaOutputs + i);
+        cs.rgb_inputs[i] = rs(kRsPsRgbInputs + i);
+        cs.rgb_outputs[i] = rs(kRsPsRgbOutputs + i);
+    }
+    cs.final_abcd = rs(8), cs.final_efgh = rs(9);
+    cs.combiner_count = rs(kRsPsCombinerCount);
+    cs.texture_modes = rs(kRsPsTextureModes);
+    cs.input_texture = rs(kRsPsInputTexture), cs.dot_mapping = rs(kRsPsDotMapping), cs.compare_mode = rs(kRsPsCompareMode);
+    cs.alpha_func = rs(kRsAlphaTestEnable) ? rs(kRsAlphaFunc) : 0;
+
+    std::vector<float> fsu(gfx::nv2a::kFsUniformVec4s * 4, 0.0f);
+    for (uint32_t stage = 0; stage < 4; ++stage) {
+        fsu[(gfx::nv2a::kFsTexScale + stage) * 4 + 0] = fsu[(gfx::nv2a::kFsTexScale + stage) * 4 + 1] = 1;
+        fsu[(gfx::nv2a::kFsTexScale + stage) * 4 + 2] = 1;
+        const uint32_t mode = cs.texture_modes >> (5 * stage) & 0x1F;
+        const uint32_t tex = ld(c, dev + 0xF78 + 4 * stage);
+        if (!tex || !(mode == 1 || mode == 2 || mode == 3)) continue;
+        const Device::CachedTexture* t = stage_texture(c, d, fn, tex);
+        cs.texture_dims[stage] = uint8_t(t->dims);
+        cmd.textures[stage] = t->id;
+        cmd.samplers[stage] = stage_sampler(c, fn, stage, *t, std::max(1u, ld(c, tex + 12) >> 16 & 0xF));
+        if (t->linear) {  // the hardware addresses linear textures in texels
+            fsu[(gfx::nv2a::kFsTexScale + stage) * 4 + 0] = 1.0f / float(t->width);
+            fsu[(gfx::nv2a::kFsTexScale + stage) * 4 + 1] = 1.0f / float(t->height);
+            fsu[(gfx::nv2a::kFsTexScale + stage) * 4 + 2] = 1.0f / float(t->depth);
+        }
+    }
+    if (const char* why = gfx::nv2a::combiners_unsupported(cs)) unmodelled(fn, why);
+    const uint64_t fs_key = cs.hash() ^ 2;
+    auto& fs_code = d.shaders[fs_key];
+    if (fs_code.empty()) fs_code = gfx::nv2a::combiners(cs);
+    for (uint32_t i = 0; i < 8; ++i) {
+        color_to_float(rs(kRsPsConstant0 + i), &fsu[(gfx::nv2a::kFsC0 + i) * 4]);
+        color_to_float(rs(kRsPsConstant1 + i), &fsu[(gfx::nv2a::kFsC1 + i) * 4]);
+    }
+    color_to_float(rs(kRsPsFinalC0), &fsu[gfx::nv2a::kFsFinalC0 * 4]);
+    color_to_float(rs(kRsPsFinalC1), &fsu[gfx::nv2a::kFsFinalC1 * 4]);
+    color_to_float(rs(kRsFogColor), &fsu[gfx::nv2a::kFsFogColor * 4]);
+    fsu[gfx::nv2a::kFsAlphaRef * 4] = float(rs(kRsAlphaRef) & 0xFF);
+
+    // Vertex constants, with the viewport's and the renderer's own.
+    std::vector<float> vsu(gfx::nv2a::kVsUniformVec4s * 4, 0.0f);
+    std::memcpy(vsu.data(), d.vs_constants, sizeof d.vs_constants);
+    viewport_constants(c, &vsu[58 * 4], &vsu[59 * 4]);  // c-38, c-37
+    const float zscale = std::bit_cast<float>(ld(c, dev + 0x944));
+    vsu[gfx::nv2a::kVsScreen * 4 + 0] = 2.0f / float(d.width);
+    vsu[gfx::nv2a::kVsScreen * 4 + 1] = 2.0f / float(d.height);
+    vsu[gfx::nv2a::kVsScreen * 4 + 2] = zscale > 0 ? 1.0f / zscale : 1.0f;
+
+    // Fixed-function state.
+    cmd.blend = rs(kRsAlphaBlendEnable);
+    if (cmd.blend) {
+        cmd.src_color = cmd.src_alpha = blend_factor(fn, rs(kRsSrcBlend));
+        cmd.dst_color = cmd.dst_alpha = blend_factor(fn, rs(kRsDestBlend));
+        cmd.color_op = cmd.alpha_op = blend_op(fn, rs(kRsBlendOp));
+    }
+    color_to_float(rs(kRsBlendColor), cmd.blend_constant);
+    const uint32_t cw = rs(kRsColorWriteEnable);
+    cmd.write_mask = uint8_t((cw >> 16 & 1) | (cw >> 8 & 1) << 1 | (cw & 1) << 2 | (cw >> 24 & 1) << 3);
+    const uint32_t zenable = rs(kRsZEnable);
+    if (zenable == 2) notice_once(d, "w-buffering (D3DZB_USEW, drawn as z)");
+    cmd.depth_test = zenable != 0;
+    cmd.depth_write = zenable != 0 && rs(kRsZWriteEnable);
+    cmd.depth_compare = compare(fn, rs(kRsZFunc));
+    cmd.stencil_test = rs(kRsStencilEnable);
+    if (cmd.stencil_test) {
+        cmd.stencil_compare = compare(fn, rs(kRsStencilFunc));
+        cmd.stencil_fail = stencil_op(fn, rs(kRsStencilFail));
+        cmd.stencil_depth_fail = stencil_op(fn, rs(kRsStencilZFail));
+        cmd.stencil_pass = stencil_op(fn, rs(kRsStencilPass));
+        cmd.stencil_ref = uint8_t(rs(kRsStencilRef));
+        cmd.stencil_read_mask = uint8_t(rs(kRsStencilMask));
+        cmd.stencil_write_mask = uint8_t(rs(kRsStencilWriteMask));
+    }
+    const uint32_t cull = rs(kRsCullMode);
+    // The original sends CULLMODE to the GPU as GL's front/back against
+    // FRONTFACE, which comes to culling the winding CULLMODE names in GL's
+    // terms (y up); the screen here runs y down, so that winding is the
+    // other one on screen: D3DCULL_CW (0x900) culls what looks
+    // counter-clockwise, the faces turned away in a D3D scene.
+    cmd.cull = cull == 0x900 ? gfx::Cull::CounterClockwise : cull == 0x901 ? gfx::Cull::Clockwise : gfx::Cull::None;
+    // The viewport's rectangle bounds what's drawn.
+    cmd.scissor.x = int32_t(ld(c, dev + kDevViewport));
+    cmd.scissor.y = int32_t(ld(c, dev + kDevViewport + 4));
+    cmd.scissor.w = ld(c, dev + kDevViewport + 8);
+    cmd.scissor.h = ld(c, dev + kDevViewport + 12);
+
+    cmd.primitive = convert_primitive(fn, prim, seq, indexed);
+    cmd.vs_key = vs_key, cmd.fs_key = fs_key, cmd.vs_code = &vs_code, cmd.fs_code = &fs_code;
+    cmd.inputs = v.mask;
+    cmd.vertex_count = v.count;
+    for (uint32_t n = 0; n < 16; ++n)
+        if (v.mask & (1u << n)) cmd.attributes[n] = v.attr[n].data();
+    if (indexed) cmd.indices = seq.data(), cmd.index_count = uint32_t(seq.size());
+    cmd.vs_uniforms = vsu.data();
+    cmd.fs_uniforms = fsu.data();
+    d.renderer->draw(cmd);
+}
+
+std::vector<uint32_t> identity_sequence(uint32_t n) {
+    std::vector<uint32_t> s(n);
+    for (uint32_t i = 0; i < n; ++i) s[i] = i;
+    return s;
 }
 
 // VOID D3DDevice_DrawVertices(D3DPRIMITIVETYPE, UINT StartVertex, UINT VertexCount)
@@ -624,8 +1041,7 @@ void draw_vertices(rt::Context& c) {
     Device& d = device(fn);
     const uint32_t primitive = arg(c, 0), start = arg(c, 1), count = arg(c, 2);
     consume_dirty_state(c, 0);
-    auto& draw = record_draw(c, d, fn, primitive);
-    capture_vertex_arrays(c, draw, fn, 0, start, count);
+    issue_draw(c, d, fn, primitive, vertex_arrays(c, fn, 0, start, count), identity_sequence(count), false);
     ret(c, c.eax, 12);
 }
 
@@ -637,18 +1053,16 @@ void draw_indexed_vertices(rt::Context& c) {
     const uint32_t primitive = arg(c, 0), count = arg(c, 1), index_data = arg(c, 2);
     const uint32_t base = ld(c, kDeviceStorage + 0x1C);
     consume_dirty_state(c, base);
-    auto& draw = record_draw(c, d, fn, primitive);
-    std::vector<uint16_t> indices(count);
+    std::vector<uint32_t> indices(count);
     uint32_t lo = 0xFFFF, hi = 0;
     for (uint32_t k = 0; k < count; ++k) {
-        indices[k] = uint16_t(rt::ld16(mem(c), index_data + 2 * k, 0));
-        lo = std::min<uint32_t>(lo, indices[k]);
-        hi = std::max<uint32_t>(hi, indices[k]);
+        indices[k] = rt::ld16(mem(c), index_data + 2 * k, 0);
+        lo = std::min(lo, indices[k]);
+        hi = std::max(hi, indices[k]);
     }
     if (!count) lo = hi = 0;
-    for (auto& i : indices) i = uint16_t(i - lo);
-    draw.indices = std::move(indices);
-    capture_vertex_arrays(c, draw, fn, base, lo, count ? hi - lo + 1 : 0);
+    for (auto& i : indices) i -= lo;
+    issue_draw(c, d, fn, primitive, vertex_arrays(c, fn, base, lo, count ? hi - lo + 1 : 0), std::move(indices), true);
     ret(c, c.eax, 12);
 }
 
@@ -677,7 +1091,8 @@ void begin_push(rt::Context& c) {
 
 void decode_push(rt::Context& c, Device& d, uint32_t from, uint32_t to) {
     const char* fn = "D3DDevice_EndPush";
-    Device::Draw* open = nullptr;
+    uint32_t open = 0;  // the primitive between SET_BEGIN_END's
+    std::vector<uint32_t> inline_data;
     for (uint32_t at = from; at < to;) {
         const uint32_t header = ld(c, at);
         at += 4;
@@ -690,14 +1105,18 @@ void decode_push(rt::Context& c, Device& d, uint32_t from, uint32_t to) {
             const uint32_t primitive = ld(c, at);
             if (primitive) {
                 if (open) unmodelled(fn, "SET_BEGIN_END inside another");
-                open = &record_draw(c, d, fn, primitive);
+                open = primitive;
+                inline_data.clear();
             } else {
                 if (!open) unmodelled(fn, "SET_BEGIN_END(END) without a begin");
-                open = nullptr;
+                Vertices v = inline_vertices(c, fn, inline_data);
+                const uint32_t n = v.count;
+                issue_draw(c, d, fn, open, std::move(v), identity_sequence(n), false);
+                open = 0;
             }
         } else if (method == kNv097InlineArray && (same_method || count == 1)) {
             if (!open) unmodelled(fn, "INLINE_ARRAY outside SET_BEGIN_END");
-            for (uint32_t k = 0; k < count; ++k) open->inline_data.push_back(ld(c, at + 4 * k));
+            for (uint32_t k = 0; k < count; ++k) inline_data.push_back(ld(c, at + 4 * k));
         } else {
             unmodelled(fn, strf("NV2A method %04X x%u%s", method, count, same_method ? " (non-incrementing)" : ""));
         }
@@ -830,7 +1249,6 @@ void set_transform(rt::Context& c) {
 // viewport's dirty bit set. The fog, depth and projection values the
 // original then derives are the renderer's to compute; the one the game can
 // read back (GetProjectionViewportMatrix) stops the runtime until it is.
-constexpr uint32_t kDevViewport = 0xED0;
 // A surface's width and height: from Size for linear surfaces, else from
 // the log2 sizes in Format (swizzled), as D3D reads them.
 std::pair<uint32_t, uint32_t> surface_size(const rt::Context& c, uint32_t surf) {
@@ -1042,14 +1460,14 @@ void set_vs_constant4(rt::Context& c) {
     load_vs_constants(c, "D3DDevice_SetVertexShaderConstant4", c.ecx, c.edx, 16, true);
     ret(c, c.eax, 0);
 }
-// ... and the count of registers on the stack.
+// ... and the number of dwords (4 a register) on the stack.
 void set_vs_constant_not_inline(rt::Context& c) {
     const bool recording = rt::ld8(mem(c), kDeviceStorage + 8, 0) & 0x10;
-    load_vs_constants(c, "D3DDevice_SetVertexShaderConstantNotInline", c.ecx, c.edx, 4 * arg(c, 0), !recording);
+    load_vs_constants(c, "D3DDevice_SetVertexShaderConstantNotInline", c.ecx, c.edx, arg(c, 0), !recording);
     ret(c, c.eax, 4);
 }
 void set_vs_constant_not_inline_fast(rt::Context& c) {
-    load_vs_constants(c, "D3DDevice_SetVertexShaderConstantNotInlineFast", c.ecx, c.edx, 4 * arg(c, 0), false);
+    load_vs_constants(c, "D3DDevice_SetVertexShaderConstantNotInlineFast", c.ecx, c.edx, arg(c, 0), false);
     ret(c, c.eax, 4);
 }
 

@@ -11,6 +11,23 @@ Each release is a git tag (`vX.Y.Z`) with a matching GitHub release. The version
 
 ## [Unreleased]
 
+## [0.22.0] - 2026-11-18
+The game draws. The attract sequence renders on Vulkan: the candle, the book opening, the "Press START" text and its effects.
+
+### Added
+- **A SPIR-V builder** (`gfx/spirv.*`): the renderer makes its shaders itself, with no shader compiler to build or ship.
+- **NV2A vertex programs as SPIR-V** (`gfx/nv2a_vs.cpp`): every MAC and ILU operation, swizzles, negation, write masks, `a0.x`-relative constants, outputs clamped as the hardware does; screen space (what the program computes, D3D's viewport transform included) to clip space.
+- **The register combiners as SPIR-V** (`gfx/nv2a_ps.cpp`): texture stages (PROJECT2D, PROJECT3D, CUBEMAP, PASSTHRU, CLIPPLANE), up to eight general combiner stages with every input and output mapping, dot products, muxes and blue-to-alpha, the final combiner, the alpha test. Other texture modes stop the runtime.
+- **Textures** (`gfx/texture.*`): swizzled, linear and DXT1/3/5 formats, with mip levels, cube faces and volumes, decoded to RGBA8; cached by header and address and re-uploaded when their texels change.
+- **The renderer draws:** pipelines (cached), dynamic depth, stencil, cull and scissor state, a ring buffer for each submission's vertices, indices and uniforms, samplers. Draws issue as the game makes them, in order with clears. Quads, fans, loops and polygons become indexed lists. Clean under the Vulkan validation layer.
+- **Derived GPU state at draw time:** the viewport's screen-space scale and offset (as D3D computes them, read by the programs as c-38 and c-37), blend, depth, stencil, cull and colour-write state from D3D's render states, constants packed by the combiners.
+- **Tests:** generated shaders checked with `spirv-val`'s rules (both validate), a draw through a generated vertex program and combiner read back, texture creation, swizzling.
+
+### Fixed
+- **`SetVertexShaderConstantNotInline(Fast)` take a count of dwords,** not registers: four times too much was read, filling later constants with whatever followed.
+- **The device's initialisation sets its render target** with `SetRenderTarget`, as the original, so the multisample scale (from the multisample type's factors) and the viewport derived from it are set; `Swap` moves a back-buffer render target to the new back buffer.
+- **Frame dumps are opaque,** as a TV shows them.
+
 ## [0.21.0] - 2026-11-18
 Bink is lifted, and the game runs its attract sequence: about 1,100 frames in two minutes, loading movies and bundles from the disc as it goes. Its draws are still recorded, not drawn.
 
