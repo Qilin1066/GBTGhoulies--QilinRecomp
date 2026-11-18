@@ -11,6 +11,16 @@ Each release is a git tag (`vX.Y.Z`) with a matching GitHub release. The version
 
 ## [Unreleased]
 
+## [0.24.0] - 2026-11-18
+The game takes input: past "Press START" to its save-slot menu, its on-screen keyboard and a signed save.
+
+### Added
+- **Controllers through SDL3** (`platform/input.*`, `host/xinput.cpp`, `docs/input.md`): XInput's ports over SDL's gamepads (any controller SDL knows, USB or Bluetooth), mapped onto the Xbox controller's layout (Black and White on the shoulder buttons); `XGetDevices`, `XGetDeviceChanges`, `XInputOpen`, `XInputClose`, `XInputGetState`, `XInputSetState` (rumble). Controllers take the lowest free port and keep it. The keyboard is controller 1, merged with the controller there or on its own.
+- **`D3DDevice_CopyRects`:** the game copies its frame into textures (a turning page shows the screen it turns from). A frame buffer is read back from the GPU; the destination is written in guest memory in its own layout.
+- **Immediate mode:** `Begin`, `End` and `SetVertexData2f`, `4f` and `Color`, as the GPU's attribute registers: a vertex at each position write, drawn at `End`. A register written outside `Begin`/`End` is the constant value of that attribute for later draws without it, as on the NV2A.
+- **The fixed-function vertex pipeline as a generated NV2A program** (World × View × Projection, colours and texture coordinates passed through), translated like the game's own programs; **the fixed-function pixel pipeline as register-combiner settings** (select, modulate, add). What isn't modelled of either stops the runtime with what it is.
+- **The kernel's SHA-1 and HMAC** (`XcSHAInit`, `XcSHAUpdate`, `XcSHAFinal`, `XcHMAC`), which XAPI signs saves with. Tested against the FIPS 180 and RFC 2202 vectors.
+
 ## [0.23.0] - 2026-11-18
 The game is shown in a window.
 

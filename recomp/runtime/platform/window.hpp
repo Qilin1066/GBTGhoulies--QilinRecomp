@@ -16,6 +16,8 @@ struct SDL_Window;
 
 namespace qilin::platform {
 
+class Input;
+
 class Window {
 public:
     // A window for a picture of width × height, at the largest whole
@@ -37,8 +39,9 @@ public:
     bool minimized() const;
 
     // Handles what happened since the last call: closing the window asks the
-    // runtime to stop (`quit_requested`), F11 and Alt+Enter switch fullscreen.
-    void pump();
+    // runtime to stop (`quit_requested`), F11 and Alt+Enter switch fullscreen;
+    // every event goes on to `input` too, if given (controllers coming and going).
+    void pump(Input* input = nullptr);
     bool quit_requested() const { return quit_; }
 
 private:

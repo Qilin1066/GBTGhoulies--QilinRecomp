@@ -29,6 +29,7 @@
 #include <optional>
 #include <string>
 #include <thread>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -99,6 +100,12 @@ struct Device {
     uint32_t ps_constant0[3] = {};
     // The game's own push-buffer writes (BeginPush/EndPush): a guest buffer.
     uint32_t push = 0, push_dwords = 0, push_begun = 0;
+    // Immediate mode (Begin, SetVertexData*, End): the GPU's attribute
+    // registers, which ones were ever written, and the vertices since Begin.
+    uint32_t immediate = 0;  // the primitive between Begin and End, 0 outside
+    float attribute_values[16][4] = {};
+    uint32_t attributes_written = 0;
+    std::vector<float> immediate_vertices;  // 16 vec4s a vertex
     // Draws decoded since the last Swap, until the renderer draws them.
     // Shaders made so far, by key, and textures uploaded, by their header and address.
     std::unordered_map<uint64_t, std::vector<uint32_t>> shaders;
@@ -487,7 +494,7 @@ void swap(rt::Context& c) {
     run_vblanks(c, d, target, true);
     deliver_frame(d);
     if (platform::Window* w = d.config.window) {
-        w->pump();
+        w->pump(d.config.input);
         if (w->quit_requested()) {
             std::fflush(stderr);
             std::printf("qilin_run: the window was closed after %u frames\n", d.swaps);
@@ -496,6 +503,97 @@ void swap(rt::Context& c) {
         }
     }
     ret(c, d.swaps, 4);
+}
+
+// ------------------------------------------------- copies between surfaces
+std::pair<uint32_t, uint32_t> surface_size(const rt::Context& c, uint32_t surf);
+
+// A 32-bit surface's pixels as A8R8G8B8 words, row by row, with its shape.
+// Frame buffers are the renderer's images (read back from the GPU); any
+// other surface is read from guest memory, swizzled or linear as its format says.
+struct SurfacePixels {
+    uint32_t width = 0, height = 0;
+    bool linear = false;
+    uint32_t pitch = 0;  // bytes per row, linear surfaces
+    uint32_t data = 0;   // guest address of the pixels
+    int frame_buffer = -1;
+};
+bool is_32bit(uint32_t fmt) { return fmt == kFmtA8R8G8B8 || fmt == kFmtX8R8G8B8 || fmt == kFmtLinA8R8G8B8 || fmt == kFmtLinX8R8G8B8; }
+
+SurfacePixels surface_pixels(const rt::Context& c, const Device& d, const char* fn, uint32_t surf) {
+    SurfacePixels p;
+    const uint32_t format = ld(c, surf + 12), fmt = (format >> 8) & 0xFF, size = ld(c, surf + 16);
+    if (!is_32bit(fmt)) unmodelled(fn, strf("a surface of format %#x (only 32-bit A8R8G8B8 and X8R8G8B8 are)", fmt));
+    std::tie(p.width, p.height) = surface_size(c, surf);
+    p.linear = fmt == kFmtLinA8R8G8B8 || fmt == kFmtLinX8R8G8B8;
+    if (p.linear != (size != 0)) unmodelled(fn, "a surface whose Size word doesn't match its format");
+    p.pitch = p.linear ? ((size >> 24) + 1) * 64 : p.width * 4;
+    p.data = ld(c, surf + 4);
+    for (size_t i = 0; i < d.frame_buffers.size(); ++i)
+        if (d.frame_buffers[i] == surf) p.frame_buffer = int(i);
+    return p;
+}
+
+uint32_t pixel_offset(const SurfacePixels& p, uint32_t x, uint32_t y) {
+    return p.linear ? y * p.pitch + x * 4 : gfx::swizzle_offset(x, y, 0, p.width, p.height, 1) * 4;
+}
+
+// HRESULT D3DDevice_CopyRects(IDirect3DSurface8* pSourceSurface, CONST RECT*
+//     pSourceRectsArray, UINT cRects, IDirect3DSurface8* pDestinationSurface,
+//     CONST POINT* pDestPointsArray): copies rectangles of pixels, unscaled,
+// between surfaces of one format (no rectangles: the whole source at 0, 0;
+// no points: each rectangle to the same place). The game copies the frame
+// it has drawn into textures this way (the book's pages show the screen
+// they turn from). A frame buffer as the source is read back from the GPU;
+// the destination is written in guest memory, where the texture is decoded
+// from when it's next drawn. A frame buffer as the destination stops the runtime.
+void copy_rects(rt::Context& c) {
+    static constexpr const char* fn = "D3DDevice_CopyRects";
+    Device& d = device(fn);
+    const uint32_t src = arg(c, 0), rects = arg(c, 1), count = arg(c, 2), dst = arg(c, 3), points = arg(c, 4);
+    const SurfacePixels from = surface_pixels(c, d, fn, src), to = surface_pixels(c, d, fn, dst);
+    if (to.frame_buffer >= 0) unmodelled(fn, "a copy into a frame buffer");
+    if (count == 0 && rects) unmodelled(fn, "a rectangle list with no rectangles");
+
+    std::vector<uint32_t> source;  // only for a frame buffer
+    if (from.frame_buffer >= 0) {
+        const uint32_t i = uint32_t(from.frame_buffer);
+        gfx::Image im;
+        if (i == d.renderer->back_index()) im = d.renderer->read_back_buffer();
+        else if (i == d.renderer->front_index()) im = d.renderer->read_front_buffer();
+        else unmodelled(fn, "a copy from a frame buffer that's neither the front nor the back buffer");
+        source.resize(size_t(im.width) * im.height);
+        for (size_t k = 0; k < source.size(); ++k)
+            source[k] = uint32_t(im.rgba[4 * k + 2]) | uint32_t(im.rgba[4 * k + 1]) << 8 | uint32_t(im.rgba[4 * k]) << 16 |
+                        uint32_t(im.rgba[4 * k + 3]) << 24;
+    }
+    const rt::Mem m = mem(c);
+    auto read = [&](uint32_t x, uint32_t y) {
+        return from.frame_buffer >= 0 ? source[size_t(y) * from.width + x] : rt::ld32(m, from.data + pixel_offset(from, x, y), 0);
+    };
+    const uint32_t n = rects ? count : 1;
+    for (uint32_t r = 0; r < n; ++r) {
+        int32_t l = 0, t = 0, rr = int32_t(from.width), b = int32_t(from.height);
+        if (rects) {
+            l = int32_t(ld(c, rects + 16 * r));
+            t = int32_t(ld(c, rects + 16 * r + 4));
+            rr = int32_t(ld(c, rects + 16 * r + 8));
+            b = int32_t(ld(c, rects + 16 * r + 12));
+        }
+        int32_t px = l, py = t;
+        if (points) {
+            px = int32_t(ld(c, points + 8 * r));
+            py = int32_t(ld(c, points + 8 * r + 4));
+        }
+        if (l < 0 || t < 0 || rr > int32_t(from.width) || b > int32_t(from.height) || l > rr || t > b || px < 0 || py < 0 ||
+            px + (rr - l) > int32_t(to.width) || py + (b - t) > int32_t(to.height))
+            unmodelled(fn, strf("a rectangle (%d,%d)-(%d,%d) to (%d,%d) outside a surface (%ux%u to %ux%u)", l, t, rr, b, px, py,
+                                from.width, from.height, to.width, to.height));
+        for (int32_t y = t; y < b; ++y)
+            for (int32_t x = l; x < rr; ++x)
+                rt::st32(m, to.data + pixel_offset(to, uint32_t(px + x - l), uint32_t(py + y - t)), read(uint32_t(x), uint32_t(y)), 0);
+    }
+    ret(c, 0, 20);
 }
 
 // ------------------------------------------------- the push-buffer sink
@@ -908,10 +1006,193 @@ void viewport_constants(rt::Context& c, float scale[4], float offset[4]) {
     offset[0] = hw + ox, offset[1] = -hh + oy, offset[2] = minz * zscale, offset[3] = 0;
 }
 
+// ---------------------------------------------------------------- the fixed-function vertex pipeline
+// The NV2A's fixed-function transform, for what the game uses of it, as an
+// NV2A vertex program the renderer translates like any other: the position
+// through the composite of the world, view and projection transforms (in
+// c0-c3 here, columns of World × View × Projection), then to screen space
+// as D3D does for programs (c-38, c-37), and the colours and texture
+// coordinates passed through. Lighting, vertex blending, fog, texture
+// coordinate generation and texture transforms stop the runtime until
+// they're modelled; so do pre-transformed (XYZRHW) vertices.
+constexpr uint32_t kDevTransforms = 0xC50;          // the device's matrices, 64 bytes each
+constexpr uint32_t kTextureStateTable = 0x181970;  // D3D__TextureState: 32 dwords per stage
+constexpr uint32_t kRsFogEnable = 92, kRsLighting = 102, kRsVertexBlend = 137;
+constexpr uint32_t kTsTextureTransformFlags = 21, kTsTexCoordIndex = 28;
+constexpr uint32_t kTsView = 0, kTsProjection = 1, kTsWorld = 6;
+
+struct FixedFunction {
+    gfx::vsh::Program program;
+    uint64_t key = 0;
+};
+
+FixedFunction fixed_function_program(rt::Context& c, const char* fn) {
+    using namespace gfx::vsh;
+    const uint32_t fvf = ld(c, kDeviceStorage + kDevVertexShader + 4);
+    auto rs = [&](uint32_t i) { return ld(c, kRenderStateTable + 4 * i); };
+    auto ts = [&](uint32_t stage, uint32_t i) { return ld(c, kTextureStateTable + 4 * (32 * stage + i)); };
+    const uint32_t position = fvf & 0xE, texcount = (fvf >> 8) & 0xF;
+    if (fvf & 1u) unmodelled(fn, strf("FVF %#x: a vertex shader handle where an FVF was expected", fvf));
+    if (position != 0x2) unmodelled(fn, strf("the fixed-function pipeline with FVF %#x (positions other than D3DFVF_XYZ)", fvf));
+    if (!(fvf & 0x40)) unmodelled(fn, strf("the fixed-function pipeline with FVF %#x (no diffuse colour)", fvf));
+    if (fvf & ~0xFFFF0FE2u) unmodelled(fn, strf("FVF %#x", fvf));
+    if (rs(kRsLighting)) unmodelled(fn, "fixed-function lighting (D3DRS_LIGHTING)");
+    if (rs(kRsVertexBlend)) unmodelled(fn, "vertex blending (D3DRS_VERTEXBLEND)");
+    if (rs(kRsFogEnable)) unmodelled(fn, "fog with the fixed-function pipeline");
+    for (uint32_t n = 0; n < texcount; ++n) {
+        if (ts(n, kTsTexCoordIndex) != n) unmodelled(fn, strf("stage %u's texture coordinates from set %#x", n, ts(n, kTsTexCoordIndex)));
+        if (ts(n, kTsTextureTransformFlags)) unmodelled(fn, strf("a texture transform on stage %u", n));
+        if (((fvf >> (16 + 2 * n)) & 3) == 3) unmodelled(fn, strf("FVF %#x: one-component texture coordinates", fvf));
+    }
+
+    FixedFunction f;
+    f.key = 0xF1F0000000000000ull | uint64_t(fvf);
+    auto input = [](uint8_t i) { Operand o; o.kind = Src::Input; o.index = i; return o; };
+    auto temp = [](uint8_t i) { Operand o; o.kind = Src::Temp; o.index = i; return o; };
+    auto konst = [] { Operand o; o.kind = Src::Const; return o; };
+    auto out = [](Instruction& in, uint8_t address, uint8_t mask) { in.out_address = address, in.out_mask = mask; };
+    for (uint8_t row = 0; row < 4; ++row) {  // dp4 oPos.<row>, v0, c<row>
+        Instruction in;
+        in.mac = Mac::Dp4, in.a = input(0), in.b = konst(), in.constant = row;
+        out(in, kPos, uint8_t(8 >> row));
+        f.program.code.push_back(in);
+    }
+    {  // mul oPos.xyz, r12, c-38 + rcc r1.x, r12.w
+        Instruction in;
+        in.mac = Mac::Mul, in.a = temp(12), in.b = konst(), in.constant = 58;
+        in.ilu = Ilu::Rcc, in.c = temp(12);
+        for (auto& s : in.c.swizzle) s = 3;
+        in.ilu_temp_mask = 8;
+        out(in, kPos, 0xE);
+        f.program.code.push_back(in);
+    }
+    {  // mad oPos.xyz, r12, r1.x, c-37
+        Instruction in;
+        in.mac = Mac::Mad, in.a = temp(12), in.b = temp(1), in.c = konst(), in.constant = 59;
+        for (auto& s : in.b.swizzle) s = 0;
+        out(in, kPos, 0xE);
+        f.program.code.push_back(in);
+    }
+    auto mov = [&](uint8_t address, uint8_t from) {
+        Instruction in;
+        in.mac = Mac::Mov, in.a = input(from);
+        out(in, address, 0xF);
+        f.program.code.push_back(in);
+    };
+    mov(kD0, 3);
+    if (fvf & 0x80) mov(kD1, 4);
+    for (uint8_t n = 0; n < texcount; ++n) mov(uint8_t(kT0 + n), uint8_t(9 + n));
+    f.program.code.back().final = true;
+    f.program.header = 0x2078u | uint32_t(f.program.code.size()) << 16;
+    return f;
+}
+
+// The composite the fixed-function program reads in c0-c3: the columns of
+// World × View × Projection (D3D's row vectors: clip = v · W · V · P).
+void composite_constants(const rt::Context& c, float* out) {
+    auto matrix = [&](uint32_t state, float m[4][4]) {
+        for (int k = 0; k < 16; ++k) m[k / 4][k % 4] = std::bit_cast<float>(ld(c, kDeviceStorage + kDevTransforms + 64 * state + 4 * k));
+    };
+    float w[4][4], v[4][4], p[4][4], wv[4][4] = {}, wvp[4][4] = {};
+    matrix(kTsWorld, w), matrix(kTsView, v), matrix(kTsProjection, p);
+    for (int i = 0; i < 4; ++i)
+        for (int j = 0; j < 4; ++j)
+            for (int k = 0; k < 4; ++k) wv[i][j] += w[i][k] * v[k][j];
+    for (int i = 0; i < 4; ++i)
+        for (int j = 0; j < 4; ++j)
+            for (int k = 0; k < 4; ++k) wvp[i][j] += wv[i][k] * p[k][j];
+    for (int col = 0; col < 4; ++col)
+        for (int row = 0; row < 4; ++row) out[col * 4 + row] = wvp[row][col];
+}
+
+// ---------------------------------------------------------------- the fixed-function pixel pipeline
+// D3D's texture-stage operations, as register-combiner settings: a general
+// combiner stage for each texture stage up to the first one disabled,
+// "current" in r0 (the diffuse colour at stage 0), "temp" in r1, the
+// texture factor in each stage's C0; the final combiner passes r0 through.
+// Operations and arguments beyond these stop the runtime until they're
+// modelled. (The original does this conversion in its state flush.)
+constexpr uint32_t kRsSpecularEnable = 103, kRsTextureFactor = 148;
+constexpr uint32_t kTsColorOp = 12, kTsAlphaOp = 16, kTsResultArg = 20;
+constexpr uint32_t kOne = 0x20;  // the zero register, inverted: 1
+
+void fixed_function_combiners(rt::Context& c, const char* fn, gfx::nv2a::CombinerSetup& cs, std::vector<float>& fsu) {
+    auto rs = [&](uint32_t i) { return ld(c, kRenderStateTable + 4 * i); };
+    auto ts = [&](uint32_t stage, uint32_t i) { return ld(c, kTextureStateTable + 4 * (32 * stage + i)); };
+    if (rs(kRsSpecularEnable)) unmodelled(fn, "the specular colour added in the fixed-function pixel pipeline (D3DRS_SPECULARENABLE)");
+    cs = {};
+    uint32_t stages = 0, modes = 0;
+    for (uint32_t stage = 0; stage < 4; ++stage) {
+        if (ts(stage, kTsColorOp) == 1) break;  // D3DTOP_DISABLE: this stage and all after it
+        const uint32_t tex = ld(c, kDeviceStorage + 0xF78 + 4 * stage);
+        // An argument as a combiner input: the register, alpha replicated
+        // (D3DTA_ALPHAREPLICATE, or the alpha portion), complemented.
+        auto arg = [&](uint32_t a, bool alpha) -> uint32_t {
+            uint32_t reg = 0;
+            switch (a & 0xF) {
+                case 0: reg = 4; break;                    // D3DTA_DIFFUSE
+                case 1: reg = stage ? 12 : 4; break;      // D3DTA_CURRENT: the diffuse colour at stage 0
+                case 2:                                    // D3DTA_TEXTURE
+                    if (!tex) unmodelled(fn, strf("stage %u reads a texture, and none is set", stage));
+                    reg = 8 + stage;
+                    break;
+                case 3: reg = 1; break;                    // D3DTA_TFACTOR: C0
+                case 4: reg = 5; break;                    // D3DTA_SPECULAR
+                case 5: reg = 13; break;                   // D3DTA_TEMP: r1
+                default: unmodelled(fn, strf("texture-stage argument %#x", a));
+            }
+            if (a & ~0x3Fu) unmodelled(fn, strf("texture-stage argument %#x", a));
+            return reg | ((alpha || (a & 0x20)) ? 0x10u : 0u) | ((a & 0x10) ? 0x20u : 0u);
+        };
+        auto operation = [&](bool alpha, uint32_t& inputs, uint32_t& outputs) {
+            const uint32_t base = alpha ? kTsAlphaOp : kTsColorOp;
+            uint32_t op = ts(stage, base);
+            const uint32_t a1 = ts(stage, base + 2), a2 = ts(stage, base + 3);
+            if (alpha && op == 1) op = 2, inputs = 0;  // alpha disabled with colour on: current's alpha
+            const uint32_t result = ts(stage, kTsResultArg) == 5 ? 13u : 12u;  // D3DTA_TEMP, else current
+            if (ts(stage, kTsResultArg) != 1 && ts(stage, kTsResultArg) != 5)
+                unmodelled(fn, strf("stage %u's result argument %#x", stage, ts(stage, kTsResultArg)));
+            auto ab = [&](uint32_t a, uint32_t b) { return a << 24 | b << 16; };
+            switch (op) {
+                case 2: inputs = ab(alpha && ts(stage, base) == 1 ? (stage ? 0x1Cu : 0x14u) : arg(a1, alpha), kOne); outputs = result << 4; break;  // SELECTARG1
+                case 3: inputs = ab(arg(a2, alpha), kOne); outputs = result << 4; break;                      // SELECTARG2
+                case 4: inputs = ab(arg(a1, alpha), arg(a2, alpha)); outputs = result << 4; break;           // MODULATE
+                case 5: inputs = ab(arg(a1, alpha), arg(a2, alpha)); outputs = result << 4 | 2u << 15; break; // MODULATE2X
+                case 6: inputs = ab(arg(a1, alpha), arg(a2, alpha)); outputs = result << 4 | 4u << 15; break; // MODULATE4X
+                case 7: inputs = ab(arg(a1, alpha), kOne) | arg(a2, alpha) << 8 | kOne; outputs = result << 8; break;  // ADD
+                default: unmodelled(fn, strf("stage %u's %s operation %u", stage, alpha ? "alpha" : "colour", op));
+            }
+        };
+        operation(false, cs.rgb_inputs[stage], cs.rgb_outputs[stage]);
+        operation(true, cs.alpha_inputs[stage], cs.alpha_outputs[stage]);
+        if (tex) {
+            const uint32_t dims = (ld(c, tex + 12) >> 4) & 0xF, cube = ld(c, tex + 12) & 4;
+            modes |= (cube ? 3u : dims == 3 ? 2u : 1u) << (5 * stage);  // CUBEMAP, PROJECT3D, PROJECT2D
+        }
+        ++stages;
+    }
+    if (!stages) {  // stage 0 disabled: the diffuse colour
+        cs.rgb_inputs[0] = 4u << 24 | kOne << 16, cs.rgb_outputs[0] = 12u << 4;
+        cs.alpha_inputs[0] = 0x14u << 24 | kOne << 16, cs.alpha_outputs[0] = 12u << 4;
+        stages = 1;
+    }
+    cs.combiner_count = stages | 0x1000u;  // each stage its own C0 (all the texture factor)
+    cs.texture_modes = modes;
+    for (uint32_t i = 0; i < 8; ++i) color_to_float(rs(kRsTextureFactor), &fsu[(gfx::nv2a::kFsC0 + i) * 4]);
+}
+
 // A draw, as the original's state flush leaves the GPU, into the renderer.
 void issue_draw(rt::Context& c, Device& d, const char* fn, uint32_t prim, Vertices&& v, std::vector<uint32_t> seq, bool indexed) {
     st(c, kDeviceStorage + 8, ld(c, kDeviceStorage + 8) | 0x800u);
     if (!v.count) return;
+    // An attribute the vertices don't have reads the GPU's register for it:
+    // the last value SetVertexData* wrote there (0, 0, 0, 1 if never written).
+    for (uint32_t n = 0; n < 16; ++n) {
+        if ((v.mask & (1u << n)) || !(d.attributes_written & (1u << n))) continue;
+        v.mask |= 1u << n;
+        v.attr[n].resize(size_t(v.count) * 4);
+        for (uint32_t i = 0; i < v.count; ++i) std::copy_n(d.attribute_values[n], 4, &v.attr[n][size_t(i) * 4]);
+    }
     const uint32_t dev = kDeviceStorage;
     auto rs = [&](uint32_t i) { return ld(c, kRenderStateTable + 4 * i); };
 
@@ -920,23 +1201,34 @@ void issue_draw(rt::Context& c, Device& d, const char* fn, uint32_t prim, Vertic
     if (target != d.frame_buffers[d.renderer->back_index()]) return notice_once(d, "drawing into a render target other than the back buffer");
 
     gfx::DrawCmd cmd;
-    // The vertex program at the selected slot of the GPU's program memory.
+    // The vertex program at the selected slot of the GPU's program memory,
+    // or the fixed-function pipeline as one.
     const uint32_t vs_flags = ld(c, ld(c, dev + kDevVertexShader) + 4);
-    if (!(vs_flags & 0x10)) unmodelled(fn, "a draw with the fixed-function vertex pipeline");
-    const uint32_t start = ld(c, dev + kDevVertexShader + 8);
-    if (start >= 136) unmodelled(fn, strf("a vertex program at slot %u", start));
-    std::vector<uint32_t> words{0x2078u};
-    for (uint32_t i = start; i < 136; ++i) {
-        words.insert(words.end(), d.vs_program[i], d.vs_program[i] + 4);
-        if (d.vs_program[i][3] & 1) break;  // FINAL
+    const bool fixed_function = !(vs_flags & 0x10);
+    uint64_t vs_key = 0;
+    std::optional<gfx::vsh::Program> prog;
+    if (fixed_function) {
+        FixedFunction f = fixed_function_program(c, fn);
+        vs_key = f.key ^ (uint64_t(v.mask) << 40);
+        prog = std::move(f.program);
+    } else {
+        const uint32_t start = ld(c, dev + kDevVertexShader + 8);
+        if (start >= 136) unmodelled(fn, strf("a vertex program at slot %u", start));
+        std::vector<uint32_t> words{0x2078u};
+        for (uint32_t i = start; i < 136; ++i) {
+            words.insert(words.end(), d.vs_program[i], d.vs_program[i] + 4);
+            if (d.vs_program[i][3] & 1) break;  // FINAL
+        }
+        words[0] |= uint32_t((words.size() - 1) / 4) << 16;  // the instruction count, as the header has it
+        vs_key = hash_bytes(reinterpret_cast<const uint8_t*>(words.data()), words.size() * 4) ^ (uint64_t(v.mask) << 40) ^ 1;
+        if (d.shaders[vs_key].empty()) {
+            std::string error;
+            prog = gfx::vsh::decode(words.data(), words.size(), &error);
+            if (!prog) unmodelled(fn, "a vertex program that doesn't decode (" + error + ")");
+        }
     }
-    words[0] |= uint32_t((words.size() - 1) / 4) << 16;  // the instruction count, as the header has it
-    uint64_t vs_key = hash_bytes(reinterpret_cast<const uint8_t*>(words.data()), words.size() * 4) ^ (uint64_t(v.mask) << 40) ^ 1;
     auto& vs_code = d.shaders[vs_key];
     if (vs_code.empty()) {
-        std::string error;
-        const auto prog = gfx::vsh::decode(words.data(), words.size(), &error);
-        if (!prog) unmodelled(fn, "a vertex program that doesn't decode (" + error + ")");
         try {
             vs_code = gfx::nv2a::vertex_program(*prog, v.mask);
         } catch (const std::exception& e) {
@@ -945,7 +1237,6 @@ void issue_draw(rt::Context& c, Device& d, const char* fn, uint32_t prim, Vertic
     }
 
     // The register combiners as the render states hold them.
-    if (!ld(c, dev + 0x780)) unmodelled(fn, "a draw with the fixed-function pixel pipeline (texture stage states)");
     gfx::nv2a::CombinerSetup cs{};
     for (uint32_t i = 0; i < 8; ++i) {
         cs.alpha_inputs[i] = rs(i);
@@ -960,6 +1251,11 @@ void issue_draw(rt::Context& c, Device& d, const char* fn, uint32_t prim, Vertic
     cs.alpha_func = rs(kRsAlphaTestEnable) ? rs(kRsAlphaFunc) : 0;
 
     std::vector<float> fsu(gfx::nv2a::kFsUniformVec4s * 4, 0.0f);
+    const bool fixed_pixels = !ld(c, dev + 0x780);  // no pixel shader: the texture-stage operations
+    if (fixed_pixels) {
+        fixed_function_combiners(c, fn, cs, fsu);
+        cs.alpha_func = rs(kRsAlphaTestEnable) ? rs(kRsAlphaFunc) : 0;
+    }
     for (uint32_t stage = 0; stage < 4; ++stage) {
         fsu[(gfx::nv2a::kFsTexScale + stage) * 4 + 0] = fsu[(gfx::nv2a::kFsTexScale + stage) * 4 + 1] = 1;
         fsu[(gfx::nv2a::kFsTexScale + stage) * 4 + 2] = 1;
@@ -980,12 +1276,14 @@ void issue_draw(rt::Context& c, Device& d, const char* fn, uint32_t prim, Vertic
     const uint64_t fs_key = cs.hash() ^ 2;
     auto& fs_code = d.shaders[fs_key];
     if (fs_code.empty()) fs_code = gfx::nv2a::combiners(cs);
-    for (uint32_t i = 0; i < 8; ++i) {
-        color_to_float(rs(kRsPsConstant0 + i), &fsu[(gfx::nv2a::kFsC0 + i) * 4]);
-        color_to_float(rs(kRsPsConstant1 + i), &fsu[(gfx::nv2a::kFsC1 + i) * 4]);
+    if (!fixed_pixels) {
+        for (uint32_t i = 0; i < 8; ++i) {
+            color_to_float(rs(kRsPsConstant0 + i), &fsu[(gfx::nv2a::kFsC0 + i) * 4]);
+            color_to_float(rs(kRsPsConstant1 + i), &fsu[(gfx::nv2a::kFsC1 + i) * 4]);
+        }
+        color_to_float(rs(kRsPsFinalC0), &fsu[gfx::nv2a::kFsFinalC0 * 4]);
+        color_to_float(rs(kRsPsFinalC1), &fsu[gfx::nv2a::kFsFinalC1 * 4]);
     }
-    color_to_float(rs(kRsPsFinalC0), &fsu[gfx::nv2a::kFsFinalC0 * 4]);
-    color_to_float(rs(kRsPsFinalC1), &fsu[gfx::nv2a::kFsFinalC1 * 4]);
     color_to_float(rs(kRsFogColor), &fsu[gfx::nv2a::kFsFogColor * 4]);
     fsu[gfx::nv2a::kFsAlphaRef * 4] = float(rs(kRsAlphaRef) & 0xFF);
 
@@ -993,6 +1291,7 @@ void issue_draw(rt::Context& c, Device& d, const char* fn, uint32_t prim, Vertic
     std::vector<float> vsu(gfx::nv2a::kVsUniformVec4s * 4, 0.0f);
     std::memcpy(vsu.data(), d.vs_constants, sizeof d.vs_constants);
     viewport_constants(c, &vsu[58 * 4], &vsu[59 * 4]);  // c-38, c-37
+    if (fixed_function) composite_constants(c, vsu.data());  // c0-c3 (the program's own constants aren't used)
     const float zscale = std::bit_cast<float>(ld(c, dev + 0x944));
     vsu[gfx::nv2a::kVsScreen * 4 + 0] = 2.0f / float(d.width);
     vsu[gfx::nv2a::kVsScreen * 4 + 1] = 2.0f / float(d.height);
@@ -1155,6 +1454,98 @@ void end_push(rt::Context& c) {
     ret(c, c.eax, 4);
 }
 
+// ---------------------------------------------------------------- immediate mode
+// D3DDevice_Begin, SetVertexData2f/4f/Color and End write NV2A methods
+// themselves in the original: SET_BEGIN_END, then the GPU's attribute
+// registers (VERTEX_DATA2F_M, 4F_M, 4UB, and SET_VERTEX4F for
+// D3DVSDE_VERTEX). Writing attribute 0 emits a vertex with every
+// register's current value. Here the registers are the device's, and End
+// draws the vertices collected, with every attribute ever written.
+constexpr uint32_t kDevStateFlags = 8;  // the device's flags word: 0x800 between Begin and End
+
+void immediate_attribute(const char* fn, uint32_t reg, const float v[4]) {
+    Device& d = device(fn);
+    const bool provoke = reg == 0xFFFFFFFFu || reg == 0;  // D3DVSDE_VERTEX, or the position register
+    // Outside Begin/End a register is a constant: draws whose vertices lack
+    // that attribute read it (issue_draw).
+    if (reg == 0xFFFFFFFFu) reg = 0;
+    if (reg >= 16) unmodelled(fn, strf("attribute register %u", reg));
+    if (provoke && !d.immediate) unmodelled(fn, "a vertex outside Begin/End");
+    std::copy(v, v + 4, d.attribute_values[reg]);
+    d.attributes_written |= 1u << reg;
+    if (provoke)
+        for (const auto& a : d.attribute_values) d.immediate_vertices.insert(d.immediate_vertices.end(), a, a + 4);
+}
+
+float arg_float(const rt::Context& c, int i) { return std::bit_cast<float>(arg(c, i)); }
+
+// VOID D3DDevice_SetVertexData2f(INT Register, FLOAT a, FLOAT b): (a, b, 0, 1).
+void set_vertex_data_2f(rt::Context& c) {
+    const float v[4] = {arg_float(c, 1), arg_float(c, 2), 0.0f, 1.0f};
+    immediate_attribute("D3DDevice_SetVertexData2f", arg(c, 0), v);
+    ret(c, c.eax, 12);
+}
+
+// VOID D3DDevice_SetVertexData4f(INT Register, FLOAT a, FLOAT b, FLOAT c, FLOAT d).
+void set_vertex_data_4f(rt::Context& c) {
+    const float v[4] = {arg_float(c, 1), arg_float(c, 2), arg_float(c, 3), arg_float(c, 4)};
+    immediate_attribute("D3DDevice_SetVertexData4f", arg(c, 0), v);
+    ret(c, c.eax, 20);
+}
+
+// VOID D3DDevice_SetVertexDataColor(INT Register, D3DCOLOR Color): the
+// original swaps red and blue into the 4UB method's byte order, so the
+// register reads (R, G, B, A), as a D3DCOLOR vertex attribute does.
+void set_vertex_data_color(rt::Context& c) {
+    const uint32_t argb = arg(c, 1);
+    const float v[4] = {float((argb >> 16) & 0xFF) / 255.0f, float((argb >> 8) & 0xFF) / 255.0f, float(argb & 0xFF) / 255.0f,
+                        float(argb >> 24) / 255.0f};
+    immediate_attribute("D3DDevice_SetVertexDataColor", arg(c, 0), v);
+    ret(c, c.eax, 8);
+}
+
+// VOID D3DDevice_Begin(D3DPRIMITIVETYPE PrimitiveType): flushes the dirty
+// state as the original's 0x1799A0 does (keeping 0xC0000070) and sets the
+// device's flag 0x800, as the original (draws set it too; End clears it).
+void begin(rt::Context& c) {
+    static constexpr const char* fn = "D3DDevice_Begin";
+    Device& d = device(fn);
+    const uint32_t prim = arg(c, 0);
+    if (d.immediate) unmodelled(fn, "a Begin inside another");
+    if (prim < 1 || prim > 10) unmodelled(fn, strf("primitive type %u", prim));
+    st(c, kDirtyFlags, ld(c, kDirtyFlags) & 0xC0000070u);
+    st(c, kDeviceStorage + kDevStateFlags, ld(c, kDeviceStorage + kDevStateFlags) | 0x800u);
+    d.immediate = prim;
+    d.immediate_vertices.clear();
+    ret(c, c.eax, 4);
+}
+
+// VOID D3DDevice_End(): draws what was given since Begin.
+void end(rt::Context& c) {
+    static constexpr const char* fn = "D3DDevice_End";
+    Device& d = device(fn);
+    if (!d.immediate) unmodelled(fn, "an End without Begin");
+    const uint32_t prim = d.immediate;
+    d.immediate = 0;
+    Vertices v;
+    v.count = uint32_t(d.immediate_vertices.size() / 64);
+    v.mask = d.attributes_written;
+    for (uint32_t n = 0; n < 16; ++n) {
+        if (!(v.mask & (1u << n))) continue;
+        v.attr[n].resize(size_t(v.count) * 4);
+        for (uint32_t i = 0; i < v.count; ++i)
+            std::copy_n(&d.immediate_vertices[size_t(i) * 64 + n * 4], 4, &v.attr[n][size_t(i) * 4]);
+    }
+    if (v.count) {
+        const uint32_t n = v.count;
+        issue_draw(c, d, fn, prim, std::move(v), identity_sequence(n), false);
+    }
+    const uint32_t flags = ld(c, kDeviceStorage + kDevStateFlags);
+    st(c, kDeviceStorage + kDevStateFlags, flags & ~0x1800u);
+    if (flags & 0x1000u) unmodelled(fn, "the device's flag 0x1000 (a kick-off the original makes after End)");
+    ret(c, c.eax, 0);
+}
+
 // ---------------------------------------------------------------- vertex shaders
 struct VertexShader {
     std::vector<uint32_t> declaration;          // D3DVSD tokens, up to D3DVSD_END
@@ -1248,7 +1639,6 @@ void create_vertex_shader(rt::Context& c) {
 // renderer's own copy (gfx state, filled in with drawing). None of them
 // writes GPU commands: the draw calls turn the state into Vulkan.
 constexpr uint32_t kTransformDirty = 0x17FD90;  // the dirty bits each transform sets (a table in D3D's data)
-constexpr uint32_t kDevTransforms = 0xC50;      // the device's matrices, 64 bytes each
 
 // VOID D3DDevice_SetTransform(D3DTRANSFORMSTATETYPE, CONST D3DMATRIX*): as the
 // original, the matrix into the device (GetTransform, lifted, reads it
@@ -1370,7 +1760,6 @@ void set_texture(rt::Context& c) {
 // D3D__TextureState (0x181970): 32 dwords per stage. As the original, each
 // setter stores the value there and marks the dirty bits the original does;
 // the GPU methods it would push are left to the renderer.
-constexpr uint32_t kTextureStateTable = 0x181970;
 uint32_t texture_state_slot(uint32_t stage, uint32_t state) { return kTextureStateTable + 4 * (32 * stage + state); }
 
 void texture_stage_check(const char* fn, uint32_t stage) {
@@ -1820,6 +2209,12 @@ constexpr D3dFn kD3d[] = {
     {"D3DDevice_SetTextureState_ColorKeyColor", 8, set_color_key_color},
     {"D3DDevice_GetProjectionViewportMatrix", 4, get_projection_viewport_matrix},
     {"D3DDevice_Swap", 4, swap},
+    {"D3DDevice_CopyRects", 20, copy_rects},
+    {"D3DDevice_Begin", 4, begin},
+    {"D3DDevice_End", 0, end},
+    {"D3DDevice_SetVertexData2f", 12, set_vertex_data_2f},
+    {"D3DDevice_SetVertexData4f", 20, set_vertex_data_4f},
+    {"D3DDevice_SetVertexDataColor", 8, set_vertex_data_color},
 };
 
 D3dConfig& config_storage() {

@@ -1,5 +1,7 @@
 #include "window.hpp"
 
+#include "input.hpp"
+
 #include <SDL3/SDL.h>
 #define SDL_MAIN_HANDLED  // the runtime's own main() starts everything; SDL is told it's ready
 #include <SDL3/SDL_main.h>
@@ -80,9 +82,10 @@ void Window::pixel_size(uint32_t* width, uint32_t* height) const {
 
 bool Window::minimized() const { return (SDL_GetWindowFlags(window_) & SDL_WINDOW_MINIMIZED) != 0; }
 
-void Window::pump() {
+void Window::pump(Input* input) {
     SDL_Event e;
     while (SDL_PollEvent(&e)) {
+        if (input) input->on_event(e);
         switch (e.type) {
         case SDL_EVENT_QUIT:
         case SDL_EVENT_WINDOW_CLOSE_REQUESTED: quit_ = true; break;

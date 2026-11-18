@@ -22,6 +22,7 @@
 
 namespace qilin::platform {
 class Window;
+class Input;
 }
 
 namespace qilin::host {
@@ -124,6 +125,7 @@ struct D3dConfig {
     uint64_t max_frames = 0;  // stop after this many frames, 0 for never (--frames)
     int gpu = -1;             // Vulkan device index, -1 for the best one (--gpu)
     platform::Window* window = nullptr;  // where frames are shown; none with --headless
+    platform::Input* input = nullptr;    // controllers, whose events the window's pump passes on
 };
 void register_d3d(const D3dConfig& config);
 const D3dConfig& d3d_config();
@@ -132,10 +134,11 @@ const D3dConfig& d3d_config();
 // writes everything mixed there (--dump-audio).
 void register_dsound(const std::string& dump_wav);
 
-// XInput (xinput.cpp): the controller ports, with nothing plugged in so far.
-void register_xinput();
+// XInput (xinput.cpp): the controller ports, over `input` (null: nothing plugged in).
+void register_xinput(platform::Input* input);
 // The kernel replacements, registered at kernel_addr(ordinal) (kernel.cpp).
 void register_kernel();
+void register_kernel_crypto();  // XcSHA*, XcHMAC (kernel_crypto.cpp); register_kernel calls it
 // The I/O manager (kernel_io.cpp): \\Device\\CdRom0 is `disc` (read-only), the
 // hard disk's partitions are data/partition1..6.
 struct IoConfig {

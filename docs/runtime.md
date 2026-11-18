@@ -1,6 +1,6 @@
 # Runtime: status (roadmap step 3)
 
-Last updated 2026-11-18 (v0.17.0: the game creates its shaders and stops at its first transform; v0.16.0: guest RAM mapped at the kernel's windows too; D3D's resource code lifted; the game creates its textures and stops at its first vertex shader. v0.15.0: audio starts, `audio.md`; the renderer and Direct3D are in `graphics.md`).
+Last updated 2026-11-18 (v0.24.0: controllers, the kernel's SHA-1 and HMAC, the game reaches its menus and saves; v0.17.0: the game creates its shaders and stops at its first transform; v0.16.0: guest RAM mapped at the kernel's windows too; D3D's resource code lifted; the game creates its textures and stops at its first vertex shader. v0.15.0: audio starts, `audio.md`; the renderer and Direct3D are in `graphics.md`).
 
 The runtime is everything the lifted game code needs that isn't lifted: guest memory, the Xbox kernel, D3D, DirectSound/XACT and the other XDK libraries. All of it is replaced natively (HLE); none of it is emulated.
 
@@ -90,6 +90,7 @@ Replacements read stdcall arguments with `host::arg(c, i)` and return with `host
 | `KeQuerySystemTime` | The host's UTC time, in 100 ns since 1601 |
 | `XeLoadSection`, `XeUnloadSection` | XBE sections above |
 | `RtlRaiseException` | Stops the runtime with the exception code |
+| `XcSHAInit`, `XcSHAUpdate`, `XcSHAFinal`, `XcHMAC` (`kernel_crypto.cpp`) | SHA-1 and HMAC-SHA1, which XAPI signs saved games with. The SHA context is the caller's memory (XAPI's 116 bytes): the hash words, the length and the partial block. The signature key XAPI derives its keys from (`XboxSignatureKey`, set up from a console's EEPROM) is the kernel data area's zeros: the same on every machine, so saves move between installs, and a console's own saves don't verify (the game calls them damaged) |
 | `KfRaiseIrql`, `KfLowerIrql` (fastcall), `KeRaiseIrqlToDpcLevel` | The KPCR's IRQL byte, which XAPI reads directly. With one processor and no interrupts yet, raising it only records the level; lowering it with a raise, or raising it with a lower, stops the runtime (a bug check on the Xbox) |
 
 **The file system** (`recomp/runtime/host/kernel_io.cpp`) is the kernel's object namespace and I/O manager over host directories:
@@ -117,13 +118,13 @@ Names are matched case-insensitively, as on FATX and the disc's XDVDFS (an exact
 
 **Cache partitions.** XAPI gives each title one of the three cache partitions, recorded in the configuration area, and formats it the first time: it writes a FATX volume header, FAT and root directory as raw sectors. The runtime takes the header as the format: it empties the partition's folder and keeps the header (`partitionN.fatx`), whose cluster size the volume reports from then on. This title asks for 64 KB clusters on its Z: drive (XBE init flags), and XAPI refuses to mount a volume whose cluster size differs. Raw writes to a partition that aren't part of a format, and raw reads of one, stop the runtime.
 
-**XInput** (`recomp/runtime/host/xinput.cpp`): the controller ports with nothing plugged in, until there's an input backend. `XInitDevices`, `XGetDevices` (no devices) and `XGetDeviceChanges` (none arrive); opening a port stops the runtime.
+**XInput** (`recomp/runtime/host/xinput.cpp`): the controller ports over SDL3's gamepads, the keyboard as controller 1 (v0.24.0). See `input.md`.
 
 **Direct3D** (`recomp/runtime/host/d3d.cpp`) over the Vulkan renderer: the device, its frame buffers, clears and swaps at the display's vblank. See `graphics.md`.
 
 **DirectSound** (`recomp/runtime/host/dsound.cpp`) over the software mixer, beneath the lifted XACT. See `audio.md`.
 
-**Where it stops now:** the game's `main` creates its graphics device on Vulkan, starts XACT (the engine, DirectSound, the effects image, the mix-bin headroom), checks its wave banks and the controller ports, loads `bundles/common.bnl` and the font, registers their resources, creates its textures, assembles and creates its 24 vertex shaders and its pixel shaders, sets its first transforms, sets its viewport and render states, and stops at its first texture binding: `D3DDevice_SetTexture` from `0x5E238`. In v0.18.0 it stopped at the first viewport; in v0.17.0 it stopped at the first transform; in v0.16.0 it stopped at the first vertex shader; in v0.15.0 at the first texture. Earlier, start-up writes the title's save metadata and images to `partition1/UDATA/4d530053/`, gets cache partition 5 formatted with 64 KB clusters and mounted as Z:, and checks that `D:\loctext\english` exists. With a disc file missing, the game shows its disc-error screen, as the console does: it loads `dirtydisk_bitmap` and draws the message into the front buffer (`LockRect`). In v0.14.0 it stopped at the audio engine; in v0.13.0 at the first Direct3D call; in v0.12.0 at the first `NtOpenFile`.
+**Where it is now** (v0.24.0): the game runs its attract sequence, takes START, turns the book's pages, shows its save-slot menu, takes a name on its on-screen keyboard and saves (signed, as XAPI signs saves), then loads the save. Between there and play, it asks for disc files one at a time (they're staged from the disc as asked), and the runtime stops at each function it doesn't provide yet. Earlier, start-up writes the title's save metadata and images to `partition1/UDATA/4d530053/`, gets cache partition 5 formatted with 64 KB clusters and mounted as Z:, and checks that `D:\loctext\english` exists. With a disc file missing, the game shows its disc-error screen, as the console does: it loads `dirtydisk_bitmap` and draws the message into the front buffer (`LockRect`); the runtime doesn't show CPU writes to a frame buffer yet, so the screen stays as it was.
 
 ## Tests
 
@@ -131,8 +132,8 @@ Names are matched case-insensitively, as on FATX and the disc's XDVDFS (an exact
 
 ## Next
 
-1. **State, shaders and drawing** (`graphics.md`): the game sets its first transform next.
-2. **A window, input and audio output** on SDL3 (the controller to test against: an Xbox One pad over Bluetooth).
+1. **Sound output** on SDL3 (the mixer's output to the speakers, then surround), and rendering into textures (`graphics.md`).
+2. **Into the game:** past the menus to the first level, implementing what it stops at.
 3. **Audio still to come** (`audio.md`): streams (streamed wave banks, music), WMA, the I3DL2 reverb, envelopes, LFOs, filters, 3D.
 4. **The scheduler:** guest threads (`PsCreateSystemThreadEx`), waits, events, timers and DPCs. Until then a second thread stops the runtime.
 5. **Keep running `qilin_run`** and implement each function it stops at.

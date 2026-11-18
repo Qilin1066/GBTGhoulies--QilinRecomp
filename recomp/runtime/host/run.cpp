@@ -22,6 +22,7 @@
 #include "regions.hpp"
 #include "host.hpp"
 #include "xbe.hpp"
+#include "input.hpp"
 #include "window.hpp"
 
 using namespace qilin;
@@ -258,7 +259,6 @@ int main(int argc, char** argv) {
     // Guest virtual memory: the RAM between the image and the main stack.
     host::vm().init(c.mem, (xbe.image_end() + 0xFFFFu) & ~0xFFFFu, mm.stack_bottom() & ~0xFFFFu);
     host::register_xapi();
-    host::register_xinput();
     // The window: where there's no display, the game still runs and draws.
     std::unique_ptr<platform::Window> window;
     if (!headless) {
@@ -266,7 +266,15 @@ int main(int argc, char** argv) {
         window = platform::Window::create("Grabbed by the Ghoulies", 640, 480, fullscreen, &why);
         if (!window) std::printf("qilin_run: no window (%s); running without one\n", why.c_str());
     }
+    // Controllers, read through the window's events; without a window, none.
+    std::unique_ptr<platform::Input> input;
+    if (window) {
+        input = std::make_unique<platform::Input>();
+        input->start();
+    }
     d3d.window = window.get();
+    d3d.input = input.get();
+    host::register_xinput(input.get());
     host::register_d3d(d3d);
     host::register_dsound(dump_audio);
     host::register_kernel();

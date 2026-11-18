@@ -624,6 +624,7 @@ void register_kernel() {
         }
         register_hle(kernel_addr(e->ordinal), e->name, k.fn);
     }
+    register_kernel_crypto();
 }
 
 // ---------------------------------------------------------------- KPCR

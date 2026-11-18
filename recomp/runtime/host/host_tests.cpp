@@ -1,4 +1,6 @@
 // Tests for the runtime's host side; no game files needed.
+#include <algorithm>
+#include <array>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -7,6 +9,8 @@
 #include <cstdio>
 #include <string>
 
+#include "crypto.hpp"
+#include "strf.hpp"
 #include "host.hpp"
 
 using namespace qilin;
@@ -233,6 +237,35 @@ int main() {
         CHECK(g.call("NtReadFile", {cfg, 0, 0, 0, iosb, buf, 0x200, off}) == 0 && g.u32(buf) == 0x97315286);
         CHECK(g.call("NtClose", {cfg}) == 0);
         fs::remove_all(root, ec);
+    }
+
+    // SHA-1 and HMAC-SHA1 (the kernel's XcSHA*, XcHMAC): FIPS 180 and RFC 2202 vectors.
+    {
+        auto hex = [](const std::array<uint8_t, 20>& d) {
+            std::string s;
+            for (uint8_t b : d) s += strf("%02x", b);
+            return s;
+        };
+        host::Sha1 s;
+        s.update(reinterpret_cast<const uint8_t*>("abc"), 3);
+        CHECK(hex(s.final()) == "a9993e364706816aba3e25717850c26c9cd0d89d");
+        host::Sha1 m;  // a million 'a's, in uneven pieces across block boundaries
+        const std::string chunk(997, 'a');
+        size_t left = 1000000;
+        while (left) {
+            const size_t n = std::min(left, chunk.size());
+            m.update(reinterpret_cast<const uint8_t*>(chunk.data()), n);
+            left -= n;
+        }
+        CHECK(hex(m.final()) == "34aa973cd4c4daa4f61eeb2bdbad27316534016f");
+        const uint8_t key[20] = {0x0b, 0x0b, 0x0b, 0x0b, 0x0b, 0x0b, 0x0b, 0x0b, 0x0b, 0x0b,
+                                 0x0b, 0x0b, 0x0b, 0x0b, 0x0b, 0x0b, 0x0b, 0x0b, 0x0b, 0x0b};
+        CHECK(hex(host::hmac_sha1(key, 20, reinterpret_cast<const uint8_t*>("Hi "), 3, reinterpret_cast<const uint8_t*>("There"), 5)) ==
+              "b617318655057264e28bc0b6fb378c8ef146be00");
+        const std::string big(80, char(0xaa));  // a key longer than a block is hashed first
+        CHECK(hex(host::hmac_sha1(reinterpret_cast<const uint8_t*>(big.data()), 80,
+                                  reinterpret_cast<const uint8_t*>("Test Using Larger Than Block-Size Key - Hash Key First"), 54)) ==
+              "aa4ae5e15272d00e95705637ce8a3b55ed402112");
     }
 
     if (failures) std::fprintf(stderr, "%d check(s) failed\n", failures);
