@@ -88,6 +88,8 @@ void call(Context& c, uint32_t target);
 // set). Provided by whatever links the generated code: the runtime, or the
 // differential test, which runs the original bytes.
 void call_unlifted(Context& c, uint32_t target);
+// Whether target has a lifted body in the generated table.
+bool is_lifted(uint32_t target);
 
 #if defined(QILIN_TRACE_WRITES)
 void trace_write(uint32_t addr, uint32_t size);
@@ -471,18 +473,132 @@ inline double fyl2x(double y, double x) {  // y * log2(x)
 // fsin, fcos, fptan leave operands of magnitude 2^63 or more unchanged (C2 = 1).
 inline bool x87_trig_in_range(double a) { return std::fabs(a) < 9223372036854775808.0; }
 
+// Round to an integer by the control word's rounding mode (fist, frndint).
+inline double x87_round(uint32_t cw, double a) {
+    switch ((cw >> 10) & 3u) {
+        case 0: return std::nearbyint(a);  // the host's mode is nearest
+        case 1: return std::floor(a);
+        case 2: return std::ceil(a);
+        default: return std::trunc(a);
+    }
+}
 // fist/fistp: round by the control word's rounding mode; out of range (or
 // NaN) gives the integer indefinite.
 inline uint32_t fist32(uint32_t cw, double a) {
-    double r;
-    switch ((cw >> 10) & 3u) {
-        case 0: r = std::nearbyint(a); break;  // the host's mode is nearest
-        case 1: r = std::floor(a); break;
-        case 2: r = std::ceil(a); break;
-        default: r = std::trunc(a); break;
-    }
+    const double r = x87_round(cw, a);
     if (!(r >= -2147483648.0 && r <= 2147483647.0)) return 0x80000000u;
     return uint32_t(int32_t(r));
+}
+// fistp m64: the integer indefinite 0x8000000000000000 on overflow or NaN.
+inline uint64_t fist64(uint32_t cw, double a) {
+    const double r = x87_round(cw, a);
+    if (!(r >= -9223372036854775808.0 && r < 9223372036854775808.0)) return 0x8000000000000000ull;
+    return uint64_t(int64_t(r));
+}
+// frndint: NaNs quietened, infinities and zeros unchanged.
+inline double frndint(uint32_t cw, double a) {
+    if (a != a) return x87_nan1(a);
+    return x87_round(cw, a);
+}
+// f2xm1: 2^ST0 - 1, correctly rounded (x87_math.hpp). The x87 defines it for
+// |x| <= 1 only; this is 2^x - 1 everywhere, as the difftest's reference is.
+inline double f2xm1(double a) {
+    if (a != a) return x87_nan1(a);
+    if (a == 0) return a;
+    if (std::isinf(a)) return a > 0 ? a : -1.0;
+    return xm::exp2m1(a);
+}
+// fscale: ST0 * 2^trunc(ST1). Exact unless it leaves double's range.
+inline double fscale(double a, double b) {
+    if (a != a || b != b) return x87_nan(a, b);
+    if (std::isinf(b)) {
+        if ((b > 0 && a == 0) || (b < 0 && std::isinf(a))) return dfrom(kX87Indefinite);  // 0 * 2^inf, inf * 2^-inf
+        return b > 0 ? (a == 0 ? a : std::copysign(dfrom(0x7FF0000000000000ull), a)) : std::copysign(0.0, a);
+    }
+    const double t = std::trunc(b);
+    const int n = t > 100000.0 ? 100000 : t < -100000.0 ? -100000 : int(t);
+    return std::ldexp(a, n);
+}
+// fxam: C3 C2 C0 classify ST0 (or an empty register), C1 is its sign.
+inline uint32_t fxam_codes(uint32_t sw, bool empty, double a) {
+    sw &= ~0x4700u;
+    const uint64_t b = dbits(a);
+    if (b >> 63) sw |= 0x0200u;  // C1
+    if (empty) return sw | 0x4100u;                                        // C3 C0: empty
+    if (a != a) return sw | 0x0100u;                                       // C0: NaN
+    if (std::isinf(a)) return sw | 0x0500u;                                // C2 C0: infinity
+    if (a == 0) return sw | 0x4000u;                                       // C3: zero
+    if (((b >> 52) & 0x7FF) == 0) return sw | 0x4400u;                    // C3 C2: denormal
+    return sw | 0x0400u;                                                   // C2: normal
+}
+// fld m80: the nearest double (64-bit significands are rounded, like the x87's own constants).
+inline double fld80(uint64_t mant, uint16_t se) {
+    const bool neg = se >> 15;
+    const int e = se & 0x7FFF;
+    if (e == 0x7FFF) {
+        if ((mant << 1) == 0) return neg ? -dfrom(0x7FF0000000000000ull) : dfrom(0x7FF0000000000000ull);
+        return dfrom(uint64_t(neg) << 63 | 0x7FF8000000000000ull | ((mant >> 11) & 0x0007FFFFFFFFFFFFull));  // quietened
+    }
+    if (mant == 0) return neg ? -0.0 : 0.0;
+    // value = mant * 2^(e - 16383 - 63); ldexp of the 64-bit integer rounds once only if it's exact in double:
+    // split into two exact halves and let one addition round.
+    const double hi = double(mant >> 11) * 2048.0, lo = double(mant & 0x7FF);  // both exact
+    const int sh = (e == 0 ? 1 : e) - 16383 - 63;
+    const double r = std::ldexp(hi + lo, sh);  // hi + lo rounds to 53 bits once; ldexp is exact in range
+    return neg ? -r : r;
+}
+// A register value as an 80-bit extended real (exact: every double is one).
+inline void st80(const Mem& m, uint32_t a, double v, uint32_t at) {
+    const uint64_t b = dbits(v);
+    const uint16_t sign = uint16_t((b >> 63) << 15);
+    const uint32_t e = uint32_t(b >> 52) & 0x7FF;
+    const uint64_t frac = b & 0x000FFFFFFFFFFFFFull;
+    uint64_t mant;
+    uint32_t ex;
+    if (e == 0x7FF) { ex = 0x7FFF; mant = 0x8000000000000000ull | (frac << 11); }
+    else if (e != 0) { ex = e - 1023 + 16383; mant = 0x8000000000000000ull | (frac << 11); }
+    else if (frac == 0) { ex = 0; mant = 0; }
+    else {  // a double subnormal is a normal extended real
+        const int sh = std::countl_zero(frac);
+        mant = frac << sh;
+        ex = uint32_t(15372 - sh);
+    }
+    st64(m, a, mant, at);
+    st16(m, a + 8, uint16_t(sign | ex), at);
+}
+// fnsave / frstor, 32-bit protected-mode layout (108 bytes): control,
+// status (with TOP) and tag words as dwords, the instruction and operand
+// pointers (stored as 0, as the difftest's emulator does; nothing reads
+// them back but frstor), then ST(0)..ST(7) as 80-bit reals. fnsave then
+// reinitialises the unit like fninit.
+inline uint32_t x87_tag2(bool full, double v) {
+    if (!full) return 3;
+    if (v == 0) return 1;
+    return std::isfinite(v) ? 0 : 2;
+}
+inline void fnsave(const Mem& m, uint32_t a, double* st, uint32_t& top, uint32_t& tag, uint32_t& cw, uint32_t& sw, uint32_t at) {
+    uint32_t tw = 0;
+    for (uint32_t p = 0; p < 8; ++p) tw |= x87_tag2((tag >> p) & 1u, st[p]) << (2 * p);
+    st32(m, a, cw & 0xFFFFu, at);
+    st32(m, a + 4, ((sw & ~0x3800u) | (top << 11)) & 0xFFFFu, at);
+    st32(m, a + 8, tw, at);
+    for (uint32_t k = 12; k < 28; k += 4) st32(m, a + k, 0u, at);
+    for (uint32_t i = 0; i < 8; ++i) st80(m, a + 28 + 10 * i, st[(top + i) & 7u], at);
+    cw = 0x037F;
+    sw = 0;
+    tag = 0;
+    top = 0;
+}
+inline void frstor(const Mem& m, uint32_t a, double* st, uint32_t& top, uint32_t& tag, uint32_t& cw, uint32_t& sw, uint32_t at) {
+    cw = ld16(m, a, at);
+    const uint32_t w = ld16(m, a + 4, at);
+    top = (w >> 11) & 7u;
+    sw = w & ~0x3800u;
+    const uint32_t tw = ld16(m, a + 8, at);
+    tag = 0;
+    for (uint32_t p = 0; p < 8; ++p)
+        if (((tw >> (2 * p)) & 3u) != 3u) tag |= 1u << p;
+    for (uint32_t i = 0; i < 8; ++i) st[(top + i) & 7u] = fld80(ld64(m, a + 28 + 10 * i, at), ld16(m, a + 36 + 10 * i, at));
 }
 // fcom/fucom/ftst condition codes in the status word: C3 C2 C0 = 111
 // unordered, 000 greater, 001 less, 100 equal; C1 cleared.

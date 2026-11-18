@@ -185,6 +185,7 @@ private:
     bool imm_round();
     bool reexplore_all();
     void scan_eh_tables();
+    void scan_seh_tables();
     Function make_function(uint32_t f, Origin origin, uint8_t round, struct Explored& r);
     bool plausible(const Function& f) const;
     // Can `a` be a function entry on evidence other than a direct call?
@@ -212,6 +213,7 @@ private:
     // are extra entry points *inside* their parent function, reached only via
     // the C++ runtime. Explored as part of whichever function contains them.
     std::set<uint32_t> eh_unwind_;
+    size_t seh_tables_ = 0, seh_excepts_ = 0;
     std::set<uint32_t> eh_roots_;
     size_t eh_funcinfos_ = 0;
     size_t eh_stubs_ = 0;

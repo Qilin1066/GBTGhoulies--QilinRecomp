@@ -13,8 +13,8 @@ Roadmap step 2, **recompiler core**, is in progress.
 | XBE loader (headers, certificate, sections, libraries, kernel thunks, flat image) | ✅ output identical to the Python prototype |
 | x86 decoder (Zydis, vendored) | ✅ agrees with LLVM on every reachable instruction |
 | Function discovery + CFG (recursive descent, switch tables, C++ EH tables, data-as-code validation) | ✅ 8,842 functions, 556 jump tables (every one in lifted code has a proven size); **100% of the lifted code accounted for** (`qilin coverage`: 0 unknown bytes in the game code, Rare libraries and EH funclets) |
-| Lifter → C++ (integer, scalar SSE, x87 with the game's 24-bit precision control, jump tables, string ops; direct, indirect and tail calls; C++ exception frames) | ✅ all 5,743 functions (game code + Rare libraries; 3 more there belong to Bink and are replaced with it), differentially tested against the original x86 under Unicorn, whole call trees included, also under UBSan: 0 mismatches |
-| Runtime: `qilin_run` loads the game and runs the lifted `main`, with a registry of native replacements for everything that isn't lifted | 🔨 started: 5 XAPI replacements; it now stops at the C runtime's `sprintf` (see `docs/runtime.md`) |
+| Lifter → C++ (integer, scalar SSE, x87 with the game's 24-bit precision control, jump tables, string ops; direct, indirect and tail calls; C++ exception frames) | ✅ all 6,008 functions (game code, Rare libraries, and the 265 C runtime functions they reach; 3 more belong to Bink and are replaced with it), differentially tested against the original x86 under Unicorn, whole call trees included, also under UBSan: 0 mismatches |
+| Runtime: `qilin_run` loads the game and runs the lifted `main`, with a registry of native replacements for everything that isn't lifted | 🔨 started: 5 XAPI replacements; the lifted C runtime's start-up runs, and stops at the kernel's critical sections (see `docs/runtime.md`) |
 | HLE of the XDK libraries, Vulkan | later (see roadmap) |
 
 ## Versions and changes
@@ -88,7 +88,7 @@ This runs the unit tests and the CFG pass, then cross-checks Zydis against LLVM'
 - **Efficiency and reliability come first.** Every choice is judged by whether it makes the game cheaper to run on low-end hardware, and whether it fails loudly instead of misbehaving quietly.
 - **Static recompilation, x86 → C++, compiled ahead of time.** No interpreter and no JIT. Hand-written C++ can override any lifted function.
 - **No DirectX.** D3D8 is translated at API level to Vulkan 1.3, using a deliberately small baseline feature set (1.3 core plus what the Pi 4's driver offers) so one render path runs on everything from low-end ARM GPUs upwards. macOS runs through MoltenVK.
-- **XDK libraries are replaced natively**, not recompiled: XAPI, CRT, D3D8, DSOUND, XACT, XPP, WMADEC and Bink.
+- **XDK libraries are replaced natively**, not recompiled: XAPI, D3D8, DSOUND, XACT, XPP, WMADEC and Bink. The C runtime is lifted with the game, for exact `printf` output and x87 maths.
 - **Ground truth is xemu** running the original game.
 
 See `docs/` for the full roadmap and the analysis notes.

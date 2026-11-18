@@ -1,4 +1,4 @@
-// x87 transcendentals (fsin, fcos, fptan, fpatan, fyl2x) with the same result
+// x87 transcendentals (fsin, fcos, fptan, fpatan, fyl2x, f2xm1) with the same result
 // on every host.
 //
 // The host's maths library differs between glibc, Apple's libm and the MSVC
@@ -110,6 +110,7 @@ inline dd sqrt(dd a) {  // a > 0: one Newton step from the IEEE square root, whi
     const dd r = sub(a, two_prod(s, s));
     return fast_two_sum(s, r.hi / (2.0 * s));
 }
+inline dd scale(dd a, double p2) { return {a.hi * p2, a.lo * p2}; }  // by a power of two: exact (no Dekker split to overflow)
 inline double round(dd a) { return a.hi + a.lo; }  // one IEEE addition: the nearest double
 inline double pow2(int k) { return std::bit_cast<double>(uint64_t(1023 + k) << 52); }  // -1022 <= k <= 1023
 
@@ -493,6 +494,121 @@ inline double yl2x(double y, double x) {
     }
     QILIN_XM_FALLBACK(yl2x);
     return yl2x_slow(y, x);
+}
+
+
+// ---- 2^x - 1 (f2xm1). x = n + j/32 + r with |r| <= 1/64, so
+// 2^x - 1 = 2^n (1 + T_j)(1 + E) - 1 with T_j = 2^(j/32) - 1 from the table
+// and E = expm1(r ln 2), |r ln 2| <= 0.0109. Defined for every finite x
+// (the x87 only defines |x| <= 1; the result is the same there).
+inline constexpr dd kLn2{0x1.62e42fefa39efp-1, 0x1.abc9e3b39803fp-56};
+inline constexpr dd kExp2m1Table[32] = {
+    dd{0.0, 0.0},
+    dd{0x1.66c34c5615d0fp-6, -0x1.183ab7149735cp-60},
+    dd{0x1.6ab0d9f3121ecp-5, 0x1.4c5c95b8c2155p-59},
+    dd{0x1.1301d0125b50ap-4, 0x1.3aefc6bb64c63p-58},
+    dd{0x1.72b83c7d517aep-4, -0x1.9041b9d78a75bp-59},
+    dd{0x1.d4873168b9aa8p-4, -0x1.fe91ff5d9bc3ep-58},
+    dd{0x1.1c3d373ab11c3p-3, 0x1.b07eb6c70572dp-58},
+    dd{0x1.4f4efa8fef709p-3, 0x1.84ba2beb44954p-57},
+    dd{0x1.837f0518db8a9p-3, 0x1.bd1ab48c60b91p-57},
+    dd{0x1.b8d39b9d54e55p-3, 0x1.c51540bd151e6p-58},
+    dd{0x1.ef5326091a112p-3, -0x1.497dbb83d8512p-57},
+    dd{0x1.13821818624b4p-2, 0x1.89b7a04ef80d0p-59},
+    dd{0x1.2ff6b54d8a89cp-2, 0x1.d4397afec42e2p-56},
+    dd{0x1.4d0ad5a753e07p-2, 0x1.f0a83c49d86a6p-56},
+    dd{0x1.6ac1f752150a5p-2, 0x1.8c93015191eb3p-56},
+    dd{0x1.891fac0e95613p-2, -0x1.c1e0bf205a4b8p-57},
+    dd{0x1.a827999fcef32p-2, 0x1.08b2fb1366ea9p-56},
+    dd{0x1.c7dd7a3b17dcfp-2, 0x1.d2370f2ef0acdp-56},
+    dd{0x1.e8451cfac061bp-2, 0x1.7d51023f6cda2p-56},
+    dd{0x1.04b1332999c25p-1, 0x1.59f115f566940p-57},
+    dd{0x1.159ca845541b7p-1, -0x1.22c1d52f369b2p-55},
+    dd{0x1.26e6f619b8bcap-1, -0x1.75fc781b57ebcp-57},
+    dd{0x1.389230547e120p-1, 0x1.c7c46b071f2bep-56},
+    dd{0x1.4aa07647c4ab9p-1, 0x1.684892395f0f8p-57},
+    dd{0x1.5d13f32b5a75bp-1, -0x1.0bc65974466fdp-55},
+    dd{0x1.6feede5f6bc8ep-1, -0x1.5584f7e54ac3bp-56},
+    dd{0x1.83337bb0aa538p-1, 0x1.11065895048ddp-55},
+    dd{0x1.96e41b9df20d2p-1, 0x1.503cbd1e949dbp-56},
+    dd{0x1.ab031b9f7490ep-1, 0x1.2ed02d75b3707p-55},
+    dd{0x1.bf92e66f736bdp-1, 0x1.cb46561cf6949p-55},
+    dd{0x1.d495f454921b3p-1, 0x1.63dce863d76ccp-58},
+    dd{0x1.ea0ecb6dc8a81p-1, -0x1.8b07b489d79d4p-56}
+};
+// expm1(s) for |s| <= 0.011: Taylor to s^15/15! (about 2^-104 relative).
+inline constexpr dd kInvFact[14] = {  // 1/n!, n = 2..15 (mpmath)
+    {0x1.0p-1, 0.0},
+    {0x1.5555555555555p-3, 0x1.5555555555555p-57},
+    {0x1.5555555555555p-5, 0x1.5555555555555p-59},
+    {0x1.1111111111111p-7, 0x1.1111111111111p-63},
+    {0x1.6c16c16c16c17p-10, -0x1.f49f49f49f49fp-65},
+    {0x1.a01a01a01a01ap-13, 0x1.a01a01a01a01ap-73},
+    {0x1.a01a01a01a01ap-16, 0x1.a01a01a01a01ap-76},
+    {0x1.71de3a556c734p-19, -0x1.c154f8ddc6c00p-73},
+    {0x1.27e4fb7789f5cp-22, 0x1.cbbc05b4fa99ap-76},
+    {0x1.ae64567f544e4p-26, -0x1.c062e06d1f209p-80},
+    {0x1.1eed8eff8d898p-29, -0x1.2aec959e14c06p-83},
+    {0x1.6124613a86d09p-33, 0x1.f28e0cc748ebep-87},
+    {0x1.93974a8c07c9dp-37, 0x1.05d6f8a2efd1fp-92},
+    {0x1.ae7f3e733b81fp-41, 0x1.1d8656b0ee8cbp-97},
+};
+inline dd expm1_slow_kernel(dd s) {
+    dd p = kInvFact[13];
+    for (int k = 12; k >= 0; --k) p = add(kInvFact[k], mul(s, p));
+    return add(s, mul(mul(s, s), p));
+}
+// The same to about 2^-67: s + s^2/2 in double-double, the rest (to s^9/9!) in doubles.
+inline dd expm1_fast_kernel(dd s) {
+    const double h = s.hi;
+    const double q = 0x1.5555555555555p-3 +
+                     h * (0x1.5555555555555p-5 + h * (0x1.1111111111111p-7 + h * (0x1.6c16c16c16c17p-10 +
+                     h * (0x1.a01a01a01a01ap-13 + h * (0x1.a01a01a01a01ap-16 + h * 0x1.71de3a556c734p-19)))));
+    const dd s2 = mul(s, s);
+    return add(s, add(dd{0.5 * s2.hi, 0.5 * s2.lo}, dd{s2.hi * h * q, 0.0}));
+}
+// 2^x - 1 as double-double from the kernel, for -60 <= x < 1024 with |x| >= 2^-60.
+// When n == 1024 the value is halved (and then rounded and doubled by the caller).
+template <dd (*Kernel)(dd)>
+inline dd exp2m1_dd(double x, bool& halved) {
+    const double k = std::nearbyint(x * 32.0);  // x * 32 is exact
+    const double r = x - k * 0x1p-5;           // exact (Sterbenz, or k == 0)
+    const int ki = int(k);
+    const int n = ki >> 5, j = ki & 31;        // floor division: n = floor(k / 32)
+    const dd em = Kernel(mul(kLn2, r));
+    const dd t = kExp2m1Table[j];
+    const dd pm1 = add(t, add(em, mul(t, em)));  // (1 + T_j)(1 + E) - 1
+    halved = false;
+    if (n == 0) return pm1;
+    if (n == 1024) {
+        halved = true;
+        return sub(scale(add(dd{1.0, 0.0}, pm1), pow2(1023)), dd{0.5, 0.0});
+    }
+    return sub(scale(add(dd{1.0, 0.0}, pm1), pow2(n)), dd{1.0, 0.0});
+}
+// Tiny |x| < 2^-60: s + s^2/2 with s = x ln 2 decides the rounding.
+inline double exp2m1_tiny(double x) {
+    const double ax = x < 0 ? -x : x;
+    if (ax < 0x1p-900) return round_scaled(mul(kLn2, x * 0x1p200), 200);  // s^2 is far below the last bit
+    const dd s = mul(kLn2, x);
+    return round(add(s, dd{0.5 * s.hi * s.hi, 0.0}));
+}
+inline double exp2m1_slow(double x) {
+    bool halved;
+    const double v = round(exp2m1_dd<expm1_slow_kernel>(x, halved));
+    return halved ? 2.0 * v : v;
+}
+// For finite x != 0.
+inline double exp2m1(double x) {
+    if (x >= 1024.0) return std::bit_cast<double>(0x7FF0000000000000ull);
+    if (x < -60.0) return -1.0;  // 2^x < 2^-60: -1 + 2^x rounds to -1
+    const double ax = x < 0 ? -x : x;
+    if (ax < 0x1p-60) return exp2m1_tiny(x);
+    bool halved;
+    double out;
+    if (rounded(exp2m1_dd<expm1_fast_kernel>(x, halved), out)) return halved ? 2.0 * out : out;
+    QILIN_XM_FALLBACK(exp2m1);
+    return exp2m1_slow(x);
 }
 
 }  // namespace qilin::rt::xm

@@ -43,6 +43,12 @@ int main(int argc, char** argv) {
          [](double y, double x) { return xm::yl2x_slow(y, x); }, [&] { return std::pair{logu(-20, 20), std::exp2(uni(-30, 30))}; }},
         {"yl2x x near 1", [](double y, double x) { return xm::yl2x(y, x); }, [](double y, double x) { return xm::yl2x_slow(y, x); },
          [&] { return std::pair{logu(-20, 20), 1.0 + (rng() & 1 ? -1 : 1) * std::exp2(uni(-52, -1))}; }},
+        {"2^x-1 |x| <= 1", [](double x, double) { return xm::exp2m1(x); }, [](double x, double) { return xm::exp2m1_slow(x); },
+         [&] { return std::pair{uni(-1, 1), 0.0}; }},
+        {"2^x-1 2^-60..1", [](double x, double) { return xm::exp2m1(x); }, [](double x, double) { return xm::exp2m1_slow(x); },
+         [&] { return std::pair{logu(-59.9, 0), 0.0}; }},
+        {"2^x-1 -60..1024", [](double x, double) { return xm::exp2m1(x); }, [](double x, double) { return xm::exp2m1_slow(x); },
+         [&] { return std::pair{uni(-60, 1023.99), 0.0}; }},
     };
     long bad = 0;
     std::printf("%-22s %10s %10s %12s\n", "operands", "cases", "differ", "fallbacks");

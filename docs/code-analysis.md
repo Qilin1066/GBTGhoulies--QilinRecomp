@@ -16,7 +16,7 @@ Boundaries found from function alignment (Rare's code is 16-byte aligned, Micros
 | `0x011000–0x14A840` | ~1,206 KB | **Ghoulies game code** (C++) | Lift |
 | `0x14A840–0x152780` | ~32 KB | **XAPI** (file I/O, threads, memory, save signing, title metadata), starting with `IsBadReadPtr` | Replace (native HLE) |
 | `0x152780–0x165C00` | ~77 KB | **Rare engine libraries** (C): scene-graph renderer (`nodes\geometry\pushbuffer.c`, `blendshape.c`, `nd*` node types), `audiocore.c` wrapper over XACT, zlib inflate | Lift; swap zlib for real zlib |
-| `0x165C00–0x170D80` | ~45 KB | **C/C++ runtime** (LIBCMT/LIBCPMT: printf family, float formatting, exceptions) | Replace with host CRT |
+| `0x165C00–0x170D80` | ~45 KB | **C/C++ runtime** (LIBCMT/LIBCPMT: printf family, float formatting, exceptions) | Lift what lifted code reaches (265 of 434 functions, v0.11.0) |
 | `0x170D80–0x171020` | ~0.7 KB | Compiler-generated C++ exception-unwind funclets (belong to game) | Lift |
 
 Three functions in the Rare-library range belong to Bink and are called only from the BINK section: `0x162570`, `0x1626B0` and Bink's MMX probe at `0x162840`. They're replaced with Bink, not lifted.

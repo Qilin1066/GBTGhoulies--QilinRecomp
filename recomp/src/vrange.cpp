@@ -508,6 +508,19 @@ std::map<uint32_t, IndexFact> index_ranges(const Xbe& xbe, const std::map<uint32
         if (x == kNoReg) continue;
         IndexFact f;
         f.index = s->r[size_t(x)];
+        // `neg r` right before the jump, which nothing else branches to.
+        const Insn* prev = nullptr;
+        bool targeted = false;
+        for (auto& [a, i] : insns) {
+            if (i->end() == w) prev = i;
+            if (i->rel_target() == w) targeted = true;
+        }
+        if (prev && !targeted && prev->mnem == ZYDIS_MNEMONIC_NEG && prev->nops >= 1 &&
+            prev->op[0].kind == Operand::Kind::Reg && gpr_index(prev->op[0].reg) == x)
+            if (const State* ps = an.at(prev->addr)) {
+                f.index = ps->r[size_t(x)];
+                f.negated = true;
+            }
         if (const ByteSrc& b = s->src[size_t(x)]; b.table) {
             f.byte_table = b.table + b.base.lo;
             f.byte_count = b.base.hi - b.base.lo + 1;

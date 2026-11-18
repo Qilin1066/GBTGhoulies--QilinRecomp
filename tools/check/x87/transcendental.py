@@ -54,6 +54,8 @@ def reference(op, a, b):
         return nearest(mpmath.tan(x))
     if op == "A":
         return nearest(mpmath.atan2(x, y))
+    if op == "F":
+        return nearest(mpmath.expm1(x * mpmath.log(2)))
     return nearest(x * mpmath.log(y, 2))
 
 
@@ -80,10 +82,14 @@ CASES = {
           ("x 2^-1074..2^1024", lambda r: (logu(r, -40, 40), 2.0 ** r.uniform(-1074, 1023.9))),
           ("y 2^-1000..2^1020", lambda r: (logu(r, -1000, 1020), 2.0 ** r.uniform(-30, 30))),
           ("subnormal results", lambda r: (logu(r, -1074, -1023), 2.0 ** r.uniform(-30, 30)))],
+    "F": [("|x| <= 1", lambda r: r.uniform(-1, 1)), ("2^-60..1", lambda r: logu(r, -60, 0)),
+          ("near k/32", lambda r: r.randint(-32, 32) / 32 + logu(r, -50, -6)),
+          ("tiny 2^-1074..2^-60", lambda r: logu(r, -1074, -60)),
+          ("beyond the x87's domain", lambda r: r.choice((r.uniform(1, 1024), r.uniform(-64, -1))))],
 }
 CASES["C"] = CASES["S"]
 CASES["T"] = CASES["S"]
-NAMES = {"S": "fsin", "C": "fcos", "T": "ftan", "A": "fpatan", "L": "fyl2x"}
+NAMES = {"S": "fsin", "C": "fcos", "T": "ftan", "A": "fpatan", "L": "fyl2x", "F": "f2xm1"}
 H = float.fromhex
 GOLDEN = [  # (op, a, b): small and large arguments, near multiples of pi/2, subnormals
     ("S", 0.5, 0), ("S", -3.0, 0), ("S", 1e6, 0), ("S", H("0x1.921fb54442d18p+1"), 0), ("S", H("0x1.fffffffffffffp+62"), 0),
@@ -95,6 +101,8 @@ GOLDEN = [  # (op, a, b): small and large arguments, near multiples of pi/2, sub
     ("A", 1e-200, 1e100), ("A", -1.0, -1.0), ("A", 1e-300, 1e10),
     ("L", 1.0, 3.0), ("L", -2.5, 0.1), ("L", 3.0, 1.0000000000000002), ("L", 1e-310, 7.0), ("L", 5e300, 1e-300),
     ("L", 0.5, 2.0 ** -1074), ("L", 1.0, 1.0 - 2.0 ** -53),
+    ("F", 0.5, 0), ("F", -0.5, 0), ("F", 1.0, 0), ("F", -1.0, 0), ("F", 2.0 ** -70, 0), ("F", -(2.0 ** -1070), 0),
+    ("F", 0.03125, 0), ("F", -0.015625, 0), ("F", H("0x1.fffffffffffffp-1"), 0), ("F", 1023.5, 0), ("F", -55.0, 0),
 ]
 
 
@@ -107,7 +115,8 @@ def main():
     ap.add_argument("--golden", action="store_true", help="print the unit-test vectors")
     args = ap.parse_args()
     if args.golden:
-        call = {"S": "fsin({a})", "C": "fcos({a})", "T": "ftan({a})", "A": "fpatan({a}, {b})", "L": "fyl2x({a}, {b})"}
+        call = {"S": "fsin({a})", "C": "fcos({a})", "T": "ftan({a})", "A": "fpatan({a}, {b})", "L": "fyl2x({a}, {b})",
+                "F": "f2xm1({a})"}
         for op, a, b in GOLDEN:
             r = reference(op, a, b)
             expr = call[op].format(a=f"rt::dfrom(0x{d2b(a):016X}ull)", b=f"rt::dfrom(0x{d2b(b):016X}ull)")

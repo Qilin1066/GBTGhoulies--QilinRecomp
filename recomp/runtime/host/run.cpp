@@ -3,12 +3,17 @@
 // yet, which it names. Built with the generated code (-DQILIN_GEN_DIR=...).
 //
 // Ghoulies' XBE entry point (0x14FAE9) is XAPI start-up code. It creates the
-// main thread, whose procedure (0x14FA75) initialises XAPI and the C runtime
-// (whose initializer tables hold only library code) and then calls the game's
-// main(0, 0, 0) at 0x32390. The runtime replaces all of that start-up: it sets
-// up memory, the stack and the thread information block, and calls main.
+// main thread, whose procedure (0x14FA75) initialises XAPI, runs the
+// initializer tables (0x15172C, 0x1516D4) and then calls the game's
+// main(0, 0, 0) at 0x32390. The runtime replaces XAPI's part: it sets up
+// memory, the stack and the thread information block. The C runtime is lifted,
+// so its initializers run as XAPI ran them, in the same order; entries that
+// belong to libraries replaced natively (XGRPH, DSOUND) are skipped, their
+// work done by the native replacements.
 #include <cstdio>
 #include <cstring>
+#include <initializer_list>
+#include <iterator>
 #include <memory>
 #include <print>
 
@@ -25,6 +30,40 @@ constexpr uint32_t kGameMain = 0x32390;
 void push(rt::Context& c, uint32_t v) {
     c.esp -= 4;
     rt::st32(rt::Mem{c.mem, c.mem_size}, c.esp, v, 0);
+}
+
+// Calls a guest function (cdecl) with the given arguments.
+void call_guest(rt::Context& c, uint32_t fn, std::initializer_list<uint32_t> args) {
+    const uint32_t esp = c.esp;
+    for (auto it = std::rbegin(args); it != std::rend(args); ++it) push(c, *it);
+    push(c, host::kReturnSentinel);
+    rt::call(c, fn);
+    if (c.ret_to != host::kReturnSentinel) rt::trap(fn, "an initializer returned somewhere else");
+    c.esp = esp;
+}
+
+// One initializer table, [lo, hi): null and -1 entries are empty slots.
+void run_table(rt::Context& c, uint32_t lo, uint32_t hi) {
+    const rt::Mem m{c.mem, c.mem_size};
+    for (uint32_t a = lo; a < hi; a += 4) {
+        const uint32_t fn = rt::ld32(m, a, 0);
+        if (fn == 0 || fn == 0xFFFFFFFFu) continue;
+        if (!rt::is_lifted(fn)) {
+            std::println("qilin_run: initializer {:08X} ({}) skipped: its library is replaced natively", fn, host::describe(fn));
+            continue;
+        }
+        call_guest(c, fn, {});
+    }
+}
+
+// The C runtime's start-up, as XAPI's thread procedure does it (0x14FAC1).
+void crt_startup(rt::Context& c) {
+    const rt::Mem m{c.mem, c.mem_size};
+    run_table(c, 0x32C800, 0x32C80C);                            // _mtinit, _ioinit
+    if (const uint32_t fpinit = rt::ld32(m, 0x337A88, 0))        // _FPinit: float formatting, x87 set-up
+        call_guest(c, fpinit, {1});                                // XAPI's `call eax` leaves a non-zero word there
+    run_table(c, 0x32C838, 0x32C84C);
+    run_table(c, 0x32C810, 0x32C834);
 }
 
 }  // namespace
@@ -91,7 +130,9 @@ int main(int argc, char** argv) {
     push(c, host::kReturnSentinel);
     host::set_current(&c);
 
-    std::println("qilin_run: {} replacements registered; calling main at {:08X}", host::hle_count(), kGameMain);
+    std::println("qilin_run: {} replacements registered; starting the C runtime", host::hle_count());
+    crt_startup(c);
+    std::println("qilin_run: calling main at {:08X}", kGameMain);
     rt::call(c, kGameMain);
     if (c.ret_to != host::kReturnSentinel) rt::trap(kGameMain, "main returned somewhere else");
     std::println("qilin_run: main returned {}", c.eax);

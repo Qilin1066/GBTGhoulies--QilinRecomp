@@ -147,6 +147,8 @@ def correct_transcendental(mnem, x, y):
         v = mpmath.cos(mx)
     elif mnem == "fptan":
         v = mpmath.tan(mx)
+    elif mnem == "f2xm1":
+        v = mpmath.expm1(mx * mpmath.log(2))
     else:
         my = mpmath.mpf(y.numerator) / y.denominator
         v = mpmath.atan2(my, mx) if mnem == "fpatan" else my * mpmath.log(mx, 2)
@@ -247,14 +249,30 @@ def build(args, work):
     return img, lib
 
 
+# C runtime assembly with irregular contracts (recomp/src/main.cpp,
+# crt_conventions): shared epilogues that pop one word of their caller's frame
+# before returning, and helpers that take their operands on the x87 stack.
+GLUE_POPS = {0x165F80: 1, 0x16B7FE: 1, 0x16B80B: 1, 0x16B849: 1}
+X87_ARGS = {0x1673D8: 1, 0x167CB8: 2, 0x167CDC: 2, 0x167EA1: 1, 0x16B64D: 1, 0x16B70C: 1, 0x16B723: 1, 0x16B760: 1,
+            0x16B849: 1, 0x1706E0: 1, 0x1706FD: 1, 0x167500: 1, 0x16751D: 1}
+
+
 class EmuFixups:
     """Where Unicorn (QEMU 5) differs from the hardware, make it follow the
     hardware, identically in both emulators:
       - rdtsc returns the host's time-stamp counter: replaced by a counter that
         restarts every trial and steps by a fixed amount;
       - fcomi/fcomip/fucomi/fucomip leave OF, SF and AF unchanged: Intel clears them;
+      - after each x87 instruction of the C runtime's maths, a register value
+        outside double's exponent range (pow's underflow and overflow paths
+        rescale such values by 2^1536) is a known, documented limitation of
+        the double registers: the trial is skipped. Game code never makes one;
+      - fnsave stores the last instruction and operand pointers, which the
+        lifted code (like nothing but frstor) doesn't track: zeroed here;
+      - fst/fstp st(i) into an empty register leaves it tagged empty: Intel
+        tags it valid (C runtime maths ends with `fstp st1` on a one-value stack);
       - fyl2x with an operand <= 0 doesn't pop: the trial is skipped;
-      - fsin, fcos, fptan, fpatan and fyl2x return the host libm's answer
+      - fsin, fcos, fptan, fpatan, fyl2x and f2xm1 return the host libm's answer
         (fyl2x even rounds three times). The hardware's 64-bit results aren't
         available, and the lifted code is specified to return the correctly
         rounded double (recomp/runtime/x87_math.hpp), so for finite, ordinary
@@ -262,7 +280,7 @@ class EmuFixups:
         the exact 80-bit operands."""
 
     def __init__(self, insns_path):
-        self.rdtsc, self.fcomi, self.fyl2x, self.trans = [], [], [], []
+        self.rdtsc, self.fcomi, self.fyl2x, self.trans, self.fst_reg, self.crt_x87, self.fnsave = [], [], [], [], [], [], []
         for line in open(insns_path):
             parts = line.split(None, 3)
             a, n, m = int(parts[0], 16), int(parts[1]), parts[3].split("\t")[0]
@@ -272,7 +290,15 @@ class EmuFixups:
                 self.fcomi.append((a, a + n))
             if m == "fyl2x":
                 self.fyl2x.append(a)
-            if m in ("fsin", "fcos", "fptan", "fpatan", "fyl2x"):
+            if m.startswith("f") and 0x165C00 <= a < 0x1707B0 and m not in ("fwait", "fnstcw", "fldcw", "fnstsw"):
+                self.crt_x87.append(a + n)
+            if m == "fnsave":
+                self.fnsave.append((a, a + n))
+            if m in ("fst", "fstp"):
+                ops = parts[3].split("\t")[1].split(None, 1)[1] if " " in parts[3].split("\t")[1] else ""
+                if ops.startswith("st") and ops[2:].isdigit():
+                    self.fst_reg.append((a, a + n, int(ops[2:])))
+            if m in ("fsin", "fcos", "fptan", "fpatan", "fyl2x", "f2xm1"):
                 self.trans.append((a, a + n, m))
         self.quirk = ""
 
@@ -299,6 +325,56 @@ class EmuFixups:
             uc.hook_add(UC_HOOK_CODE, on_fcomi, None, a, a)
             uc.hook_add(UC_HOOK_CODE, after_fcomi, None, nxt, nxt)
 
+        def on_fst(u, a, size, i):
+            top = (u.reg_read(UC_X86_REG_FPSW) >> 11) & 7
+            state["fst"] = (a + size, (top + i) & 7)
+
+        def after_fst(u, a, size, ud):
+            f = state.get("fst")
+            if f and f[0] == a:
+                state["fst"] = None
+                tag = u.reg_read(UC_X86_REG_FPTAG)
+                if (tag >> (2 * f[1])) & 3 == TAG_EMPTY:
+                    u.reg_write(UC_X86_REG_FPTAG, tag & ~(3 << (2 * f[1])))
+        for a, nxt, i in self.fst_reg:
+            if i:
+                uc.hook_add(UC_HOOK_CODE, on_fst, i, a, a)
+                uc.hook_add(UC_HOOK_CODE, after_fst, None, nxt, nxt)
+
+        def on_fnsave(u, a, size, ud):
+            # The operand is [reg + disp8] in the C runtime's pow; resolve it before the instruction runs.
+            state["fnsave"] = (a + size, None)
+            insn = bytes(u.mem_read(a, size))
+            if insn[0] == 0xDD and (insn[1] >> 3) & 7 == 6:
+                rm, mod = insn[1] & 7, insn[1] >> 6
+                regs = [UC_X86_REG_EAX, UC_X86_REG_ECX, UC_X86_REG_EDX, UC_X86_REG_EBX, UC_X86_REG_ESP, UC_X86_REG_EBP,
+                        UC_X86_REG_ESI, UC_X86_REG_EDI]
+                if mod == 1 and rm != 4:
+                    state["fnsave"] = (a + size, (u.reg_read(regs[rm]) + struct.unpack("<b", insn[2:3])[0]) & 0xFFFFFFFF)
+            if state["fnsave"][1] is None:
+                self_.quirk = f"fnsave operand form at {a:08X} not handled by the harness"
+
+        def after_fnsave(u, a, size, ud):
+            f = state.get("fnsave")
+            if f and f[0] == a:
+                state["fnsave"] = None
+                if f[1] is not None:
+                    u.mem_write(f[1] + 12, bytes(16))
+        for a, nxt in self.fnsave:
+            uc.hook_add(UC_HOOK_CODE, on_fnsave, None, a, a)
+            uc.hook_add(UC_HOOK_CODE, after_fnsave, None, nxt, nxt)
+
+        def after_crt_x87(u, a, size, ud):
+            fx = x87_read(u)
+            for p in range(8):
+                if fx["valid"] >> p & 1:
+                    mant, se = fx["regs"][p]
+                    e = se & 0x7FFF
+                    if mant and e != 0x7FFF and not (16383 - 1074 <= e <= 16383 + 1023):
+                        self_.quirk = f"x87 value outside double's range after {a:08X}"
+        for a in self.crt_x87:
+            uc.hook_add(UC_HOOK_CODE, after_crt_x87, None, a, a)
+
         def on_fyl2x(u, a, size, ud):
             top = (u.reg_read(UC_X86_REG_FPSW) >> 11) & 7
             v, _ = x802d(u.reg_read(UC_X86_REG_FP0 + top))
@@ -314,7 +390,7 @@ class EmuFixups:
             state["trans"] = None
             r = correct_transcendental(mnem, st0, st1)
             if r is not None:  # the result lands in ST(0), or in ST(1) before the pop
-                state["trans"] = (a + size, top if mnem in ("fsin", "fcos", "fptan") else (top + 1) & 7, r)
+                state["trans"] = (a + size, top if mnem in ("fsin", "fcos", "fptan", "f2xm1") else (top + 1) & 7, r)
 
         def after_trans(u, a, size, ud):
             t = state.get("trans")
@@ -517,19 +593,34 @@ class Runner:
         for a, n in merge(ranges):
             self.write_both(a, self.pristine_bytes(a, n))
 
-    def trial(self, addr, rng):
+    def trial(self, addr, rng, args=None, setup=()):
+        """One trial. A targeted check (tools/check/crt_printf.py) passes the
+        stack arguments and (address, bytes) blocks to place in memory first."""
         regs = [rand_word(rng) for _ in GPRS]
         regs[4] = STACK_TOP
         xmm = [[rand_word(rng, (1, 1, 6, 1)) for _ in range(4)] for _ in range(8)]
-        stack = struct.pack("<I", SENTINEL) + struct.pack("<16I", *[rand_word(rng) for _ in range(16)])
+        # A shared epilogue pops its caller's saved word before returning.
+        glue = [rand_word(rng) for _ in range(GLUE_POPS.get(addr, 0))]
+        words = list(args or [])
+        words += [rand_word(rng) for _ in range(max(0, 16 - len(words)))]
+        stack = struct.pack(f"<{len(glue)}I", *glue) + struct.pack("<I", SENTINEL) + struct.pack(f"<{len(words)}I", *words)
         self.write_both(STACK_TOP, stack)
+        for a, data in setup:
+            self.write_both(a, data)
+        extra = [(a, len(data)) for a, data in setup]
         # x87: the variant's control word, and half the time a value already in
-        # ST(0) (an argument passed on the register stack).
+        # ST(0) (an argument passed on the register stack); the C runtime's
+        # register-stack helpers always get their arguments.
         fst = [0.0] * 8
         ftop, fvalid = 0, 0
-        if rng.random() < 0.5:
-            ftop, fvalid = 7, 1 << 7
-            fst[7] = struct.unpack("<f", struct.pack("<I", rand_word(rng, (1, 1, 6, 1))))[0]
+        nargs = X87_ARGS.get(addr, 1 if rng.random() < 0.5 else 0)
+        for k in range(nargs):
+            ftop = (ftop - 1) & 7
+            fvalid |= 1 << ftop
+            if addr in X87_ARGS and rng.random() < 0.5:
+                fst[ftop] = rng.choice(FLOATS) * rng.choice((1.0, 1.0, 0.37, 13.0))
+            else:
+                fst[ftop] = struct.unpack("<f", struct.pack("<I", rand_word(rng, (1, 1, 6, 1))))[0]
 
         # ---- original under Unicorn ----
         uc = self.uc
@@ -562,7 +653,7 @@ class Runner:
             why = f"{e} at {uc_eip(uc):08X}"
         self.last_why = why  # for debugging a single trial
         if status == "budget" or self.fixups.quirk:  # never run the lifted code on a state the original didn't finish
-            self.restore(list(self.uc_writes) + [(STACK_TOP, len(stack))])
+            self.restore(list(self.uc_writes) + [(STACK_TOP, len(stack))] + extra)
             return "skip", "", regs
         uc_regs = [uc.reg_read(r) for r in UC_GPR]
         uc_xmm = [uc.reg_read(UC_X86_REG_XMM0 + k) for k in range(8)]
@@ -664,7 +755,7 @@ class Runner:
                 result = "pass-nan"
             elif self.wide_reg:
                 result = "pass-x87wide"  # equal once the original's 64-bit register value is rounded to double
-        self.restore(uc_w + h_w + [(STACK_TOP, len(stack))])
+        self.restore(uc_w + h_w + [(STACK_TOP, len(stack))] + extra)
         return result, detail, regs
 
 

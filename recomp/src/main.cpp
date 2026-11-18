@@ -63,6 +63,31 @@ constexpr Replaced kReplaced[] = {
     {0x162840, "Bink's MMX probe (pushfd, cpuid); its one caller is in BINK (0x1AE916), and only BINK reads its result"},
 };
 
+// The C runtime (LIBCMT) isn't lifted as a region: only the functions lifted
+// code can reach are (closure_of). Its hand-written assembly breaks the usual
+// function contract in a few reviewed places, listed here.
+constexpr Range kCrt{0x165C00, 0x1707B0};
+
+Conventions crt_conventions() {
+    constexpr uint8_t ZF = 8;
+    Conventions c;
+    // x87 maths: a classifier returns ZF (operand is inf/NaN), the next
+    // routine branches on it.
+    c.flags_out = {{0x16B7A5, ZF}, {0x16B7E8, ZF}};  // load-and-classify helpers
+    c.flags_in = {{0x16751D, ZF}, {0x1706FD, ZF}};    // asin / acos cores
+    c.stack_glue = {
+        0x165F80,  // strchr's shared exit: lea eax, [edx-1]; pop ebx; ret
+        0x166D58,  // __SEH_prolog: builds the caller's frame
+        0x166D93,  // __SEH_epilog: tears it down
+        0x1675FB,  // pop eax; pop ecx; xchg [esp], eax; jmp eax (calls a __finally block)
+        0x1679A8,  // __EH_prolog
+        0x16B7FE,  // x87 maths epilogues: pop the saved control word, return
+        0x16B80B,
+        0x16B849,
+    };
+    return c;
+}
+
 struct Failure {
     std::string message;
 };
@@ -148,6 +173,44 @@ std::vector<std::string> check_replaced(const Xbe& xbe, Decoder& dec, const Cfg&
     return out;
 }
 
+// CRT functions reachable from `from`: direct calls and tail calls, and
+// function addresses as immediates or displacements (pointers for indirect
+// calls), followed transitively; plus every CRT function whose address is
+// stored in a data section (the CRT's own pointer tables, such as the
+// floating-point formatting hooks printf calls through).
+std::vector<uint32_t> crt_closure(const Xbe& xbe, Decoder& dec, const Cfg& cfg, std::span<const uint32_t> from) {
+    const auto& fns = cfg.functions();
+    auto in_crt = [](uint32_t a) { return a >= kCrt.lo && a < kCrt.hi; };
+    std::set<uint32_t> seen;
+    std::vector<uint32_t> work;
+    auto add = [&](uint32_t t) {
+        if (in_crt(t) && fns.contains(t) && seen.insert(t).second) work.push_back(t);
+    };
+    auto refs = [&](const Function& fn) {
+        for (uint32_t t : fn.calls) add(t);
+        for (uint32_t t : fn.tails) add(t);
+        for (uint32_t ia : fn.insns) {
+            const Insn* i = dec.decode(ia);
+            for (int k = 0; i && k < i->nops; ++k) {
+                const Operand& o = i->op[k];
+                if (o.kind == Operand::Kind::Imm && !o.imm_relative) add(uint32_t(o.imm));
+                if (o.kind == Operand::Kind::Mem) add(uint32_t(o.disp));
+            }
+        }
+    };
+    for (uint32_t a : from) refs(fns.at(a));
+    for (const XbeSection& s : xbe.sections) {
+        if (s.code) continue;
+        for (uint32_t va = s.va; va + 4 <= s.file_end(); ++va) add(xbe.u32(va));
+    }
+    while (!work.empty()) {
+        const uint32_t a = work.back();
+        work.pop_back();
+        refs(fns.at(a));
+    }
+    return {seen.begin(), seen.end()};
+}
+
 int cmd_lift(const Xbe& xbe, Decoder& dec, std::span<const std::string_view> args) {
     auto outdir = opt(args, "--out");
     if (!outdir) return usage();
@@ -171,7 +234,8 @@ int cmd_lift(const Xbe& xbe, Decoder& dec, std::span<const std::string_view> arg
 
     Cfg cfg(xbe, dec);
     cfg.run();
-    Lifter lifter(dec);
+    const Conventions conv = crt_conventions();
+    Lifter lifter(dec, &conv);
     const std::filesystem::path dir(*outdir);
     std::filesystem::create_directories(dir);
 
@@ -189,20 +253,32 @@ int cmd_lift(const Xbe& xbe, Decoder& dec, std::span<const std::string_view> arg
         chunk.clear();
         in_chunk = 0;
     };
-    for (auto& [a, fn] : cfg.functions()) {
-        if (!wanted(a)) continue;
+    int crt_failed = 0;
+    auto lift_one = [&](uint32_t a, const Function& fn) {
         ++total;
         auto r = lifter.lift(fn);
         if (!r) {
             failures += r.error().message() + '\n';
             buckets[r.error().category()]++;
-            continue;
+            return false;
         }
         chunk += *r + '\n';
         done.push_back(a);
         called.insert(fn.calls.begin(), fn.calls.end());
         called.insert(fn.tails.begin(), fn.tails.end());
         if (++in_chunk == 200) flush();
+        return true;
+    };
+    for (auto& [a, fn] : cfg.functions())
+        if (wanted(a)) lift_one(a, fn);
+    // The CRT functions lifted code can reach, transitively (default run only).
+    size_t crt_n = 0;
+    if (!only && !opt(args, "--range")) {
+        std::vector<uint32_t> crt = crt_closure(xbe, dec, cfg, done);
+        crt_n = crt.size();
+        for (uint32_t a : crt)
+            if (!lift_one(a, cfg.functions().at(a))) ++crt_failed;
+        std::ranges::sort(done);
     }
     flush();
 
@@ -232,6 +308,11 @@ int cmd_lift(const Xbe& xbe, Decoder& dec, std::span<const std::string_view> arg
     write_file(dir / "failures.txt", failures);
 
     std::println("lifted {} of {} functions ({} call targets without a lifted body get stubs)", done.size(), total, stubs.size());
+    if (crt_n) std::println("  {} of them are the C runtime functions lifted code can reach", crt_n);
+    if (crt_failed) {
+        std::println(stderr, "qilin: error: {} reachable C runtime functions don't lift (see failures.txt)", crt_failed);
+        return 3;
+    }
     if (!only) {
         size_t n = 0;
         for (const Replaced& r : kReplaced)

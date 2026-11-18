@@ -280,6 +280,30 @@ void Cfg::resolve_jt(const std::vector<const Insn*>& hist, const XbeSection& sec
 // hold an address in the table's code section; otherwise the proof doesn't
 // describe this table and it stays heuristic.
 bool Cfg::prove_table(const IndexFact& fact, const XbeSection& sec, JumpTable& t) const {
+    if (fact.negated) {  // indices -hi .. -lo of a small non-negative range
+        const Range p = fact.index;
+        if (p.hi >= 4096 || fact.byte_table) return false;
+        IndexFact n;
+        n.index = Range{uint32_t(-int64_t(p.hi)), uint32_t(-int64_t(p.lo))};
+        if (p.lo == 0 && p.hi > 0) {  // crosses zero: -hi .. 0 as int32
+            t.entries.assign(p.hi + 1, 0);
+            std::set<uint32_t> tg;
+            for (uint32_t k = 0; k <= p.hi; ++k) {
+                const uint32_t a = t.table + 4 * (uint32_t(-int64_t(p.hi)) + k);
+                if (!xbe_.mapped(a, 4)) return false;
+                const uint32_t v = xbe_.u32(a);
+                if (v < sec.va || v >= sec.file_end()) return false;
+                t.entries[k] = v;
+                tg.insert(v);
+            }
+            t.first = -int32_t(p.hi);
+            t.targets.assign(tg.begin(), tg.end());
+            t.bounded = true;
+            t.how = "range+neg";
+            return true;
+        }
+        return prove_table(n, sec, t);
+    }
     const Range r = fact.index;
     // Non-negative or entirely negative (as int32); at most 4096 slots.
     const bool neg = r.lo >= 0x80000000u;
@@ -810,6 +834,58 @@ void Cfg::rebuild_owned() {
 // type, dispCatchObj, addressOfHandler). A catch handler is called by the
 // runtime with the parent's frame and returns the continuation address in eax
 // (`mov eax, imm32; ret`).
+// MSVC structured exception handling (__try/__except/__finally) in the CRT and
+// XAPI: the function's prologue pushes a scope table, either via
+// __SEH_prolog (`push scopetable; call X`, X starting `push imm32; mov eax,
+// fs:[0]`) or inline (`push -1; push scopetable; push handler; mov eax,
+// fs:[0]`). Each table entry is {enclosing level, filter, handler}. For an
+// __except (filter != 0), the filter expression and the handler body are
+// laid out inside the parent function, and the handler continues into the
+// parent's code: both are entry points inside the parent (eh_roots_), never
+// functions of their own. A __finally (filter 0) handler is a real function
+// the parent also calls directly: nothing to do.
+void Cfg::scan_seh_tables() {
+    auto code = [&](uint32_t a) { return xbe_.code_section_at(a) != nullptr; };
+    auto data = [&](uint32_t a) {
+        const XbeSection* s = xbe_.section_at(a);
+        return s && !s->code && xbe_.mapped(a, 12);
+    };
+    auto fs0_load = [&](uint32_t a) {  // mov eax, dword ptr fs:[0]
+        return xbe_.mapped(a, 6) && xbe_.u8(a) == 0x64 && xbe_.u8(a + 1) == 0xA1 && xbe_.u32(a + 2) == 0;
+    };
+    std::set<uint32_t> tables;
+    for (auto& s : xbe_.sections) {
+        if (!s.code) continue;
+        for (uint32_t a = s.va; a + 12 <= s.file_end(); ++a) {
+            if (xbe_.u8(a) == 0x68 && xbe_.u8(a + 5) == 0xE8) {
+                const uint32_t t = xbe_.u32(a + 1), x = a + 10 + xbe_.u32(a + 6);
+                if (data(t) && code(x) && xbe_.mapped(x, 11) && xbe_.u8(x) == 0x68 && fs0_load(x + 5)) tables.insert(t);
+            }
+            if (xbe_.u8(a) == 0x6A && xbe_.u8(a + 1) == 0xFF && xbe_.u8(a + 2) == 0x68 && xbe_.u8(a + 7) == 0x68 &&
+                fs0_load(a + 12)) {
+                const uint32_t t = xbe_.u32(a + 3);
+                if (data(t)) tables.insert(t);
+            }
+        }
+    }
+    std::set<uint32_t> roots;
+    for (auto it = tables.begin(); it != tables.end(); ++it) {
+        const uint32_t t = *it, next = std::next(it) == tables.end() ? UINT32_MAX : *std::next(it);
+        ++seh_tables_;
+        for (uint32_t k = 0; t + 12 * (k + 1) <= next && data(t + 12 * k); ++k) {
+            const uint32_t enclosing = xbe_.u32(t + 12 * k), filter = xbe_.u32(t + 12 * k + 4), handler = xbe_.u32(t + 12 * k + 8);
+            if (!(enclosing == 0xFFFFFFFFu || enclosing < k) || !(filter == 0 || code(filter)) || !code(handler)) break;
+            if (filter == 0) continue;
+            roots.insert(filter);
+            roots.insert(handler);
+            ++seh_excepts_;
+        }
+    }
+    eh_roots_.insert(roots.begin(), roots.end());
+    std::erase_if(strong_, [&](uint32_t a) { return roots.contains(a); });
+    std::erase_if(weak_, [&](uint32_t a) { return roots.contains(a); });
+}
+
 void Cfg::scan_eh_tables() {
     auto code = [&](uint32_t a) { return xbe_.code_section_at(a) != nullptr; };
     auto rd = [&](uint32_t a, uint32_t& v) {
@@ -882,6 +958,7 @@ void Cfg::scan_eh_tables() {
 void Cfg::run() {
     linear_seeds();
     scan_eh_tables();
+    scan_seh_tables();
     known_.insert(strong_.begin(), strong_.end());
     cand_.insert(strong_.begin(), strong_.end());
     cand_.insert(weak_.begin(), weak_.end());
@@ -892,7 +969,8 @@ void Cfg::run() {
         if (s.name != ".rdata" && s.name != ".data") continue;
         for (uint32_t k = 0; k + 3 < s.rsize; k += 4) {
             const uint32_t v = xbe_.u32(s.va + k);
-            if (v >= cfg_.dataptr_lo && v < cfg_.dataptr_hi && v % 16 == 0 && dec_.decode(v) && entry_ok(v)) dptr.insert(v);
+            if (v >= cfg_.dataptr_lo && v < cfg_.dataptr_hi && v % 16 == 0 && dec_.decode(v) && entry_ok(v) && !eh_roots_.contains(v))
+                dptr.insert(v);
         }
     }
 
@@ -1315,7 +1393,9 @@ std::string Cfg::summary() const {
     std::format_to(w, "rejected as data decoded as code: {}\n", rejected_.size());
     std::format_to(w, "fragments merged back into their parent function: {}\n", absorbed_);
     std::format_to(w, "C++ EH: {} FuncInfo tables, {} handler stubs, {} unwind funclets, {} catch/continuation entry points\n",
-                   eh_funcinfos_, eh_stubs_, eh_unwind_.size() - eh_stubs_, eh_roots_.size());
+                   eh_funcinfos_, eh_stubs_, eh_unwind_.size() - eh_stubs_, eh_roots_.size() - 2 * seh_excepts_);
+    std::format_to(w, "SEH: {} scope tables, {} __except filter/handler pairs (entry points inside their function)\n", seh_tables_,
+                   seh_excepts_);
     std::format_to(w, "suspect call targets kept (see `qilin suspects`): {}\n", suspects_.size());
     return out;
 }

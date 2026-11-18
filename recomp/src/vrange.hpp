@@ -36,6 +36,9 @@ struct IndexFact {
     Range index;
     uint32_t byte_table = 0;  // first byte of the index table read (0 if none)
     uint32_t byte_count = 0;  // bytes of it that can be read
+    // The jump is `neg r; jmp [4*r + T]` (memmove's tail table): index is r's
+    // range *before* the neg, and the table is indexed by its negation.
+    bool negated = false;
 };
 
 // insns: the function's instructions; entries: where execution can start

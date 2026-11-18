@@ -214,6 +214,36 @@ std::vector<uint8_t> make_xbe() {
     };
     std::memcpy(&d[0x1390], ehframe, sizeof ehframe);
     put32(d, 0x1424, 0x11390);
+    std::memset(&d[0x13B7], 0xCC, 0x113C0 - 0x113B7);
+    // 113C0: instructions the C runtime's hand-written assembly uses.
+    const uint8_t crtops[] = {
+        0x0F, 0xA4, 0xC2, 0x05,  // 113C0 shld edx, eax, 5
+        0x0F, 0xAD, 0xC2,        // 113C4 shrd edx, eax, cl
+        0xD1, 0xD8,              // 113C7 rcr eax, 1
+        0xE3, 0x03,              // 113C9 jecxz 113CE
+        0xF2, 0xAE,              // 113CB repne scasb
+        0x90,                    // 113CD nop
+        0xD9, 0xFC,              // 113CE frndint
+        0xD9, 0xFD,              // 113D0 fscale
+        0xD9, 0xE5,              // 113D2 fxam
+        0xDB, 0xE2,              // 113D4 fnclex
+        0xD9, 0xF0,              // 113D6 f2xm1
+        0xDF, 0x7C, 0x24, 0xF8,  // 113D8 fistp qword ptr [esp-8]
+        0xDB, 0x6C, 0x24, 0xF8,  // 113DC fld tbyte ptr [esp-8]
+        0xDD, 0x74, 0x24, 0x80,  // 113E0 fnsave [esp-0x80]
+        0xDD, 0x64, 0x24, 0x80,  // 113E4 frstor [esp-0x80]
+        0xDD, 0xD8,              // 113E8 fstp st0
+        0xC3,                    // 113EA ret
+        // 113EB: returns ZF to its caller (a Conventions::flags_out helper)
+        0x85, 0xC0,  // 113EB test eax, eax
+        0xC3,        // 113ED ret
+        // 113EE: branches on the ZF its caller left (flags_in)
+        0x74, 0x01,  // 113EE je 113F1
+        0x40,        // 113F0 inc eax
+        0xC3,        // 113F1 ret
+    };
+    std::memcpy(&d[0x13C0], crtops, sizeof crtops);
+    put32(d, 0x1428, 0x113C0);
     return d;
 }
 
@@ -276,7 +306,7 @@ int main() {
     if (f.contains(0x112A0)) CHECK(std::ranges::binary_search(f.at(0x112A0).insns, 0x112B0u));
     CHECK(f.contains(0x112D0) && f.at(0x112D0).origin == Origin::Eh);  // __ehhandler stub
     CHECK(f.contains(0x112E0));  // unwind funclet
-    CHECK(f.size() == 12);  // nothing seeded inside the jump/index tables or the filler
+    CHECK(f.size() == 13);  // nothing seeded inside the jump/index tables or the filler
     if (f.contains(0x11300) && f.at(0x11300).jtabs.size() == 1) {
         auto& t = f.at(0x11300).jtabs[0];  // proven by value ranges, not by a cmp next to the jump
         CHECK(t.how == "range" && t.bounded && t.first == 0);
@@ -375,6 +405,17 @@ int main() {
         {rt::dbits(rt::fyl2x(rt::dfrom(0x7E5DDD4BAA009303ull), rt::dfrom(0x01A56E1FC2F8F359ull))), 0xFEFD109028C6770Eull},  // fyl2x(5e+300, 1e-300) = -4.9828921423310436e+303
         {rt::dbits(rt::fyl2x(rt::dfrom(0x3FE0000000000000ull), rt::dfrom(0x0000000000000001ull))), 0xC080C80000000000ull},  // fyl2x(0.5, 5e-324) = -537.0
         {rt::dbits(rt::fyl2x(rt::dfrom(0x3FF0000000000000ull), rt::dfrom(0x3FEFFFFFFFFFFFFFull))), 0xBCA71547652B82FEull},  // fyl2x(1.0, 0.9999999999999999) = -1.6017132519074588e-16
+        {rt::dbits(rt::f2xm1(rt::dfrom(0x3FE0000000000000ull))), 0x3FDA827999FCEF32ull},  // f2xm1(0.5) = 0.41421356237309503
+        {rt::dbits(rt::f2xm1(rt::dfrom(0xBFE0000000000000ull))), 0xBFD2BEC333018867ull},  // f2xm1(-0.5) = -0.2928932188134525
+        {rt::dbits(rt::f2xm1(rt::dfrom(0x3FF0000000000000ull))), 0x3FF0000000000000ull},  // f2xm1(1.0) = 1.0
+        {rt::dbits(rt::f2xm1(rt::dfrom(0xBFF0000000000000ull))), 0xBFE0000000000000ull},  // f2xm1(-1.0) = -0.5
+        {rt::dbits(rt::f2xm1(rt::dfrom(0x3B90000000000000ull))), 0x3B862E42FEFA39EFull},  // f2xm1(8.470329472543003e-22) = 5.871184992306991e-22
+        {rt::dbits(rt::f2xm1(rt::dfrom(0x8000000000000010ull))), 0x800000000000000Bull},  // f2xm1(-8e-323) = -5.4e-323
+        {rt::dbits(rt::f2xm1(rt::dfrom(0x3FA0000000000000ull))), 0x3F966C34C5615D0Full},  // f2xm1(0.03125) = 0.02189714865411668
+        {rt::dbits(rt::f2xm1(rt::dfrom(0xBF90000000000000ull))), 0xBF860F9F985BC9F4ull},  // f2xm1(-0.015625) = -0.010771986806024515
+        {rt::dbits(rt::f2xm1(rt::dfrom(0x3FEFFFFFFFFFFFFFull))), 0x3FEFFFFFFFFFFFFFull},  // f2xm1(0.9999999999999999) = 0.9999999999999999
+        {rt::dbits(rt::f2xm1(rt::dfrom(0x408FFC0000000000ull))), 0x7FE6A09E667F3BCDull},  // f2xm1(1023.5) = 1.2711610061536464e+308
+        {rt::dbits(rt::f2xm1(rt::dfrom(0xC04B800000000000ull))), 0xBFF0000000000000ull},  // f2xm1(-55.0) = -1.0
         };
         for (size_t k = 0; k < std::size(golden); ++k)
             if (golden[k].first != golden[k].second) {
@@ -387,6 +428,33 @@ int main() {
         CHECK(rt::dbits(rt::fpatan(rt::dfrom(0x8000000000000000ull), -1.0)) == 0xC00921FB54442D18ull);  // atan2(-0, -1) = -pi
         CHECK(rt::fpatan(-1.0, 0.0) == -0x1.921fb54442d18p+0);
         CHECK(rt::fyl2x(2.0, 0.0) == -rt::dfrom(0x7FF0000000000000ull));                     // 2 log2(0) = -inf
+        CHECK(rt::dbits(rt::f2xm1(rt::dfrom(0x8000000000000000ull))) == 0x8000000000000000ull);  // 2^-0 - 1 = -0
+        CHECK(rt::f2xm1(-rt::dfrom(0x7FF0000000000000ull)) == -1.0);
+        CHECK(rt::fscale(3.0, 4.9) == 48.0 && rt::fscale(3.0, -2.5) == 0.75);  // the scale is truncated
+        CHECK(rt::dbits(rt::fscale(0.0, rt::dfrom(0x7FF0000000000000ull))) == rt::kX87Indefinite);  // 0 * 2^inf
+        CHECK(rt::frndint(0x027F, 2.5) == 2.0 && rt::frndint(0x067F, 2.5) == 2.0 && rt::frndint(0x0A7F, 2.5) == 3.0 &&
+              rt::frndint(0x0E7F, -2.5) == -2.0);  // nearest-even, down, up, toward zero
+        CHECK(rt::fist64(0x027F, -3.5) == uint64_t(-4) && rt::fist64(0x027F, 1e19) == 0x8000000000000000ull);
+        CHECK(rt::fxam_codes(0, true, 0.0) == 0x4100u && rt::fxam_codes(0, false, -1.0) == 0x0600u &&
+              rt::fxam_codes(0, false, 0.0) == 0x4000u && rt::fxam_codes(0, false, 1e-310) == 0x4400u &&
+              rt::fxam_codes(0x4700, false, rt::dfrom(0x7FF0000000000000ull)) == 0x0500u);
+        {
+            std::vector<uint8_t> mem(256);
+            const rt::Mem m{mem.data(), mem.size()};
+            for (double v : {1.0, -0.0, 1e-310, -3.25e300, rt::dfrom(0x7FF0000000000000ull), rt::dfrom(0x7FF8000000000123ull)}) {
+                rt::st80(m, 0, v, 0);
+                CHECK(rt::dbits(rt::fld80(rt::ld64(m, 0, 0), rt::ld16(m, 8, 0))) == rt::dbits(v));
+            }
+            CHECK(rt::ld16(m, 8, 0) == 0x7FFF);  // the NaN stored last
+            double st[8] = {1, 2, 3, 4, 5, 6, 7, 8};
+            uint32_t top = 3, tag = 0b00011000, cw = 0x027F, sw = 0x4100;
+            rt::fnsave(m, 0, st, top, tag, cw, sw, 0);
+            CHECK(cw == 0x037F && sw == 0 && tag == 0 && top == 0);  // fninit
+            CHECK(rt::ld32(m, 4, 0) == (0x4100u | 3u << 11) && rt::ld32(m, 8, 0) == 0xFC3Fu);  // TOP in the status word; tags 3 and 4 valid
+            for (double& v : st) v = 0;
+            rt::frstor(m, 0, st, top, tag, cw, sw, 0);
+            CHECK(cw == 0x027F && sw == 0x4100 && tag == 0b00011000 && top == 3 && st[3] == 4.0 && st[4] == 5.0 && st[2] == 3.0);
+        }
         CHECK(rt::dbits(rt::fyl2x(0.0, 0.0)) == rt::kX87Indefinite);                          // 0 log2(0): invalid
         CHECK(rt::dbits(rt::fyl2x(1.0, -2.0)) == rt::kX87Indefinite);                         // log2 of a negative
         CHECK(rt::dbits(rt::fyl2x(rt::dfrom(0x8000000000000000ull), 0.5)) == 0x0000000000000000ull);  // -0 * log2(0.5) = +0
@@ -463,6 +531,39 @@ int main() {
             CHECK(r->contains("eax = rt::ld32(m, uint32_t(c.fs_base + ecx + 0x18u), 0x113AFu);"));
         }
     } else CHECK(false);
+    if (f.contains(0x113C0)) {
+        auto r = lifter.lift(f.at(0x113C0));
+        CHECK(r.has_value());
+        if (r) {
+            CHECK(r->contains("const uint32_t r = (a << n) | (b >> (32u - n));"));  // shld
+            CHECK(r->contains("const uint32_t n = (ecx & 31u);") && r->contains("const uint32_t r = (a >> n) | (b << (32u - n));"));
+            CHECK(r->contains("const uint32_t c0 = cf ? 1u : 0u;"));               // rcr through carry
+            CHECK(r->contains("if (ecx == 0u) { goto L_000113CE; }"));              // jecxz
+            CHECK(r->contains("if (a == b) break;"));                                // repne scasb stops on a match
+            CHECK(r->contains("ST(0u) = rt::frndint(fpcw, ST(0u));") && r->contains("ST(0u) = rt::fscale(ST(0u), ST(1u));"));
+            CHECK(r->contains("fpsw = rt::fxam_codes(") && r->contains("fpsw &= 0x4700u;"));
+            CHECK(r->contains("ST(0u) = rt::f2xm1(ST(0u));") && r->contains("rt::fist64(fpcw, ST(0u))"));
+            CHECK(r->contains("rt::fld80(") && r->contains("rt::fnsave(m,") && r->contains("rt::frstor(m,"));
+        }
+    } else CHECK(false);
+    {
+        // 113EB and 113EE sit off the 16-byte grid the CFG wants for entries
+        // here, so they're described by hand.
+        Function out, in;
+        out.start = 0x113EB;
+        out.insns = {0x113EB, 0x113ED};
+        in.start = 0x113EE;
+        in.insns = {0x113EE, 0x113F0, 0x113F1};
+        CHECK(!lifter.lift(in).has_value());  // without the convention: flags read before written
+        Conventions conv;
+        conv.flags_out = {{0x113EB, 8}};
+        conv.flags_in = {{0x113EE, 8}};
+        Lifter with(dec, &conv);
+        auto o = with.lift(out);
+        CHECK(o.has_value() && o->contains("c.eflags = 0u | (zf ? 0x40u : 0u);"));
+        auto i = with.lift(in);
+        CHECK(i.has_value() && i->contains("zf = (c.eflags & 0x40u) != 0;"));
+    }
     if (f.contains(0x11340)) {
         auto r = lifter.lift(f.at(0x11340));  // negative cases: unsigned values of ecx
         CHECK(r.has_value() && r->contains("case 4294967292u: goto L_00011353;") &&

@@ -11,6 +11,27 @@ Each release is a git tag (`vX.Y.Z`) with a matching GitHub release. The version
 
 ## [Unreleased]
 
+## [0.11.0] - 2026-11-18
+The C runtime is lifted, not replaced, so `sprintf`, string conversions and the x87 maths give exactly the original's results. Its start-up runs as XAPI ran it.
+
+### Added
+- **The C runtime in the lifted set.** `qilin lift` adds the CRT functions lifted code can reach (calls, tail calls, function addresses in code, and CRT functions stored in data sections), transitively: 265 of 434. 6,008 functions lift, with no failures, and `qilin lift` fails if a reachable CRT function doesn't lift.
+- **Lifter conventions for hand-written assembly** (`Conventions`, listed in `crt_conventions()`): flags passed into or out of a call through `c.eflags`, for the x87 maths' classify-then-branch helpers; and "stack glue" (`__SEH_prolog`/`__SEH_epilog`, `__EH_prolog`, shared epilogues that pop their caller's saved word), which skips the stack-balance check.
+- **Instructions:** `scas` (with `rep`/`repne`), `shld`/`shrd` (by an immediate or `cl`), `rcl`/`rcr` by 1, `jecxz`, and for the x87 `frndint`, `fscale`, `fxam`, `fnclex`, `fistp` m64, `fld` m80 (to the nearest double), `f2xm1`, `fnsave` and `frstor`.
+- **`f2xm1`, correctly rounded** (`x87_math.hpp`), with the same fast-path-then-check design and checks as the other transcendentals: 0 wrong against mpmath (GCC, Clang, ARM64 under qemu), 6 million fast-against-slow cases, 11 golden vectors.
+- **SEH scope tables in the CFG.** `__except` filters and handlers are entry points inside their parent function (46 tables, 24 `__except` entries in the CRT and XAPI).
+- **Negated jump-table indices** in the value-range analysis (`neg ecx; jmp [4*ecx + T]`, `memmove`).
+- **C runtime start-up** in `qilin_run`: `_mtinit`, `_ioinit`, `_FPinit` and the other CRT initializers, in XAPI's order; library initializers (XGRPH, DSOUND) are skipped. `rt::is_lifted`.
+- **`tools/check/crt_printf.py`:** the lifted `sprintf` against the original on generated format strings (all conversions, flags, widths, precisions, doubles across the range): 3,000 of 3,000 match.
+- **Difftest:** trial set-ups for the CRT's irregular contracts (`GLUE_POPS`, `X87_ARGS`), `f2xm1` in the mpmath reference, and three more Unicorn deviations handled (`fst st(i)` tagging, `fnsave` pointers, CRT values outside double's range). Trials can take explicit arguments and memory blocks.
+
+### Fixed
+- **`_input` (`scanf`'s engine) was cut into about 60 fragments** joined by tail calls, because an `__except` handler that a scope table points to was taken for a function. Fixed by the scope-table reading above. The lifted fragments would have grown the host stack on every loop iteration.
+- **`memmove`'s backward tail-copy table** was sized at one entry by scanning, so the lifted code trapped on 7 of its 8 indices. Found by the difftest; fixed by the negated-index analysis.
+
+### Verified
+- Difftest of the whole lifted set: 6,008 functions, 36,048 trials, 0 mismatches; also under UBSan. CRT alone: 265 functions, 12,631 trials, 0 mismatches. The game's generated code is byte-identical to v0.10.0's.
+
 ## [0.10.0] - 2026-11-18
 The runtime's first slice: the game runs. `qilin_run` calls the lifted `main`, which runs until the first function the runtime doesn't provide yet.
 
