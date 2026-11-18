@@ -51,6 +51,7 @@ Lifter slice 2 (calls), and every jump table in lifted code proven. 5,098 of the
 - **Difftest:** Unicorn ignored a new stop address for blocks it had already translated.
 - **Difftest:** tail calls into shared SEH epilogues stopped at the wrong place.
 - **Difftest:** workers ran out of memory.
+- **MSVC:** `rt::divss` tripped warning C4723 ("potential divide by 0") wherever a constant zero divisor was inlined. IEEE division by zero is intended there.
 
 
 ### Documentation
