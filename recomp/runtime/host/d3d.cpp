@@ -15,6 +15,8 @@
 // Anything not modelled yet (a Swap flag, a partial colour clear, a call
 // that isn't registered) stops the runtime with its name.
 #include <algorithm>
+#include <array>
+#include <string_view>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -24,6 +26,7 @@
 #include <optional>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include "gfx.hpp"
@@ -462,6 +465,49 @@ void set_transform(rt::Context& c) {
     ret(c, c.eax, 8);
 }
 
+// VOID D3DDevice_SetViewport(CONST D3DVIEWPORT8*): X, Y, Width, Height,
+// MinZ, MaxZ. As the original: the right and bottom edges are clipped to the
+// render target, the result stored in the device (+0xED0 …) and the
+// viewport's dirty bit set. The fog, depth and projection values the
+// original then derives are the renderer's to compute; the one the game can
+// read back (GetProjectionViewportMatrix) stops the runtime until it is.
+constexpr uint32_t kDevViewport = 0xED0;
+// A surface's width and height: from Size for linear surfaces, else from
+// the log2 sizes in Format (swizzled), as D3D reads them.
+std::pair<uint32_t, uint32_t> surface_size(const rt::Context& c, uint32_t surf) {
+    const uint32_t size = ld(c, surf + 16), format = ld(c, surf + 12);
+    if (size) return {(size & 0xFFF) + 1, ((size >> 12) & 0xFFF) + 1};
+    return {1u << ((format >> 20) & 0xF), 1u << ((format >> 24) & 0xF)};
+}
+void set_viewport(rt::Context& c) {
+    Device& d = device("D3DDevice_SetViewport");
+    const uint32_t vp = arg(c, 0);
+    if (!vp) unmodelled("D3DDevice_SetViewport", "a null viewport");
+    // The original measures the front buffer when the target is the back buffer (they're the same size).
+    uint32_t target = ld(c, kDeviceStorage + kDevRenderTarget);
+    if (target == ld(c, kDeviceStorage + kDevFrameBuffers)) target = ld(c, kDeviceStorage + kDevFrameBuffers + 4);
+    const auto [tw, th] = surface_size(c, target);
+    const uint32_t x = ld(c, vp), y = ld(c, vp + 4);
+    const uint32_t right = std::min(x + ld(c, vp + 8), tw), bottom = std::min(y + ld(c, vp + 12), th);
+    st(c, kDeviceStorage + kDevViewport, x);
+    st(c, kDeviceStorage + kDevViewport + 4, y);
+    st(c, kDeviceStorage + kDevViewport + 8, right - x);
+    st(c, kDeviceStorage + kDevViewport + 12, bottom - y);
+    st(c, kDeviceStorage + kDevViewport + 16, ld(c, vp + 16));  // MinZ
+    st(c, kDeviceStorage + kDevViewport + 20, ld(c, vp + 20));  // MaxZ
+    st(c, kDirtyFlags, ld(c, kDirtyFlags) | 0x100u);
+    (void)d;
+    ret(c, c.eax, 4);
+}
+
+// VOID D3DDevice_GetProjectionViewportMatrix(D3DMATRIX*): the original
+// copies the device's composite of the projection and the viewport (+0x970),
+// which D3D derives in its state code.
+void get_projection_viewport_matrix(rt::Context& c) {
+    unmodelled("D3DDevice_GetProjectionViewportMatrix", "the derived projection-viewport matrix");
+    ret(c, c.eax, 4);
+}
+
 // VOID FASTCALL D3DDevice_SetRenderState_Simple(DWORD Method, DWORD Value):
 // the GPU method and value for a render state that maps straight onto one.
 // The game's inline SetRenderState has already stored the D3D value in
@@ -475,6 +521,61 @@ void set_render_state_simple(rt::Context& c) {
     simple_methods()[c.ecx] = c.edx;
     ret(c, c.eax, 0);
 }
+
+// The render states D3D sets through functions (the "complex" ones, whose
+// GPU encoding depends on other state): VOID D3DDevice_SetRenderState_X(DWORD
+// Value). As the originals: the value into its slot of D3D's render-state
+// table, and the dirty bits the original sets (TwoSidedLighting's only when
+// enabled). The GPU state they derive is the renderer's to compute.
+struct ComplexRenderState {
+    const char* name;
+    uint32_t slot;   // its D3D__RenderState address
+    uint32_t dirty;  // dirty bits set
+};
+constexpr ComplexRenderState kComplexRenderStates[] = {
+    {"D3DDevice_SetRenderState_PSTextureModes", 0x181D90, 0x0},
+    {"D3DDevice_SetRenderState_EdgeAntiAlias", 0x181DCC, 0x0},
+    {"D3DDevice_SetRenderState_ShadowFunc", 0x181DE0, 0x0},
+    {"D3DDevice_SetRenderState_FogColor", 0x181D98, 0x0},
+    {"D3DDevice_SetRenderState_CullMode", 0x181DBC, 0x0},
+    {"D3DDevice_SetRenderState_FrontFace", 0x181DB8, 0x0},
+    {"D3DDevice_SetRenderState_NormalizeNormals", 0x181DA8, 0x0},
+    {"D3DDevice_SetRenderState_TextureFactor", 0x181DC0, 0x0},
+    {"D3DDevice_SetRenderState_LineWidth", 0x181DE4, 0x0},
+    {"D3DDevice_SetRenderState_Dxt1NoiseEnable", 0x181DEC, 0x0},
+    {"D3DDevice_SetRenderState_ZBias", 0x181DC4, 0x0},
+    {"D3DDevice_SetRenderState_LogicOp", 0x181DC8, 0x0},
+    {"D3DDevice_SetRenderState_FillMode", 0x181D9C, 0x0},
+    {"D3DDevice_SetRenderState_BackFillMode", 0x181DA0, 0x0},
+    {"D3DDevice_SetRenderState_TwoSidedLighting", 0x181DA4, 0x9000},
+    {"D3DDevice_SetRenderState_VertexBlend", 0x181D94, 0x200},
+    {"D3DDevice_SetRenderState_ZEnable", 0x181DAC, 0x0},
+    {"D3DDevice_SetRenderState_StencilEnable", 0x181DB0, 0x0},
+    {"D3DDevice_SetRenderState_StencilFail", 0x181DB4, 0x0},
+    {"D3DDevice_SetRenderState_YuvEnable", 0x181DF0, 0x0},
+    {"D3DDevice_SetRenderState_OcclusionCullEnable", 0x181DF4, 0x0},
+    {"D3DDevice_SetRenderState_StencilCullEnable", 0x181DF8, 0x0},
+    {"D3DDevice_SetRenderState_RopZCmpAlwaysRead", 0x181DFC, 0x0},
+    {"D3DDevice_SetRenderState_RopZRead", 0x181E00, 0x0},
+    {"D3DDevice_SetRenderState_DoNotCullUncompressed", 0x181E04, 0x0},
+    {"D3DDevice_SetRenderState_MultiSampleMode", 0x181DD8, 0x0},
+    {"D3DDevice_SetRenderState_MultiSampleRenderTargetMode", 0x181DDC, 0x0},
+    {"D3DDevice_SetRenderState_MultiSampleAntiAlias", 0x181DD0, 0x0},
+    {"D3DDevice_SetRenderState_MultiSampleMask", 0x181DD4, 0x0},
+    {"D3DDevice_SetRenderState_SampleAlpha", 0x181DE8, 0x0},
+};
+void set_complex_render_state(rt::Context& c, const ComplexRenderState& r) {
+    const uint32_t v = arg(c, 0);
+    st(c, r.slot, v);
+    const bool sets_dirty = r.dirty && (std::string_view(r.name) != "D3DDevice_SetRenderState_TwoSidedLighting" || v != 0);
+    if (sets_dirty) st(c, kDirtyFlags, ld(c, kDirtyFlags) | r.dirty);
+    ret(c, c.eax, 4);
+}
+template <size_t N> void complex_render_state(rt::Context& c) { set_complex_render_state(c, kComplexRenderStates[N]); }
+template <size_t... I> constexpr std::array<HleFn, sizeof...(I)> complex_render_state_fns(std::index_sequence<I...>) {
+    return {complex_render_state<I>...};
+}
+constexpr auto kComplexRenderStateFns = complex_render_state_fns(std::make_index_sequence<std::size(kComplexRenderStates)>());
 
 struct D3dFn {
     const char* name;
@@ -498,6 +599,8 @@ constexpr D3dFn kD3d[] = {
     {"D3DDevice_CreateVertexShader", 16, create_vertex_shader},
     {"D3DDevice_SetTransform", 8, set_transform},
     {"D3DDevice_SetRenderState_Simple", 0, set_render_state_simple},
+    {"D3DDevice_SetViewport", 4, set_viewport},
+    {"D3DDevice_GetProjectionViewportMatrix", 4, get_projection_viewport_matrix},
     {"D3DDevice_Swap", 4, swap},
 };
 
@@ -519,6 +622,14 @@ void register_d3d(const D3dConfig& config) {
             std::abort();
         }
         register_hle(s->address, f.name, f.fn);
+    }
+    for (size_t k = 0; k < std::size(kComplexRenderStates); ++k) {
+        const XdkSymbol* s = xdk_symbol(kComplexRenderStates[k].name);
+        if (!s) {
+            std::fprintf(stderr, "qilin: D3D replacement %s has no address in this XBE\n", kComplexRenderStates[k].name);
+            std::abort();
+        }
+        register_hle(s->address, kComplexRenderStates[k].name, kComplexRenderStateFns[k]);
     }
 }
 

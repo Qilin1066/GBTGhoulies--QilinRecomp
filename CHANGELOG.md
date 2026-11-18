@@ -11,6 +11,15 @@ Each release is a git tag (`vX.Y.Z`) with a matching GitHub release. The version
 
 ## [Unreleased]
 
+## [0.19.0] - 2026-11-18
+D3D state stays at API level (decided): the setters are rewritten natively. The game sets its viewport and render states and stops at its first `SetTexture`.
+
+### Added
+- **`D3DDevice_SetViewport`:** as the original, the viewport clipped to the render target into the device (`+0xED0`) and its dirty bit.
+- **The 30 `D3DDevice_SetRenderState_X` functions:** each value into its slot of D3D's render-state table, with the dirty bits the original sets, from a table read off the originals.
+- **`D3DDevice_GetProjectionViewportMatrix`** stops the runtime, named, until the derived matrix is reproduced (it was lifted, and would have read a matrix nothing computes).
+
+
 ## [0.18.0] - 2026-11-18
 D3DX is lifted, and the first state setters are in. The game sets its transforms and stops at its first viewport.
 
