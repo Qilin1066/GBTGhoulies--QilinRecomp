@@ -281,7 +281,16 @@ inline uint32_t sse_nan(uint32_t a, uint32_t b) {
 inline uint32_t addss(uint32_t a, uint32_t b) { const float r = f32(a) + f32(b); return r == r ? u32(r) : sse_nan(a, b); }
 inline uint32_t subss(uint32_t a, uint32_t b) { const float r = f32(a) - f32(b); return r == r ? u32(r) : sse_nan(a, b); }
 inline uint32_t mulss(uint32_t a, uint32_t b) { const float r = f32(a) * f32(b); return r == r ? u32(r) : sse_nan(a, b); }
+// IEEE division: x / 0 is an infinity or a NaN by design (MSVC's C4723 would
+// flag it wherever a constant zero divisor gets inlined).
+#if defined(_MSC_VER)
+#pragma warning(push)
+#pragma warning(disable : 4723)
+#endif
 inline uint32_t divss(uint32_t a, uint32_t b) { const float r = f32(a) / f32(b); return r == r ? u32(r) : sse_nan(a, b); }
+#if defined(_MSC_VER)
+#pragma warning(pop)
+#endif
 inline uint32_t sqrtss(uint32_t a) { const float r = std::sqrt(f32(a)); return r == r ? u32(r) : sse_nan(a, a); }
 
 // minss/maxss: return the second operand if either is NaN or both are zero.
