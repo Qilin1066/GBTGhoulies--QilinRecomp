@@ -48,9 +48,9 @@ An entry runs if it's lifted (`rt::is_lifted`); otherwise `qilin_run` names it a
 
 `qilin_run` is built with checked memory for bring-up, so an access outside RAM stops with the guest address of the instruction.
 
-**Kernel imports.** A function's thunk slot keeps `0x80000000 | ordinal`, which `rt::call_unlifted` recognises. A data export's slot (`KeTickCount`, `LaunchDataPage`, `XboxHardwareInfo` and 12 more) gets the address of its object: `XeImageFileName` names `\Device\CdRom0\default.xbe`, `HalDiskCachePartitionCount` is 3, and the rest start as zero.
+**Kernel imports.** A function's thunk slot keeps `0x80000000 | ordinal`, which `rt::call_unlifted` recognises. A data export's slot (`KeTickCount`, `LaunchDataPage`, `XboxHardwareInfo` and 12 more) gets the address of its object: `XeImageFileName` names `\Device\CdRom0\default.xbe`, `HalDiskCachePartitionCount` is 3, and the rest start as zero. Names, ordinals, stdcall argument sizes and data/fastcall flags come from nxdk's `xboxkrnl.exe.def` (CC0, in `third_party/nxdk/`), turned into `recomp/runtime/host/kernel_exports.inc` by `tools/gen/kernel_exports.py`.
 
-**XBE sections.** Sections without the preload flag (`$$XTIMAGE`, `$$XSIMAGE`, `.XTLID`) start as zero, as the kernel's loader leaves them, and `XeLoadSection` reads them in. Their reference counts and the shared-page counts live in the section headers, as the kernel keeps them. Names, ordinals, stdcall argument sizes and data/fastcall flags come from nxdk's `xboxkrnl.exe.def` (CC0, in `third_party/nxdk/`), turned into `recomp/runtime/host/kernel_exports.inc` by `tools/gen/kernel_exports.py`.
+**XBE sections.** Sections without the preload flag (`$$XTIMAGE`, `$$XSIMAGE`, `.XTLID`) start as zero, as the kernel's loader leaves them, and `XeLoadSection` reads them in. Their reference counts and the shared-page counts live in the section headers, as the kernel keeps them.
 
 **Replacements** (`recomp/runtime/host/host.hpp`). Every call from lifted code to code that isn't lifted reaches `rt::call_unlifted`: a direct call to a stub, an indirect call the function table doesn't know, or a kernel import. It runs the replacement registered for that guest address. There's no fallback: anything unregistered stops the game and names the target and its caller, for example:
 
@@ -83,7 +83,6 @@ Replacements read stdcall arguments with `host::arg(c, i)` and return with `host
 | `ExQueryNonVolatileSetting` | A North American retail console with factory settings: English, 60 Hz, NTSC-M, region 1. An unmodelled setting stops the runtime |
 | `RtlNtStatusToDosError` | The NT table for the statuses the runtime and the file system return; any other status stops the runtime |
 | `HalRegisterShutdownNotification` | Accepted; the routines never run |
-
 | `RtlInitAnsiString`, `RtlEqualString`, `RtlUnicodeStringToAnsiString`, `RtlCompareMemoryUlong` | As the kernel: `RtlEqualString` folds ASCII only, `RtlUnicodeStringToAnsiString` maps Latin-1 and turns the rest into `?`. Allocating the destination string stops the runtime |
 | `KeQuerySystemTime` | The host's UTC time, in 100 ns since 1601 |
 | `XeLoadSection`, `XeUnloadSection` | XBE sections above |
@@ -126,4 +125,3 @@ Names are matched case-insensitively, as on FATX and the disc's XDVDFS (an exact
 3. **Keep running `qilin_run`** and implement each function it stops at: the rest of the 81 kernel imports, and the 167 library entry points (D3D, XACT, DSOUND …).
 4. **Hot C runtime functions** (`memcpy`, `strlen` …) may get native versions once the runtime shows which are hot, each checked against the lifted original.
 5. **Names:** XbSymbolDatabase can name the XDK library functions by signature, which would speed up identifying them.
-6. **D3D on Vulkan** (roadmap step 4).
