@@ -153,6 +153,9 @@ FlagFx flag_fx(const Insn& i) {
 
 // ------------------------------------------------------------------ registers
 constexpr std::array<const char*, 8> kGpr = {"eax", "ecx", "edx", "ebx", "esp", "ebp", "esi", "edi"};
+// x87 control state, held in locals like the general registers.
+constexpr std::array<const char*, 4> kX87 = {"ftop", "ftag", "fpcw", "fpsw"};
+enum { FTOP, FTAG, FPCW, FPSW };
 enum Gpr : int { EAX, ECX, EDX, EBX, ESP, EBP, ESI, EDI };
 
 struct RegInfo {
@@ -222,10 +225,13 @@ private:
     // Register bookkeeping: `use` = referenced (declared in the prologue),
     // `mark` = modified (also stored back at every exit). An unrecorded
     // reference is a compile error in the generated code, never a silent bug.
-    void use(int g) { used_ |= uint16_t(1u << g); }
-    void use_xmm(int x) { used_ |= uint16_t(1u << (8 + x)); }
-    void mark(int g) { use(g); written_ |= uint16_t(1u << g); }
-    void mark_xmm(int x) { use_xmm(x); written_ |= uint16_t(1u << (8 + x)); }
+    void use(int g) { used_ |= 1u << g; }
+    void use_xmm(int x) { used_ |= 1u << (8 + x); }
+    void mark(int g) { use(g); written_ |= 1u << g; }
+    void mark_xmm(int x) { use_xmm(x); written_ |= 1u << (8 + x); }
+    // x87 control state held in locals: bit 16 + k of used_/written_ for kX87[k].
+    void use_fx(int k) { used_ |= 1u << (16 + k); }
+    void mark_fx(int k) { use_fx(k); written_ |= 1u << (16 + k); }
 
     void line(std::string_view s) {
         out_ += "    ";
@@ -233,6 +239,11 @@ private:
         out_ += '\n';
     }
     void emit(const Insn& i, uint8_t live_out);
+    bool emit_x87(const Insn& i, uint8_t need);
+    int st_index(const Insn& i, const Operand& o);
+    std::string fsrc(const Insn& i, const Operand& o);  // x87 source operand as a double
+    void fpush(const std::string& v);
+    void fpop();
     // Direction flag at instruction i (0 or 1; unknown is an error).
     int direction(const Insn& i) const {
         if (df_now_ > 1) unsupported(i, "direction flag not known statically");
@@ -248,8 +259,9 @@ private:
     const Function& f_;
     std::vector<const Insn*> ins_;
     std::unordered_map<uint32_t, size_t> idx_;
-    uint16_t used_ = 0;     // bit g: GPR g referenced; bit 8+x: xmm x referenced
-    uint16_t written_ = 0;  // same bits: modified
+    uint32_t used_ = 0;     // bit g: GPR g referenced; bit 8+x: xmm x; bit 16+k: x87 kX87[k]
+    uint32_t written_ = 0;  // same bits: modified
+    bool x87_ = false;      // uses the x87 register stack (needs ST())
     bool calls_ = false;    // has a call that returns here (needs reload())
     std::string out_;
 };
@@ -816,8 +828,223 @@ void FnEmitter::emit(const Insn& i, uint8_t live_out) {
         default:
             break;
     }
-    if (i.isa_ext == ZYDIS_ISA_EXT_X87) fail(i, LiftFailure::Kind::X87, "x87");
+    if (i.isa_ext == ZYDIS_ISA_EXT_X87 && emit_x87(i, need)) return;
+    if (i.isa_ext == ZYDIS_ISA_EXT_X87) fail(i, LiftFailure::Kind::X87, "x87 instruction not supported yet");
     unsupported(i, "instruction not supported yet");
+}
+
+// ---------------------------------------------------------------- x87 (slice 3)
+// The register stack lives in the Context (c.st, physical order); TOP, the
+// tag bits, the control and status words are locals (see kX87). ST(i) is
+// c.st[(ftop + i) & 7]. Arithmetic goes through rt::fadd & co, which apply
+// precision control exactly (see guest.hpp).
+int FnEmitter::st_index(const Insn& i, const Operand& o) {
+    if (o.kind != Operand::Kind::Reg || o.reg < ZYDIS_REGISTER_ST0 || o.reg > ZYDIS_REGISTER_ST7)
+        unsupported(i, "x87 register operand");
+    return int(o.reg - ZYDIS_REGISTER_ST0);
+}
+
+std::string FnEmitter::fsrc(const Insn& i, const Operand& o) {
+    if (o.kind == Operand::Kind::Reg) return std::format("ST({}u)", st_index(i, o));
+    if (o.kind != Operand::Kind::Mem) unsupported(i, "x87 operand");
+    const std::string a = addr(i, o);
+    if (o.size == 32) return std::format("rt::f32_raw(rt::ld32(m, {}, 0x{:X}u))", a, i.addr);
+    if (o.size == 64) return std::format("rt::f64_raw(rt::ld64(m, {}, 0x{:X}u))", a, i.addr);
+    unsupported(i, std::format("{}-bit x87 memory operand", o.size));
+}
+
+void FnEmitter::fpush(const std::string& v) {
+    mark_fx(FTOP);
+    mark_fx(FTAG);
+    line(std::format("{{ const double v_ = {}; ftop = (ftop - 1u) & 7u; ftag |= 1u << ftop; ST(0u) = v_; }}", v));
+}
+
+void FnEmitter::fpop() {
+    mark_fx(FTOP);
+    mark_fx(FTAG);
+    line("ftag &= ~(1u << ftop); ftop = (ftop + 1u) & 7u;");
+}
+
+bool FnEmitter::emit_x87(const Insn& i, uint8_t need) {
+    const ZydisMnemonic M = i.mnem;
+    const Operand& d = i.op[0];
+    x87_ = true;
+    use_fx(FTOP);
+    auto int_src = [&](const Operand& o) {
+        if (o.kind != Operand::Kind::Mem) unsupported(i, "x87 integer operand");
+        const std::string a = addr(i, o);
+        if (o.size == 16) return std::format("double(int16_t(rt::ld16(m, {}, 0x{:X}u)))", a, i.addr);
+        if (o.size == 32) return std::format("double(int32_t(rt::ld32(m, {}, 0x{:X}u)))", a, i.addr);
+        if (o.size == 64) return std::format("double(int64_t(rt::ld64(m, {}, 0x{:X}u)))", a, i.addr);
+        unsupported(i, "x87 integer operand width");
+    };
+    // Arithmetic: dst = dst op src, or src op dst for the reversed forms.
+    auto arith = [&](const char* fn, bool reversed, bool integer, bool pop) {
+        use_fx(FPCW);
+        std::string dst = "ST(0u)", src;
+        if (i.nops == 0) {
+            dst = "ST(1u)";  // faddp with no operands: st1 op= st0, pop
+            src = "ST(0u)";
+        } else if (i.nops == 1) {
+            src = integer ? int_src(d) : fsrc(i, d);
+        } else {
+            dst = std::format("ST({}u)", st_index(i, d));
+            src = fsrc(i, i.op[1]);
+        }
+        line(reversed ? std::format("{0} = rt::{1}(fpcw, {2}, {0});", dst, fn, src)
+                      : std::format("{0} = rt::{1}(fpcw, {0}, {2});", dst, fn, src));
+        if (pop) fpop();
+    };
+    switch (M) {
+        case ZYDIS_MNEMONIC_FADD: arith("fadd", false, false, false); return true;
+        case ZYDIS_MNEMONIC_FADDP: arith("fadd", false, false, true); return true;
+        case ZYDIS_MNEMONIC_FIADD: arith("fadd", false, true, false); return true;
+        case ZYDIS_MNEMONIC_FSUB: arith("fsub", false, false, false); return true;
+        case ZYDIS_MNEMONIC_FSUBP: arith("fsub", false, false, true); return true;
+        case ZYDIS_MNEMONIC_FISUB: arith("fsub", false, true, false); return true;
+        case ZYDIS_MNEMONIC_FSUBR: arith("fsub", true, false, false); return true;
+        case ZYDIS_MNEMONIC_FSUBRP: arith("fsub", true, false, true); return true;
+        case ZYDIS_MNEMONIC_FISUBR: arith("fsub", true, true, false); return true;
+        case ZYDIS_MNEMONIC_FMUL: arith("fmul", false, false, false); return true;
+        case ZYDIS_MNEMONIC_FMULP: arith("fmul", false, false, true); return true;
+        case ZYDIS_MNEMONIC_FIMUL: arith("fmul", false, true, false); return true;
+        case ZYDIS_MNEMONIC_FDIV: arith("fdiv", false, false, false); return true;
+        case ZYDIS_MNEMONIC_FDIVP: arith("fdiv", false, false, true); return true;
+        case ZYDIS_MNEMONIC_FIDIV: arith("fdiv", false, true, false); return true;
+        case ZYDIS_MNEMONIC_FDIVR: arith("fdiv", true, false, false); return true;
+        case ZYDIS_MNEMONIC_FDIVRP: arith("fdiv", true, false, true); return true;
+        case ZYDIS_MNEMONIC_FIDIVR: arith("fdiv", true, true, false); return true;
+
+        case ZYDIS_MNEMONIC_FLD:
+            if (d.kind == Operand::Kind::Reg) fpush(fsrc(i, d));
+            else if (d.size == 32) fpush(std::format("rt::fld32(rt::ld32(m, {}, 0x{:X}u))", addr(i, d), i.addr));
+            else if (d.size == 64) fpush(std::format("rt::fld64(rt::ld64(m, {}, 0x{:X}u))", addr(i, d), i.addr));
+            else unsupported(i, "80-bit x87 load");
+            return true;
+        case ZYDIS_MNEMONIC_FILD: fpush(int_src(d)); return true;
+        case ZYDIS_MNEMONIC_FLDZ: fpush("0.0"); return true;
+        case ZYDIS_MNEMONIC_FLD1: fpush("1.0"); return true;
+        // The x87's constants are 64-bit; these are their nearest doubles.
+        case ZYDIS_MNEMONIC_FLDPI: fpush("rt::dfrom(0x400921FB54442D18ull)"); return true;
+        case ZYDIS_MNEMONIC_FLDLG2: fpush("rt::dfrom(0x3FD34413509F79FFull)"); return true;
+        case ZYDIS_MNEMONIC_FLDLN2: fpush("rt::dfrom(0x3FE62E42FEFA39EFull)"); return true;
+        case ZYDIS_MNEMONIC_FLDL2E: fpush("rt::dfrom(0x3FF71547652B82FEull)"); return true;
+        case ZYDIS_MNEMONIC_FLDL2T: fpush("rt::dfrom(0x400A934F0979A371ull)"); return true;
+
+        case ZYDIS_MNEMONIC_FST: case ZYDIS_MNEMONIC_FSTP: {
+            const bool pop = M == ZYDIS_MNEMONIC_FSTP;
+            if (d.kind == Operand::Kind::Reg) {
+                const int k = st_index(i, d);
+                if (k != 0) {
+                    mark_fx(FTAG);  // the destination holds a value now, even if it was empty
+                    line(std::format("ST({0}u) = ST(0u); ftag |= 1u << ((ftop + {0}u) & 7u);", k));
+                }
+            } else if (d.size == 32) {
+                line(std::format("rt::st32(m, {}, rt::fst32(ST(0u)), 0x{:X}u);", addr(i, d), i.addr));
+            } else if (d.size == 64) {
+                line(std::format("rt::st64(m, {}, rt::dbits(ST(0u)), 0x{:X}u);", addr(i, d), i.addr));
+            } else {
+                unsupported(i, "80-bit x87 store");
+            }
+            if (pop) fpop();
+            return true;
+        }
+        case ZYDIS_MNEMONIC_FIST: case ZYDIS_MNEMONIC_FISTP:
+            if (d.kind != Operand::Kind::Mem || d.size != 32) unsupported(i, "fist other than 32-bit");
+            use_fx(FPCW);
+            line(std::format("rt::st32(m, {}, rt::fist32(fpcw, ST(0u)), 0x{:X}u);", addr(i, d), i.addr));
+            if (M == ZYDIS_MNEMONIC_FISTP) fpop();
+            return true;
+
+        case ZYDIS_MNEMONIC_FXCH: {
+            const int k = i.nops == 0 ? 1 : st_index(i, i.nops == 2 ? i.op[1] : d);
+            line(std::format("{{ const double t_ = ST(0u); ST(0u) = ST({0}u); ST({0}u) = t_; }}", k));
+            return true;
+        }
+        case ZYDIS_MNEMONIC_FCHS: line("ST(0u) = rt::dfrom(rt::dbits(ST(0u)) ^ 0x8000000000000000ull);"); return true;
+        case ZYDIS_MNEMONIC_FABS: line("ST(0u) = rt::dfrom(rt::dbits(ST(0u)) & 0x7FFFFFFFFFFFFFFFull);"); return true;
+        case ZYDIS_MNEMONIC_FSQRT:
+            use_fx(FPCW);
+            line("ST(0u) = rt::fsqrt(fpcw, ST(0u));");
+            return true;
+        case ZYDIS_MNEMONIC_FSIN: case ZYDIS_MNEMONIC_FCOS:
+            mark_fx(FPSW);
+            line(std::format("if (rt::x87_trig_in_range(ST(0u))) {{ ST(0u) = rt::{}(ST(0u)); fpsw &= ~0x600u; }} else {{ fpsw = (fpsw & ~0x200u) | 0x400u; }}",
+                             M == ZYDIS_MNEMONIC_FSIN ? "fsin" : "fcos"));
+            return true;
+        case ZYDIS_MNEMONIC_FPTAN:
+            mark_fx(FPSW);
+            line("if (rt::x87_trig_in_range(ST(0u))) {");
+            line("ST(0u) = rt::ftan(ST(0u)); fpsw &= ~0x600u;");
+            fpush("1.0");
+            line("} else { fpsw = (fpsw & ~0x200u) | 0x400u; }");
+            return true;
+        case ZYDIS_MNEMONIC_FPATAN:
+            line("ST(1u) = rt::fpatan(ST(1u), ST(0u));");
+            fpop();
+            return true;
+        case ZYDIS_MNEMONIC_FYL2X:
+            line("ST(1u) = rt::fyl2x(ST(1u), ST(0u));");
+            fpop();
+            return true;
+
+        case ZYDIS_MNEMONIC_FCOMI: case ZYDIS_MNEMONIC_FCOMIP: case ZYDIS_MNEMONIC_FUCOMI: case ZYDIS_MNEMONIC_FUCOMIP: {
+            const int k = st_index(i, i.nops == 2 ? i.op[1] : d);
+            line(std::format("{{ const double a_ = ST(0u), b_ = ST({}u); [[maybe_unused]] const bool un_ = a_ != a_ || b_ != b_;", k));
+            if (need & ZF) line("zf = un_ || a_ == b_;");
+            if (need & PF) line("pf = un_;");
+            if (need & CF) line("cf = un_ || a_ < b_;");
+            if (need & OF) line("of = false;");
+            if (need & SF) line("sf = false;");
+            if (need & AF) line("af = false;");
+            line("}");
+            if (M == ZYDIS_MNEMONIC_FCOMIP || M == ZYDIS_MNEMONIC_FUCOMIP) fpop();
+            return true;
+        }
+        case ZYDIS_MNEMONIC_FCOM: case ZYDIS_MNEMONIC_FCOMP: case ZYDIS_MNEMONIC_FCOMPP:
+        case ZYDIS_MNEMONIC_FUCOM: case ZYDIS_MNEMONIC_FUCOMP: case ZYDIS_MNEMONIC_FUCOMPP: case ZYDIS_MNEMONIC_FTST: {
+            mark_fx(FPSW);
+            std::string src = "ST(1u)";
+            if (M == ZYDIS_MNEMONIC_FTST) src = "0.0";
+            else if (i.nops == 1) src = fsrc(i, d);
+            else if (i.nops == 2) src = fsrc(i, i.op[1]);
+            line(std::format("fpsw = rt::fcom_codes(fpsw, ST(0u), {});", src));
+            const int pops = (M == ZYDIS_MNEMONIC_FCOMP || M == ZYDIS_MNEMONIC_FUCOMP) ? 1
+                             : (M == ZYDIS_MNEMONIC_FCOMPP || M == ZYDIS_MNEMONIC_FUCOMPP) ? 2 : 0;
+            for (int k = 0; k < pops; ++k) fpop();
+            return true;
+        }
+        case ZYDIS_MNEMONIC_FNSTSW: {
+            use_fx(FPSW);
+            const std::string sw = "((fpsw & ~0x3800u) | (ftop << 11)) & 0xFFFFu";
+            if (d.kind == Operand::Kind::Reg) {
+                if (d.reg != ZYDIS_REGISTER_AX) unsupported(i, "fnstsw to a register other than ax");
+                mark(EAX);
+                line(std::format("eax = (eax & 0xFFFF0000u) | ({});", sw));
+            } else {
+                line(std::format("rt::st16(m, {}, uint16_t({}), 0x{:X}u);", addr(i, d), sw, i.addr));
+            }
+            return true;
+        }
+        case ZYDIS_MNEMONIC_FNSTCW:
+            use_fx(FPCW);
+            line(std::format("rt::st16(m, {}, uint16_t(fpcw), 0x{:X}u);", addr(i, d), i.addr));
+            return true;
+        case ZYDIS_MNEMONIC_FLDCW:
+            mark_fx(FPCW);
+            line(std::format("fpcw = uint32_t(rt::ld16(m, {}, 0x{:X}u));", addr(i, d), i.addr));
+            return true;
+        case ZYDIS_MNEMONIC_FWAIT: case ZYDIS_MNEMONIC_FNOP:
+            return true;
+        case ZYDIS_MNEMONIC_FFREE:
+            mark_fx(FTAG);
+            line(std::format("ftag &= ~(1u << ((ftop + {}u) & 7u));", st_index(i, d)));
+            return true;
+        case ZYDIS_MNEMONIC_FINCSTP: mark_fx(FTOP); line("ftop = (ftop + 1u) & 7u;"); return true;
+        case ZYDIS_MNEMONIC_FDECSTP: mark_fx(FTOP); line("ftop = (ftop - 1u) & 7u;"); return true;
+        default:
+            return false;
+    }
 }
 
 // Forward analysis of esp (and ebp) as constant offsets from esp at entry.
@@ -1027,12 +1254,19 @@ std::string FnEmitter::run() {
         if (used_ & (1u << (8 + x))) xmms += std::format("{}xmm{} = c.xmm[{}]", xmms.empty() ? "" : ", ", x, x);
         if (written_ & (1u << (8 + x))) wb += std::format(" c.xmm[{0}] = xmm{0};", x);
     }
+    std::string fx;
+    for (int k = 0; k < 4; ++k) {
+        if (used_ & (1u << (16 + k))) fx += std::format("{}{} = c.{}", fx.empty() ? "" : ", ", kX87[size_t(k)], kX87[size_t(k)]);
+        if (written_ & (1u << (16 + k))) wb += std::format(" c.{0} = {0};", kX87[size_t(k)]);
+    }
 
     std::string fn = std::format("void {}(rt::Context& c) {{\n", Lifter::name(f_.start));
     fn += std::format("    QILIN_FRAME(0x{:X}u, c.esp);\n", f_.start);
     fn += "    [[maybe_unused]] const rt::Mem m{c.mem, c.mem_size};\n";
     if (!gprs.empty()) fn += std::format("    uint32_t {};\n", gprs);
     if (!xmms.empty()) fn += std::format("    rt::Xmm {};\n", xmms);
+    if (!fx.empty()) fn += std::format("    uint32_t {};\n", fx);
+    if (x87_) fn += "    [[maybe_unused]] auto ST = [&](uint32_t k) -> double& { return c.st[(ftop + k) & 7u]; };\n";
     fn += "    [[maybe_unused]] bool cf = false, pf = false, af = false, zf = false, sf = false, of = false;\n";
     fn += std::format("    [[maybe_unused]] auto writeback = [&] {{{} }};\n", wb);
     if (calls_) {
@@ -1042,6 +1276,8 @@ std::string FnEmitter::run() {
             if (used_ & (1u << g)) rl += std::format(" {0} = c.{0};", kGpr[size_t(g)]);
         for (int x = 0; x < 8; ++x)
             if (used_ & (1u << (8 + x))) rl += std::format(" xmm{0} = c.xmm[{0}];", x);
+        for (int k = 0; k < 4; ++k)
+            if (used_ & (1u << (16 + k))) rl += std::format(" {0} = c.{0};", kX87[size_t(k)]);
         fn += std::format("    [[maybe_unused]] auto reload = [&] {{{} }};\n", rl);
     }
     fn += out_;

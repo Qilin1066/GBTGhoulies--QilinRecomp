@@ -50,6 +50,13 @@ struct Context {
     uint32_t eflags;  // not modelled across calls yet; reserved
     uint32_t ret_to;  // return address popped by the last `ret` (callers check it)
     Xmm xmm[8];
+    // x87 (slice 3). Registers are doubles, in physical order: ST(i) is
+    // st[(ftop + i) & 7]. See the x87 section below for why doubles are exact.
+    double st[8];
+    uint32_t ftop;  // TOP
+    uint32_t ftag;  // bit p set: physical register p holds a value
+    uint32_t fpcw;  // control word: precision control in bits 8-9, rounding in 10-11
+    uint32_t fpsw;  // status word except TOP: condition codes C0-C3, sticky exception bits
     uint8_t* mem;
     uint64_t mem_size;
 };
@@ -130,6 +137,8 @@ inline uint16_t ld16(const Mem& m, uint32_t a, uint32_t at) { check(m, a, 2, at)
 inline uint32_t ld32(const Mem& m, uint32_t a, uint32_t at) { check(m, a, 4, at); uint32_t v; std::memcpy(&v, m.base + a, 4); return v; }
 
 inline void st8(const Mem& m, uint32_t a, uint8_t v, uint32_t at) { check(m, a, 1, at); traced(a, 1); m.base[a] = v; }
+inline uint64_t ld64(const Mem& m, uint32_t a, uint32_t at) { check(m, a, 8, at); uint64_t v; std::memcpy(&v, m.base + a, 8); return v; }
+inline void st64(const Mem& m, uint32_t a, uint64_t v, uint32_t at) { check(m, a, 8, at); traced(a, 8); std::memcpy(m.base + a, &v, 8); }
 inline void st16(const Mem& m, uint32_t a, uint16_t v, uint32_t at) { check(m, a, 2, at); traced(a, 2); std::memcpy(m.base + a, &v, 2); }
 inline void st32(const Mem& m, uint32_t a, uint32_t v, uint32_t at) { check(m, a, 4, at); traced(a, 4); std::memcpy(m.base + a, &v, 4); }
 
@@ -292,6 +301,160 @@ inline uint32_t divss(uint32_t a, uint32_t b) { const float r = f32(a) / f32(b);
 #pragma warning(pop)
 #endif
 inline uint32_t sqrtss(uint32_t a) { const float r = std::sqrt(f32(a)); return r == r ? u32(r) : sse_nan(a, a); }
+
+// ---------------------------------------------------------------- x87
+// Registers hold doubles. That is exact for what the game does:
+//  - It runs with precision control at 24 bits (_controlfp(_PC_24) at
+//    startup), so every add, subtract, multiply, divide and square root rounds
+//    its result to a 24-bit significand, while the exponent keeps the
+//    register's range (unlike a C++ float). x87_round does that rounding.
+//  - When both operands have at most 24 significant bits, computing in double
+//    and rounding once to 24 bits gives the correctly rounded result (53 >=
+//    2*24 + 2). When one is wider (a loaded double or integer, a constant, a
+//    transcendental result), the double result is first made round-to-odd
+//    using its exact error (fma / TwoSum), which makes the second rounding
+//    exact too.
+//  - With precision control at 53 bits (the C runtime's setting before the
+//    game changes it), double arithmetic is the x87 arithmetic.
+// Not exact: values wider than 53 bits (fild of a 64-bit integer above 2^53,
+// the 64-bit constants such as fldpi, and transcendental results, which the
+// x87 computes to 64 bits; these use the host's double maths), precision
+// control at 64 bits, and exponents beyond double's range.
+inline uint64_t dbits(double d) { return std::bit_cast<uint64_t>(d); }
+inline double dfrom(uint64_t b) { return std::bit_cast<double>(b); }
+inline bool is_nan64(uint64_t b) { return (b & 0x7FFFFFFFFFFFFFFFull) > 0x7FF0000000000000ull; }
+inline bool is_snan64(uint64_t b) { return is_nan64(b) && !(b & (1ull << 51)); }
+constexpr uint64_t kX87Indefinite = 0xFFF8000000000000ull;  // the "real indefinite" QNaN
+inline double quiet64(double a) { return dfrom(dbits(a) | (1ull << 51)); }
+
+// x87 NaN results: a QNaN beats an SNaN; between two of the same kind the
+// larger significand wins (the positive one on a tie); a single NaN operand
+// propagates; an invalid operation on non-NaNs gives the indefinite.
+inline double x87_nan(double a, double b) {
+    const uint64_t A = dbits(a), B = dbits(b);
+    const bool an = is_nan64(A), bn = is_nan64(B);
+    if (an && bn) {
+        const bool as = is_snan64(A), bs = is_snan64(B);
+        if (as != bs) return quiet64(as ? b : a);
+        const uint64_t ma = A & 0x000FFFFFFFFFFFFFull, mb = B & 0x000FFFFFFFFFFFFFull;
+        if (ma != mb) return quiet64(ma > mb ? a : b);
+        return quiet64((A >> 63) <= (B >> 63) ? a : b);
+    }
+    if (an) return quiet64(a);
+    if (bn) return quiet64(b);
+    return dfrom(kX87Indefinite);
+}
+inline double x87_nan1(double a) { return is_nan64(dbits(a)) ? quiet64(a) : dfrom(kX87Indefinite); }
+
+// Memory operands. f32_raw/f64_raw keep an SNaN signalling (it matters for
+// which NaN an arithmetic result propagates); fld quietens, as the x87 does.
+inline double f32_raw(uint32_t u) {
+    if ((u & 0x7FFFFFFFu) > 0x7F800000u)
+        return dfrom(uint64_t(u >> 31) << 63 | 0x7FF0000000000000ull | uint64_t(u & 0x7FFFFFu) << 29);
+    return double(f32(u));
+}
+inline double f64_raw(uint64_t u) { return dfrom(u); }
+inline double fld32(uint32_t u) { const double d = f32_raw(u); return d == d ? d : quiet64(d); }
+inline double fld64(uint64_t u) { const double d = dfrom(u); return d == d ? d : quiet64(d); }
+// fst m32: round to single precision and range (nearest); a NaN keeps the
+// top of its payload.
+inline uint32_t fst32(double d) {
+    const uint64_t b = dbits(d);
+    if (is_nan64(b)) return uint32_t(b >> 63) << 31 | 0x7FC00000u | uint32_t((b >> 29) & 0x3FFFFFu);
+    return u32(float(d));
+}
+
+// Round to a 24-bit significand, ties to even, keeping double's exponent range.
+inline double round24(double x) {
+    uint64_t b = dbits(x);
+    if ((b & 0x7FF0000000000000ull) == 0x7FF0000000000000ull) return x;  // inf, NaN
+    b += 0x0FFFFFFFull + ((b >> 29) & 1u);
+    return dfrom(b & ~0x1FFFFFFFull);
+}
+inline bool narrow24(double x) { return (dbits(x) & 0x1FFFFFFFull) == 0; }
+// r was rounded to nearest from r + e (e exact): make it round-to-odd.
+inline double to_odd(double r, double e) {
+    if (e == 0.0 || (dbits(r) & 1u)) return r;
+    return std::nextafter(r, e > 0.0 ? INFINITY : -INFINITY);
+}
+inline unsigned x87_pc(uint32_t cw) { return (cw >> 8) & 3u; }  // 0: 24 bits, 2: 53, 3: 64
+
+// The precision-controlled operations. `wide` is the exact-error fallback.
+template <class Op, class Err>
+inline double x87_arith(uint32_t cw, double a, double b, Op op, Err err) {
+    const double r = op(a, b);
+    if (r != r) [[unlikely]] return x87_nan(a, b);
+    if (x87_pc(cw) != 0u || !std::isfinite(r)) return r;
+    if (narrow24(a) && narrow24(b)) return round24(r);
+    return round24(to_odd(r, err(a, b, r)));
+}
+inline double fadd(uint32_t cw, double a, double b) {
+    return x87_arith(cw, a, b, [](double x, double y) { return x + y; },
+                     [](double x, double y, double r) { const double bb = r - x; return (x - (r - bb)) + (y - bb); });
+}
+inline double fsub(uint32_t cw, double a, double b) {
+    return x87_arith(cw, a, b, [](double x, double y) { return x - y; },
+                     [](double x, double y, double r) { const double bb = r - x; return (x - (r - bb)) + (-y - bb); });
+}
+inline double fmul(uint32_t cw, double a, double b) {
+    return x87_arith(cw, a, b, [](double x, double y) { return x * y; },
+                     [](double x, double y, double r) { return std::fma(x, y, -r); });
+}
+#if defined(_MSC_VER)
+#pragma warning(push)
+#pragma warning(disable : 4723)  // IEEE division by zero is intended
+#endif
+inline double fdiv(uint32_t cw, double a, double b) {
+    return x87_arith(cw, a, b, [](double x, double y) { return x / y; },
+                     [](double x, double y, double r) {
+                         const double rem = std::fma(-r, y, x);  // x - r*y, exact
+                         if (rem == 0.0) return 0.0;  // exact
+                         return (rem < 0.0) != (y < 0.0) ? -1.0 : 1.0;  // sign of x/y - r
+                     });
+}
+#if defined(_MSC_VER)
+#pragma warning(pop)
+#endif
+inline double fsqrt(uint32_t cw, double a) {
+    const double r = std::sqrt(a);
+    if (r != r) [[unlikely]] return x87_nan1(a);
+    if (x87_pc(cw) != 0u || !std::isfinite(r)) return r;
+    if (narrow24(a)) return round24(r);
+    const double rem = std::fma(-r, r, a);  // a - r*r, exact
+    return round24(to_odd(r, rem));
+}
+// Transcendentals (precision control doesn't apply): the host's double maths.
+inline double x87_result1(double r, double a) { return r == r ? r : x87_nan1(a); }
+inline double fsin(double a) { return x87_result1(std::sin(a), a); }
+inline double fcos(double a) { return x87_result1(std::cos(a), a); }
+inline double ftan(double a) { return x87_result1(std::tan(a), a); }
+inline double fpatan(double y, double x) { const double r = std::atan2(y, x); return r == r ? r : x87_nan(y, x); }
+inline double fyl2x(double y, double x) { const double r = y * std::log2(x); return r == r ? r : x87_nan(y, x); }
+// fsin, fcos, fptan leave operands of magnitude 2^63 or more unchanged (C2 = 1).
+inline bool x87_trig_in_range(double a) { return std::fabs(a) < 9223372036854775808.0; }
+
+// fist/fistp: round by the control word's rounding mode; out of range (or
+// NaN) gives the integer indefinite.
+inline uint32_t fist32(uint32_t cw, double a) {
+    double r;
+    switch ((cw >> 10) & 3u) {
+        case 0: r = std::nearbyint(a); break;  // the host's mode is nearest
+        case 1: r = std::floor(a); break;
+        case 2: r = std::ceil(a); break;
+        default: r = std::trunc(a); break;
+    }
+    if (!(r >= -2147483648.0 && r <= 2147483647.0)) return 0x80000000u;
+    return uint32_t(int32_t(r));
+}
+// fcom/fucom/ftst condition codes in the status word: C3 C2 C0 = 111
+// unordered, 000 greater, 001 less, 100 equal; C1 cleared.
+inline uint32_t fcom_codes(uint32_t sw, double a, double b) {
+    sw &= ~0x4700u;
+    if (a != a || b != b) return sw | 0x4500u;
+    if (a < b) return sw | 0x0100u;
+    if (a == b) return sw | 0x4000u;
+    return sw;
+}
 
 // minss/maxss: return the second operand if either is NaN or both are zero.
 inline uint32_t minss(uint32_t a, uint32_t b) { return f32(a) < f32(b) ? a : b; }

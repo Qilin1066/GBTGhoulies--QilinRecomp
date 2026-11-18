@@ -29,6 +29,8 @@ Exit status 1 if any function mismatches. Needs: pip install unicorn
 import argparse
 import concurrent.futures as cf
 import ctypes as C
+import fractions
+import math
 import mmap
 import os
 import random
@@ -40,7 +42,7 @@ import threading
 import time
 from collections import Counter
 
-from unicorn import (UC_ARCH_X86, UC_ERR_WRITE_PROT, UC_HOOK_INTR, UC_HOOK_MEM_WRITE, UC_MODE_32, UC_PROT_ALL,
+from unicorn import (UC_ARCH_X86, UC_ERR_WRITE_PROT, UC_HOOK_CODE, UC_HOOK_INTR, UC_HOOK_MEM_WRITE, UC_MODE_32, UC_PROT_ALL,
                      UC_PROT_EXEC, UC_PROT_READ, Uc, UcError)
 from unicorn.x86_const import (UC_X86_REG_CR0, UC_X86_REG_CR4, UC_X86_REG_EAX, UC_X86_REG_EBP,
                                UC_X86_REG_EBX, UC_X86_REG_ECX, UC_X86_REG_EDI, UC_X86_REG_EDX,
@@ -73,7 +75,57 @@ class Xmm(C.Structure):
 class Context(C.Structure):
     _fields_ = [(r, C.c_uint32) for r in GPRS] + [
         ("eflags", C.c_uint32), ("ret_to", C.c_uint32), ("xmm", Xmm * 8),
+        ("st", C.c_double * 8), ("ftop", C.c_uint32), ("ftag", C.c_uint32), ("fpcw", C.c_uint32), ("fpsw", C.c_uint32),
         ("mem", C.c_void_p), ("mem_size", C.c_uint64)]
+
+
+# ---- x87 values: the lifted side holds doubles, Unicorn 80-bit (mantissa, sign|exponent).
+def d2x80(d):
+    b = struct.unpack("<Q", struct.pack("<d", d))[0]
+    sign, e, m = b >> 63, (b >> 52) & 0x7FF, b & ((1 << 52) - 1)
+    if e == 0x7FF:  # inf / NaN: explicit integer bit, payload shifted up
+        return ((1 << 63) | (m << 11), sign << 15 | 0x7FFF)
+    if e == 0:
+        if m == 0:
+            return (0, sign << 15)
+        sh = 53 - m.bit_length()  # double subnormal: normalise
+        return (m << (11 + sh), sign << 15 | (1 - 1023 + 16383 - sh))
+    return ((1 << 63) | (m << 11), sign << 15 | (e - 1023 + 16383))
+
+
+def x802d(v):
+    """80-bit -> nearest double, and whether that was exact."""
+    mant, se = v
+    sign, e = se >> 15, se & 0x7FFF
+    if e == 0x7FFF:
+        if mant & ((1 << 63) - 1) == 0:
+            return math.copysign(math.inf, -1 if sign else 1), True
+        b = sign << 63 | 0x7FF << 52 | ((mant >> 11) & ((1 << 52) - 1))
+        return struct.unpack("<d", struct.pack("<Q", b))[0], mant & 0x7FF == 0
+    if mant == 0:
+        return (-0.0 if sign else 0.0), True
+    q = fractions.Fraction(mant, 1 << 63) * fractions.Fraction(2) ** (e - 16383)
+    d = float(q)  # correctly rounded
+    return (-d if sign else d), fractions.Fraction(d) == q
+
+
+TAG_EMPTY = 3
+
+
+def x87_read(uc):
+    sw = uc.reg_read(UC_X86_REG_FPSW)
+    tag = uc.reg_read(UC_X86_REG_FPTAG)
+    valid = sum(1 << p for p in range(8) if (tag >> (2 * p)) & 3 != TAG_EMPTY)
+    return {"top": (sw >> 11) & 7, "valid": valid, "sw": sw, "cw": uc.reg_read(UC_X86_REG_FPCW),
+            "regs": [uc.reg_read(UC_X86_REG_FP0 + p) for p in range(8)]}
+
+
+def x87_write(uc, cw, sw, top, valid, values):
+    uc.reg_write(UC_X86_REG_FPCW, cw)
+    uc.reg_write(UC_X86_REG_FPSW, (sw & ~0x3800) | (top << 11))
+    uc.reg_write(UC_X86_REG_FPTAG, sum((0 if valid >> p & 1 else TAG_EMPTY) << (2 * p) for p in range(8)))
+    for p in range(8):
+        uc.reg_write(UC_X86_REG_FP0 + p, d2x80(values[p]))
 
 
 FLOATS = [0.0, -0.0, 1.0, -1.0, 0.5, 2.0, 3.14159, -100.25, 1e-3, 1e10, -1e10, 1e-30, 65536.0,
@@ -84,20 +136,26 @@ def f2u(f):
     return struct.unpack("<I", struct.pack("<f", f))[0]
 
 
-def rand_word(rng, kind_weights=(4, 3, 3, 1)):
-    k = rng.choices(range(4), kind_weights)[0]
+def rand_word(rng, floaty=False):
+    k = rng.choices(range(4), (2, 1, 8, 1) if floaty else (4, 3, 3, 1))[0]
     if k == 0:  # pointer into scratch, 16-aligned plus a small offset
         return SCRATCH + rng.randrange(0, SCRATCH_SIZE - 0x10000, 16) + rng.choice([0, 0, 0, 4, 8, 12])
     if k == 1:
         return rng.randrange(0, 64)
     if k == 2:
-        return f2u(rng.choice(FLOATS) if rng.random() < 0.5 else rng.uniform(-1000, 1000))
+        if not floaty:
+            return f2u(rng.choice(FLOATS) if rng.random() < 0.5 else rng.uniform(-1000, 1000))
+        # Full 24-bit significands, at world-coordinate and unit-vector scales.
+        r = rng.random()
+        return f2u(rng.choice(FLOATS) if r < 0.2 else rng.uniform(-1000, 1000) if r < 0.6 else rng.uniform(-1, 1))
     return rng.getrandbits(32)
 
 
-def make_scratch(seed):
+def make_scratch(seed, floaty=False):
+    """floaty: a heap of mostly floats with full significands, where rounding
+    differences (x87 precision control, SSE) show up far more often."""
     rng = random.Random(seed)
-    words = [rand_word(rng) for _ in range(SCRATCH_SIZE // 4)]
+    words = [rand_word(rng, floaty) for _ in range(SCRATCH_SIZE // 4)]
     return struct.pack(f"<{len(words)}I", *words)
 
 
@@ -105,6 +163,9 @@ def build(args, work):
     gen = os.path.join(work, "gen")
     img = os.path.join(work, "image.bin")
     subprocess.run([args.qilin, "image", args.xbe, img], check=True, stdout=subprocess.DEVNULL)
+    # Reachable instructions, for the emulator corrections (see EmuFixups).
+    subprocess.run([args.qilin, "insns", args.xbe, "-o", os.path.join(work, "insns.txt")], check=True,
+                   stdout=subprocess.DEVNULL)
     cmd = [args.qilin, "lift", args.xbe, "--out", gen]
     if args.only:
         cmd += ["--only", args.only]
@@ -135,6 +196,60 @@ def build(args, work):
     return img, lib
 
 
+class EmuFixups:
+    """Where Unicorn (QEMU 5) differs from the hardware, make it follow the
+    hardware, identically in both emulators:
+      - rdtsc returns the host's time-stamp counter: replaced by a counter that
+        restarts every trial and steps by a fixed amount;
+      - fcomi/fcomip/fucomi/fucomip leave OF, SF and AF unchanged: Intel clears them;
+      - fyl2x with an operand <= 0 doesn't pop: the trial is skipped."""
+
+    def __init__(self, insns_path):
+        self.rdtsc, self.fcomi, self.fyl2x = [], [], []
+        for line in open(insns_path):
+            parts = line.split(None, 3)
+            a, n, m = int(parts[0], 16), int(parts[1]), parts[3].split("\t")[0]
+            if m == "rdtsc":
+                self.rdtsc.append(a)
+            elif m in ("fcomi", "fcomip", "fucomi", "fucomip"):
+                self.fcomi.append((a, a + n))
+            elif m == "fyl2x":
+                self.fyl2x.append(a)
+        self.quirk = ""
+
+    def install(self, uc):
+        state = {"tsc": 0, "fix_at": None}
+        self_ = self
+
+        def on_rdtsc(u, a, size, ud):
+            state["tsc"] += 1000
+            u.reg_write(UC_X86_REG_EAX, state["tsc"] & 0xFFFFFFFF)
+            u.reg_write(UC_X86_REG_EDX, state["tsc"] >> 32)
+            u.reg_write(UC_X86_REG_EIP, a + 2)
+        for a in self.rdtsc:
+            uc.hook_add(UC_HOOK_CODE, on_rdtsc, None, a, a)
+
+        def on_fcomi(u, a, size, ud):
+            state["fix_at"] = a + size
+
+        def after_fcomi(u, a, size, ud):
+            if state["fix_at"] == a:
+                state["fix_at"] = None
+                u.reg_write(UC_X86_REG_EFLAGS, u.reg_read(UC_X86_REG_EFLAGS) & ~0x890)  # OF, SF, AF
+        for a, nxt in self.fcomi:
+            uc.hook_add(UC_HOOK_CODE, on_fcomi, None, a, a)
+            uc.hook_add(UC_HOOK_CODE, after_fcomi, None, nxt, nxt)
+
+        def on_fyl2x(u, a, size, ud):
+            top = (u.reg_read(UC_X86_REG_FPSW) >> 11) & 7
+            v, _ = x802d(u.reg_read(UC_X86_REG_FP0 + top))
+            if not v > 0:
+                self_.quirk = f"fyl2x of {v} at {a:08X} (Unicorn doesn't pop)"
+        for a in self.fyl2x:
+            uc.hook_add(UC_HOOK_CODE, on_fyl2x, None, a, a)
+        return state
+
+
 CB_UNLIFTED = C.CFUNCTYPE(C.c_int, C.POINTER(Context), C.c_uint32, C.c_uint32)
 
 
@@ -156,7 +271,7 @@ def enable_sse(uc):
 
 
 class Runner:
-    def __init__(self, image_path, lib_path, base=0x10000):
+    def __init__(self, image_path, lib_path, base=0x10000, insns_path=None):
         self.image = open(image_path, "rb").read()
         self.base = base
         self.lib = C.CDLL(lib_path)
@@ -198,7 +313,12 @@ class Runner:
             self.intr2 = intno
             uc.emu_stop()
         self.uc2.hook_add(UC_HOOK_INTR, on_intr2)
+        self.fixups = EmuFixups(insns_path or os.path.join(os.path.dirname(lib_path), "insns.txt"))
+        self.fix_uc = self.fixups.install(self.uc)
+        self.fix_uc2 = self.fixups.install(self.uc2)
         self.unlifted_calls = 0
+        self.fpcw = 0x007F
+        self.wide_reg = self.wide_from_unlifted = False
         self.cb = CB_UNLIFTED(self.run_unlifted)  # keep a reference: ctypes doesn't
         self.lib.qd_set_unlifted(self.cb)
         # Clean CPU state (segments, control registers, x87, MXCSR) for both
@@ -232,9 +352,11 @@ class Runner:
             uc = self.uc2
             for name, r in zip(GPRS, UC_GPR):
                 uc.reg_write(r, getattr(ctx, name))
-            # EFLAGS aren't modelled across calls (DF clear); x87 and MXCSR state
-            # carry over from earlier callees in this trial, as in the original.
+            # EFLAGS aren't modelled across calls (DF clear); MXCSR carries over
+            # from earlier callees in this trial, as in the original. The x87
+            # state is the lifted side's.
             uc.reg_write(UC_X86_REG_EFLAGS, 0x202)
+            x87_write(uc, ctx.fpcw, ctx.fpsw, ctx.ftop, ctx.ftag, list(ctx.st))
             for k in range(8):
                 uc.reg_write(UC_X86_REG_XMM0 + k, sum(ctx.xmm[k].u[j] << (32 * j) for j in range(4)))
             self.intr2 = None
@@ -259,6 +381,14 @@ class Runner:
                 v = uc.reg_read(UC_X86_REG_XMM0 + k)
                 for j in range(4):
                     ctx.xmm[k].u[j] = (v >> (32 * j)) & 0xFFFFFFFF
+            fx = x87_read(uc)
+            ctx.ftop, ctx.ftag, ctx.fpcw = fx["top"], fx["valid"], fx["cw"]
+            ctx.fpsw = fx["sw"] & ~0x3800
+            for p in range(8):
+                v, exact = x802d(fx["regs"][p])
+                ctx.st[p] = v
+                if not exact and fx["valid"] >> p & 1:
+                    self.wide_from_unlifted = True  # a 64-bit-precision value the lifted side can't hold
             ctx.ret_to = ret
             return 0
         except Exception as e:  # never let an exception unwind through C++ frames
@@ -293,6 +423,13 @@ class Runner:
         xmm = [[rand_word(rng, (1, 1, 6, 1)) for _ in range(4)] for _ in range(8)]
         stack = struct.pack("<I", SENTINEL) + struct.pack("<16I", *[rand_word(rng) for _ in range(16)])
         self.write_both(STACK_TOP, stack)
+        # x87: the variant's control word, and half the time a value already in
+        # ST(0) (an argument passed on the register stack).
+        fst = [0.0] * 8
+        ftop, fvalid = 0, 0
+        if rng.random() < 0.5:
+            ftop, fvalid = 7, 1 << 7
+            fst[7] = struct.unpack("<f", struct.pack("<I", rand_word(rng, (1, 1, 6, 1))))[0]
 
         # ---- original under Unicorn ----
         uc = self.uc
@@ -304,6 +441,11 @@ class Runner:
         for k in range(8):
             v = sum(xmm[k][j] << (32 * j) for j in range(4))
             uc.reg_write(UC_X86_REG_XMM0 + k, v)
+        x87_write(uc, self.fpcw, 0, ftop, fvalid, fst)
+        self.wide_from_unlifted = self.wide_reg = False
+        for st in (self.fix_uc, self.fix_uc2):
+            st["tsc"], st["fix_at"] = 0, None
+        self.fixups.quirk = ""
         self.uc_writes = []
         self.uc2_writes = []
         self.unlifted_fault = ""
@@ -318,11 +460,12 @@ class Runner:
         except UcError as e:
             status = "budget" if e.errno == UC_ERR_WRITE_PROT else "fault"
             why = f"{e} at {uc_eip(uc):08X}"
-        if status == "budget":  # never run the lifted code on a state the original didn't finish
+        if status == "budget" or self.fixups.quirk:  # never run the lifted code on a state the original didn't finish
             self.restore(list(self.uc_writes) + [(STACK_TOP, len(stack))])
             return "skip", "", regs
         uc_regs = [uc.reg_read(r) for r in UC_GPR]
         uc_xmm = [uc.reg_read(UC_X86_REG_XMM0 + k) for k in range(8)]
+        uc_fx = x87_read(uc)
         uc_w = list(self.uc_writes)
 
         # ---- lifted ----
@@ -332,6 +475,9 @@ class Runner:
         for k in range(8):
             for j in range(4):
                 ctx.xmm[k].u[j] = xmm[k][j]
+        for p in range(8):
+            ctx.st[p] = fst[p]
+        ctx.ftop, ctx.ftag, ctx.fpcw, ctx.fpsw = ftop, fvalid, self.fpcw, 0
         ctx.mem = C.addressof(self.hmem)
         ctx.mem_size = MEM_SIZE
         err = C.create_string_buffer(256)
@@ -342,7 +488,9 @@ class Runner:
         h_w = [(buf[2 * k], buf[2 * k + 1]) for k in range(n)] + self.uc2_writes
 
         result, detail = "pass", ""
-        if rc == 3:
+        if self.fixups.quirk:
+            result = "skip"  # the callee emulator hit a Unicorn x87 deviation
+        elif rc == 3:
             result = "skip"  # an unlifted callee ran past the budget
         elif rc == 4:
             result, detail = "fail", err.value.decode()
@@ -375,6 +523,19 @@ class Runner:
                         nan_only = True
                     else:
                         diffs.append(f"xmm{k}: original {uc_xmm[k]:032X} lifted {hv:032X}")
+            # x87: TOP, which registers hold values, those values, the control word.
+            if ctx.ftop != uc_fx["top"] or ctx.ftag != uc_fx["valid"]:
+                diffs.append(f"x87 TOP/tags: original {uc_fx['top']}/{uc_fx['valid']:02X} lifted {ctx.ftop}/{ctx.ftag:02X}")
+            else:
+                for p in range(8):
+                    if uc_fx["valid"] >> p & 1 and d2x80(ctx.st[p]) != tuple(uc_fx["regs"][p]):
+                        o, exact = x802d(uc_fx["regs"][p])
+                        if not exact and d2x80(o) == d2x80(ctx.st[p]):
+                            self.wide_reg = True  # the original holds more than 53 bits
+                            continue
+                        diffs.append(f"st[{p}]: original {uc_fx['regs'][p]} ({o!r}) lifted {ctx.st[p]!r}")
+            if ctx.fpcw != uc_fx["cw"]:
+                diffs.append(f"x87 control word: original {uc_fx['cw']:04X} lifted {ctx.fpcw:04X}")
             for a, sz in merge(uc_w + h_w):
                 ub = bytes(uc.mem_read(a, sz))
                 hb = bytes(self.hmem[a:a + sz])
@@ -395,9 +556,12 @@ class Runner:
                     diffs.append(f"memory {a:08X}+{sz}: original {ub.hex()} lifted {hb.hex()}")
                     break
             if diffs:
-                result, detail = "fail", "; ".join(diffs[:4])
+                wide = " [a 64-bit x87 value was involved]" if (self.wide_reg or self.wide_from_unlifted) else ""
+                result, detail = "fail", "; ".join(diffs[:4]) + wide
             elif nan_only:
                 result = "pass-nan"
+            elif self.wide_reg:
+                result = "pass-x87wide"  # equal once the original's 64-bit register value is rounded to double
         self.restore(uc_w + h_w + [(STACK_TOP, len(stack))])
         return result, detail, regs
 
@@ -441,7 +605,10 @@ def worker_body(job):
     per_variant = max(1, args.trials // args.variants)
     log = open(os.path.join(args.work, f"results.{wid}.txt"), "w")
     for v in range(args.variants):
-        R.load_scratch(make_scratch(args.seed * 1000 + v))
+        # Variants alternate the x87 precision; the second pair uses a float-heavy heap.
+        R.load_scratch(make_scratch(args.seed * 1000 + v, floaty=(v // 2) % 2 == 1))
+        # The game's x87 control word (24-bit precision) and the C runtime's (53-bit).
+        R.fpcw = 0x007F if v % 2 == 0 else 0x027F
         for n, f in enumerate(funcs):
             t0 = time.time()
             for k in range(per_variant):
@@ -506,9 +673,11 @@ def main():
     failing = sorted(f for f, c in per.items() if c["fail"])
     exercised = sum(1 for c in per.values() if c["pass"])
     only_fault = sum(1 for c in per.values() if not c["pass"] and not c["fail"])
-    counted = ("pass", "pass-nan", "fail", "fault-both", "skip")
+    counted = ("pass", "pass-nan", "pass-x87wide", "fail", "fault-both", "skip")
     print(f"functions: {len(funcs)}  trials: {sum(tot[k] for k in counted)}  {dict(tot)}")
     print(f"functions with >=1 completed matching trial: {exercised}")
+    if tot["pass-x87wide"]:
+        print(f"trials matching once a 64-bit x87 register value is rounded to double: {tot['pass-x87wide']}")
     if tot["pass-nan"]:
         print(f"trials matching except NaN against NaN (Unicorn's x87-style SSE NaN propagation): {tot['pass-nan']}")
     print(f"functions where every trial faulted or hit the budget (not exercised): {only_fault}")

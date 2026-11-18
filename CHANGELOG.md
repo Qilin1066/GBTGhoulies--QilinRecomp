@@ -11,6 +11,27 @@ Each release is a git tag (`vX.Y.Z`) with a matching GitHub release. The version
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-11-18
+Lifter slice 3 (x87). 5,726 of the 5,747 functions in the game code and Rare libraries lift now (99.6%), up from 5,098. The 21 left are 20 functions with C++ exception frames and one CPU-ID probe.
+
+### Added
+- **x87 in lifted code:** 9,646 instructions in 628 functions.
+  - **State:** the register stack is kept in the Context in physical order, as doubles, with TOP, the tag bits, the control word and the status word. Values cross calls as on the hardware, including float return values in `ST(0)`.
+  - **Precision control is honoured at runtime.** The game sets 24-bit precision at startup (`_controlfp` at `0x33462`). `rt::fadd`, `fsub`, `fmul`, `fdiv` and `fsqrt` then round to a 24-bit significand with the register's full exponent range, correctly even when an operand is wider than 24 bits (round-to-odd from the exact error). At 53-bit precision they're plain double arithmetic.
+  - **NaN results follow x87 rules on every host:** a QNaN beats an SNaN, the larger significand wins, and invalid operations give the indefinite `0xFFF8000000000000`.
+  - **Also covered:** integer loads, `fist` by the control word's rounding mode, the constants, `fxch`, `fchs`, `fabs`, `fcom`/`fucom`/`ftst` with `fnstsw`, `fcomi`/`fucomi`, `fsin`, `fcos`, `fptan`, `fpatan`, `fyl2x`, `fldcw`/`fnstcw` and `ffree`.
+  - **Not exact, by design:** values wider than 53 bits (64-bit integers above 2^53, the x87's 64-bit constants, transcendental results) are held as doubles. Transcendentals use the host's maths library, which may differ in the last bit between platforms. That affects 23 instructions, and a bundled implementation is next.
+- **An exact cross-check of the x87 rounding** (`tools/check/x87/`): 40,000 random operations per seed, compared with exact rational arithmetic rounded to 24 bits. 0 mismatches with GCC 14 and Clang 19. Unit tests cover the tie cases, NaN rules, conversions and compare codes.
+- **Differential test with x87 state.**
+  - **Compared:** TOP, the valid registers and their values, and the control word. Half the trials start with a value in `ST(0)`. Each function runs under both 24-bit and 53-bit precision control.
+  - **Results:** 5,726 functions, 45,808 trials, 0 mismatches, also under UBSan. 511 of the 628 x87 functions completed at least one matching trial.
+  - **Float-heavy heaps** with `--variants 4`. On the 628 x87 functions: 10,047 trials, 0 mismatches, and 540 functions exercised.
+  - **Mutation checks:** four planted x87 bugs. A dropped pop was caught in 270 of 449 functions, `fcomi` with swapped operands in 92 of 155, and ignored precision control in 56 of 310. An untagged `fst st(i)` destination was caught in 0 of 30: in the game's code the destination already holds a value, and a probe for an empty one never fired.
+- **Emulator corrections in the difftest,** where Unicorn 2.1 (QEMU 5) differs from the hardware: `rdtsc` returns a per-trial counter instead of the host's, the `fcomi` family clears OF, SF and AF, and trials where `fyl2x` gets an operand ≤ 0 (which Unicorn doesn't pop) are skipped. The difftest build now also writes `qilin insns` output, which gives the addresses.
+
+### Changed
+- **24 more library entry points are called directly,** from the newly lifted functions: 275 in all (D3D 90, XAPI 79, CRT 40, XACT 28, D3DX 17, BINK 7, XPP 7, XGRPH 6, DSOUND 1). Generated stubs fall from 699 to 287.
+
 ## [0.5.0] - 2026-11-18
 Lifter slice 2 (calls), and every jump table in lifted code proven. 5,098 of the 5,747 functions in the game code and Rare libraries lift now (88.7%), up from 1,276.
 

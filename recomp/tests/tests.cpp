@@ -184,6 +184,20 @@ std::vector<uint8_t> make_xbe() {
     };
     std::memcpy(&d[0x1360], strops, sizeof strops);
     put32(d, 0x141C, 0x11360);
+    // 11370: x87: a float function returning in ST0, with fcomip feeding a branch.
+    const uint8_t x87[] = {
+        0xD9, 0x44, 0x24, 0x04,  // 11370 fld dword ptr [esp+4]
+        0xD8, 0x4C, 0x24, 0x08,  // 11374 fmul dword ptr [esp+8]
+        0xD9, 0xC0,              // 11378 fld st0
+        0xDE, 0xC1,              // 1137A faddp st1, st0
+        0xD9, 0xE8,              // 1137C fld1
+        0xDF, 0xF1,              // 1137E fcomip st0, st1
+        0x76, 0x02,              // 11380 jbe 11384
+        0xD9, 0xE0,              // 11382 fchs
+        0xC3,                    // 11384 ret
+    };
+    std::memcpy(&d[0x1370], x87, sizeof x87);
+    put32(d, 0x1420, 0x11370);
     return d;
 }
 
@@ -246,7 +260,7 @@ int main() {
     if (f.contains(0x112A0)) CHECK(std::ranges::binary_search(f.at(0x112A0).insns, 0x112B0u));
     CHECK(f.contains(0x112D0) && f.at(0x112D0).origin == Origin::Eh);  // __ehhandler stub
     CHECK(f.contains(0x112E0));  // unwind funclet
-    CHECK(f.size() == 10);  // nothing seeded inside the jump/index tables or the filler
+    CHECK(f.size() == 11);  // nothing seeded inside the jump/index tables or the filler
     if (f.contains(0x11300) && f.at(0x11300).jtabs.size() == 1) {
         auto& t = f.at(0x11300).jtabs[0];  // proven by value ranges, not by a cmp next to the jump
         CHECK(t.how == "range" && t.bounded && t.first == 0);
@@ -305,6 +319,44 @@ int main() {
         CHECK(addss(0x3F800000u, 0x40000000u) == 0x40400000u);  // 1 + 2 = 3
     }
 
+    // ---------------------------------------------------------------- x87 arithmetic (24-bit precision control)
+    {
+        using namespace qilin::rt;
+        constexpr uint32_t pc24 = 0x007F, pc53 = 0x027F;
+        auto D = [](uint64_t b) { return dfrom(b); };
+        // Ties after the first rounding: the round-to-odd path gets these right.
+        CHECK(dbits(fadd(pc24, D(0x41c5696f50000000ull), D(0x3dcedeb160000000ull))) == 0x41c5696f60000000ull);
+        CHECK(dbits(fadd(pc24, D(0xb9cd634e6eb1a730ull), D(0x417f26e8f0000000ull))) == 0x417f26e8e0000000ull);
+        CHECK(dbits(fsub(pc24, D(0x41a204f570000000ull), D(0x3c101b5ba0000000ull))) == 0x41a204f560000000ull);
+        CHECK(dbits(fsub(pc24, D(0x3ba858a5a0000000ull), D(0xc1b8cf60d0000000ull))) == 0x41b8cf60e0000000ull);
+        // 53-bit precision control: plain double arithmetic.
+        CHECK(fadd(pc53, D(0x41c5696f50000000ull), D(0x3dcedeb160000000ull)) ==
+              D(0x41c5696f50000000ull) + D(0x3dcedeb160000000ull));
+        CHECK(dbits(fsqrt(pc24, 2.0)) == 0x3FF6A09E60000000ull);  // sqrt(2) to 24 bits
+        CHECK(dbits(fmul(pc24, 3.0, 1.0 / 3.0)) == 0x3FF0000000000000ull);
+        // Exponent range stays the register's: no overflow at FLT_MAX.
+        CHECK(std::isfinite(fmul(pc24, double(3.0e38f), 10.0)) && fmul(pc24, double(3.0e38f), 10.0) > 1e39);
+        // NaN rules: indefinite for invalid operations; larger payload; QNaN beats SNaN.
+        CHECK(dbits(fadd(pc24, INFINITY, -INFINITY)) == kX87Indefinite);
+        CHECK(dbits(fdiv(pc24, 0.0, 0.0)) == kX87Indefinite);
+        CHECK(dbits(fsqrt(pc24, -1.0)) == kX87Indefinite);
+        CHECK(dbits(fadd(pc24, D(0x7FF8000000000001ull), D(0xFFF8000000000002ull))) == 0xFFF8000000000002ull);
+        CHECK(dbits(fmul(pc24, D(0x7FF0000000000005ull), D(0x7FF8000000000001ull))) == 0x7FF8000000000001ull);
+        CHECK(dbits(fsub(pc24, 1.0, D(0x7FF0000000000005ull))) == 0x7FF8000000000005ull);  // SNaN quietened
+        // Memory conversions.
+        CHECK(is_snan64(dbits(f32_raw(0x7F800001u))) && !is_snan64(dbits(fld32(0x7F800001u))));
+        CHECK(fst32(1.0 + 0x1p-24) == 0x3F800000u);         // tie to even
+        CHECK(fst32(1.0 + 0x1p-24 + 0x1p-50) == 0x3F800001u);
+        CHECK(fst32(1e39) == 0x7F800000u);                  // overflow to infinity
+        CHECK(fst32(dfrom(0xFFF8000000000000ull)) == 0xFFC00000u);
+        // Compares and integer stores.
+        CHECK(fcom_codes(0, 1.0, 2.0) == 0x0100u && fcom_codes(0, 2.0, 1.0) == 0u && fcom_codes(0, 1.0, 1.0) == 0x4000u);
+        CHECK(fcom_codes(0x0200u, NAN, 1.0) == 0x4500u);
+        CHECK(fist32(0x037F, 2.5) == 2u && fist32(0x0F7F, 2.5) == 2u && fist32(0x077F, -2.5) == uint32_t(-3) &&
+              fist32(0x0B7F, 2.1) == 3u);
+        CHECK(fist32(0x037F, 3e9) == 0x80000000u);
+    }
+
     // ---------------------------------------------------------------- lifter
     Lifter lifter(dec);
     if (f.contains(0x11360)) {
@@ -314,6 +366,19 @@ int main() {
             CHECK(r->contains("rt::rep_movs_back(m, esi, edi, ecx, 4u, 0x11361u);"));  // DF = 1 after std
             CHECK(r->contains("if (a != b) break;") && r->contains("if (ran) {") && r->contains("zf = r == 0;"));
             CHECK(r->contains("esi += 1u; edi += 1u;"));  // DF = 0 again after cld
+        }
+    }
+    if (f.contains(0x11370)) {
+        auto r = lifter.lift(f.at(0x11370));
+        CHECK(r.has_value());
+        if (r) {
+            CHECK(r->contains("{ const double v_ = rt::fld32(rt::ld32(m, uint32_t(esp + 0x4u), 0x11370u)); ftop = (ftop - 1u) & 7u; "
+                              "ftag |= 1u << ftop; ST(0u) = v_; }"));
+            CHECK(r->contains("ST(0u) = rt::fmul(fpcw, ST(0u), rt::f32_raw(rt::ld32(m, uint32_t(esp + 0x8u), 0x11374u)));"));
+            CHECK(r->contains("ST(1u) = rt::fadd(fpcw, ST(1u), ST(0u));"));
+            CHECK(r->contains("zf = un_ || a_ == b_;") && r->contains("cf = un_ || a_ < b_;"));
+            CHECK(r->contains("ST(0u) = rt::dfrom(rt::dbits(ST(0u)) ^ 0x8000000000000000ull);"));
+            CHECK(r->contains("c.ftop = ftop; c.ftag = ftag;"));  // the return value stays on the x87 stack
         }
     }
     if (f.contains(0x11340)) {

@@ -1,6 +1,6 @@
 # Recompiler core: status (roadmap step 2)
 
-Last updated 2026-11-18 (v0.5.0: slice 2, calls; every jump table in lifted code proven by value-range analysis; v0.4.0: every byte of the lifted code accounted for; earlier: C++23 migration and code review, validation pass, lifter slice 1, differential test).
+Last updated 2026-11-18 (v0.6.0: slice 3, x87; v0.5.0: slice 2, calls; every jump table in lifted code proven by value-range analysis; v0.4.0: every byte of the lifted code accounted for; earlier: C++23 migration and code review, validation pass, lifter slice 1, differential test).
 
 ## Language and toolchain
 Everything is **C++23**: the recompiler, the runtime header and the generated code. The C++23 features in use are `std::expected` (XBE loader and lifter results), `std::print`/`std::format`, `std::ranges` algorithms, `std::string::contains`, `std::unreachable` and `std::bit_cast`.
@@ -127,9 +127,9 @@ A `cmp` or `and` directly above a table jump bounds most switches. For the rest,
 
 **Cross-check:** run on the 311 tables already bounded by `cmp` or `and`, the analysis gives the same size for all of them except two `and` tables in replaced library code, where it reports the full mask range and the old path drops unused trailing slots. Both answers are correct. The 7 tables still sized by scanning are all in XDK libraries that aren't lifted.
 
-**Lift check.** The lift report has no fragments left: every failure is something still to be implemented (x87 for slice 3, C++ exception frames, and one `pushfd`). In v0.3.0, 61 lift failures were fragments.
+**Lift check.** The lift report has no fragments left: every failure is something still to be implemented (C++ exception frames, and one `pushfd`). In v0.3.0, 61 lift failures were fragments.
 
-### Lifter, slices 1 and 2 (`recomp/src/lifter.*`, runtime `recomp/runtime/guest.hpp` and `dispatch.cpp`)
+### Lifter, slices 1–3 (`recomp/src/lifter.*`, runtime `recomp/runtime/guest.hpp` and `dispatch.cpp`)
 Each guest function becomes `void fn_XXXXXXXX(rt::Context&)`. `Lifter::lift` returns `std::expected<std::string, LiftFailure>`, where the failure carries a kind (fragment, unsupported instruction, x87, undefined flag, implausible, bad control flow), the address and the instruction.
 
 Inside a lifted function:
@@ -140,7 +140,7 @@ Inside a lifted function:
   - **Direct `call T`:** push the guest return address onto the guest stack, store the modified registers back to the Context (`writeback()`), call `fn_T(c)` as a plain C++ call, reload the registers the function uses (`reload()`), and check that the callee returned to the call site. A callee that returns anywhere else traps. The stack layout is exactly the original's, so arguments at `[esp+4]` and callees that move their return address (`__SEH_prolog`, `_chkstk`) work unchanged.
   - **Tail calls:** a `jmp` or `jcc` out of the function writes back, calls `fn_T(c)` and returns.
   - **Indirect calls and jumps** (`call [eax+0x14]`, `jmp eax`, the two record tables in `.rdata`) go through `rt::call(c, target)`. It binary-searches the generated function table, then falls back to `rt::call_unlifted`. That fallback belongs to whatever links the code: high-level replacements in the runtime, the original bytes in the differential test, otherwise a trap with the address.
-  - **Stubs:** every call or tail-call target without a lifted body gets a generated `fn_T` that forwards to `rt::call_unlifted`, so all direct calls link. There are 699: 448 game and Rare-library functions waiting on x87 or exception handling, and 251 library entry points the game calls directly. Those 251 are the first concrete list of what the runtime must replace: XAPI 71, D3D 87, CRT 36, XACT 25, D3DX 11, BINK 7, XPP 7, XGRPH 6, DSOUND 1.
+  - **Stubs:** every call or tail-call target without a lifted body gets a generated `fn_T` that forwards to `rt::call_unlifted`, so all direct calls link. There are 287: 12 game functions waiting on exception handling, and 275 library entry points the game calls directly. Those 275 are the concrete list of what the runtime must replace: D3D 90, XAPI 79, CRT 40, XACT 28, D3DX 17, BINK 7, XPP 7, XGRPH 6, DSOUND 1. Slice 3 added 24, called from the functions it lifted (v0.5.0 had 699 stubs, 251 of them library entry points).
   - **Flags** aren't carried across calls. A flag read after a call before any write is a lift error, never a guess. No function in the game does this.
   - **Direction flag:** tracked statically per instruction. It's clear on entry and after every call (the MSVC ABI), set by `std` and cleared by `cld`. String instructions run in that direction, and DF must be clear at every call and exit. The Rare `memcpy` uses `std; rep movsd; cld` for overlapping copies.
   - **The stack-balance check** treats esp as unknown after a call, since a callee ending in `ret n` pops its arguments too.
@@ -162,18 +162,26 @@ Inside a lifted function:
   **NaN results follow x86 rules on every host.** A NaN operand propagates, quietened; if both are NaN, the first operand's. An invalid operation on non-NaN operands (inf − inf, 0 × inf, 0 / 0, the square root of a negative) gives the default NaN `0xFFC00000`. `rt::addss` and its siblings check the result with one compare, since NaN results are rare. Before, the result depended on the host: ARM's default NaN is `0x7FC00000`, and a C++ compiler may swap the operands of `a + b`, which changes which NaN propagates. Unit tests cover the rules.
 
   `guest.hpp` turns off multiply-add contraction for Clang and MSVC and refuses `-ffast-math`. The `qilin_runtime` CMake target adds `-ffp-contract=off` for GCC.
+- **x87 (slice 3):** 9,646 instructions in 628 lifted functions, mostly float loads and stores, arithmetic, `fcomip` and float return values in `ST(0)`. There are 30 float-returning functions, called from 665 sites.
+  - **State:** the register stack lives in the Context in physical order, as eight doubles plus TOP, the tag bits, the control word and the status word. TOP, tags and the two words are held in locals like the general registers, written back at calls and exits and reloaded after calls. So values cross calls exactly as on the hardware: float returns, C-runtime helpers that take arguments on the stack, virtual calls. Nothing is inferred about what a callee pushes.
+  - **Precision control is honoured at runtime.** The game calls `_controlfp(_PC_24, _MCW_PC)` at startup (`0x33462`), so add, subtract, multiply, divide and square root round to a 24-bit significand while the exponent keeps the register's range. That is unlike a C++ `float`, which would overflow at 3.4e38 and denormalise below 1.2e-38. `rt::fadd` & co compute in double and round once. That's exact when both operands have at most 24 significant bits, because 53 ≥ 2·24 + 2. When an operand is wider (a loaded double or integer, a constant, a transcendental result), the double result is first made round-to-odd from its exact error (TwoSum, or `fma` for products, quotients and roots), which makes the second rounding exact as well. At 53-bit precision (the C runtime's setting until the game changes it, so static constructors run with it) double arithmetic is the x87 arithmetic.
+  - **NaN results follow x87 rules on every host:** a QNaN beats an SNaN; between two of the same kind the larger significand wins; invalid operations give the indefinite `0xFFF8…`. Loads quieten SNaNs, as `fld` does. Arithmetic memory operands keep them signalling, because that decides which NaN propagates.
+  - **Also covered:** loads and stores of 32 and 64-bit floats and 16/32/64-bit integers, `fxch`, `fchs`, `fabs`, the constants, `fcom`/`fucom`/`ftst` with `fnstsw ax`, `fcomi`/`fucomi` setting EFLAGS directly, `fist` by the control word's rounding mode, `fsin`/`fcos`/`fptan` (C2 set and the operand unchanged at 2^63 and above), `fpatan` and `fyl2x`.
+  - **Not exact, by design:** values wider than 53 bits. That covers `fild` of a 64-bit integer above 2^53, the x87's 64-bit constants (`fldpi`, `fldlg2` …; these use their nearest doubles), transcendental results (the host's double maths; the x87 computes 64 bits), magnitudes outside double's exponent range (the register's is wider; float data stays far inside it), and precision control at 64 bits, which the game doesn't use.
+  - **`fst st(i)` marks its destination valid.** An earlier draft only copied the value, so a store into an empty register left it tagged empty.
+  - **Checked against exact arithmetic:** `tools/check/x87/rounding.py` runs 40,000 random operations per seed, narrow and deliberately wide and near ties, through `rt::fadd`/`fsub`/`fmul`/`fdiv`/`fsqrt`, and compares each with the exact rational result rounded to 24 bits. 0 mismatches, built with GCC 14 and Clang 19. The naive "double, then round" version fails 24 of 40,000.
 - **Stack-balance check:** a forward esp/ebp analysis rejects "functions" that are fragments of other functions: they return with esp off balance or pop their own return address.
 
 **Coverage today:** `qilin lift` covers the game code (`0x11000–0x14A895`) and the Rare engine libraries (`0x152780–0x165C00`), 5,747 functions in all.
 
-| | v0.4.0 (slice 1) | v0.5.0 (slice 2) |
-|---|---|---|
-| **Lifted** | 1,276 | **5,098 (88.7%)** |
-| Not leaves (needed calls) | 4,422 | 0 |
-| Use x87 (slice 3) | 48 | 628 |
-| C++ exception frames (`fs:[0]`) | — | 20 |
-| One-off (`pushfd` in a CPU-ID probe) | 2 | 1 |
-| Fragments of other functions | 0 | 0 |
+| | v0.4.0 (slice 1) | v0.5.0 (slice 2) | v0.6.0 (slice 3) |
+|---|---|---|---|
+| **Lifted** | 1,276 | 5,098 (88.7%) | **5,726 (99.6%)** |
+| Not leaves (needed calls) | 4,422 | 0 | 0 |
+| Use x87 | 48 | 628 | 0 |
+| C++ exception frames (`fs:[0]`) | — | 20 | 20 |
+| One-off (`pushfd` in a CPU-ID probe) | 2 | 1 | 1 |
+| Fragments of other functions | 0 | 0 | 0 |
 
 Most x87 users used to be counted as "not a leaf", because they also make calls.
 
@@ -187,6 +195,9 @@ The generated code compiles with no warnings at `-Wall -Wextra -Werror` under GC
 2. Run the original x86 bytes in Unicorn, with the code pages read-only. The original runs its whole call tree.
 3. Run the lifted C++ on an identical copy of that state.
 4. Compare the results bit for bit: every general register, esp, all 8 xmm registers (all lanes), every written byte, and the return address. If the original faults, the lifted code must trap too.
+5. **x87 state** is compared too: TOP, which registers are valid, every valid register's value and the control word. Unicorn holds 80-bit registers and the lifted code doubles, so a value matches only if the original's register holds exactly that double. A register holding more than 53 bits in the original (a 64-bit constant or a transcendental result) that matches once rounded would be counted apart, as `pass-x87wide`. No trial in the v0.6.0 runs needed that.
+
+Half the trials start with a value already in `ST(0)`, as when a caller passes one in. Each function runs under both precision-control settings: the game's 24-bit (the first heap image) and the C runtime's 53-bit (the second). With `--variants 4`, a second pair of heap images is float-heavy, mostly floats with full significands at world and unit-vector scales, where rounding differences show up more often.
 
 **Calls.** Lifted callees are called directly. A callee with no lifted body (library code, or game code waiting on x87) runs from its original bytes in a second Unicorn instance that maps the lifted side's memory, so whole call trees are compared whatever their callees are. A called callee stops at the return address at `[esp]`. A tail-called one (marked in test builds, since it may be the middle of an epilogue with saved registers at `[esp]`) stops at the tail-calling function's own return address.
 
@@ -198,7 +209,44 @@ The generated code compiles with no warnings at `-Wall -Wextra -Werror` under GC
 - **NaN against NaN.** Unicorn propagates SSE NaNs by x87 rules (larger payload wins), real SSE by operand order. Trials whose only differences are NaN against NaN, in an xmm lane or an aligned memory word, are counted as `pass-nan`.
 - **Calls into non-code.** A call through a null or random pointer makes the original execute data, which depends on CPU state the lifted side doesn't carry (flags, segments). Those trials are skipped.
 
-**Mutation check:** a lifter with the post-call `reload()` removed was caught as mismatches in 17 of 100 sampled functions. Without the runaway guards, that build had crashed or hung the harness instead.
+**Emulator corrections.** Unicorn 2.1 (QEMU 5) differs from the hardware in three places that lifted code reaches. The harness corrects them in both emulators, at the addresses `qilin insns` lists:
+- **`rdtsc`** reads the host's time-stamp counter, so an XAPI timing function (`0x14C29C`) gave different results in the two runs. It now returns a counter that restarts every trial.
+- **`fcomi`, `fcomip`, `fucomi` and `fucomip`** leave OF, SF and AF as they were; Intel documents them as cleared. `0x140D80` reads them back with `lahf`. They're cleared after each one.
+- **`fyl2x` with an operand ≤ 0** doesn't pop. The lifted code pops, as the hardware does, and those trials are skipped.
+
+**Mutation checks:**
+- **Slice 2:** a lifter with the post-call `reload()` removed was caught as mismatches in 17 of 100 sampled functions. Without the runaway guards, that build had crashed or hung the harness instead.
+- **Slice 3:** four x87 bugs, each planted in the generated code of every function it applies to, then tested on the functions among them that had completed a trial before:
+
+  | Planted bug | Caught in |
+  |---|---|
+  | One pop dropped per function | 270 of 449 functions |
+  | `fcomi` setting CF with its operands swapped | 92 of 155 |
+  | Precision control ignored (always 53-bit) | 35 of 310; 56 with the float-heavy heaps added |
+  | `fst st(i)` not marking its destination valid (the earlier draft's bug) | 0 of 30 |
+
+  Precision control is the hardest to see. One operation on float inputs, stored straight to a float, gives the same result at either precision, so only longer chains in registers can show it. The `fst st(i)` bug can't show on the game's code: a probe that traps when the destination is empty never fired in 161 completed trials of those 30 functions.
+
+**Results (v0.6.0, slice 3):**
+
+| | `-O2` run (8 trials per function, 2 heap images) | UBSan run (same trials) |
+|---|---|---|
+| Functions tested | 5,726 | 5,726 |
+| Trials | 45,808 | 45,808 |
+| Completed and matching | 20,695 | 20,695 |
+| … of which ran through an unlifted callee's original code | 861 (in 204 functions) | 861 |
+| Matching except NaN against NaN | 1 | 1 |
+| Faulted in both versions | 22,659 | 22,659 |
+| Skipped (budget, a write into code, a call into non-code, the `fyl2x` case) | 2,453 | 2,453 |
+| **Mismatches** | **0** | **0**, and no undefined behaviour |
+| Functions with at least one completed, matching trial | 4,434 | 4,434 |
+| … of the 628 x87 functions | 511 | 511 |
+
+Fewer trials ran through original callee code than in v0.5.0, because the 628 functions that were stubs then are lifted now.
+
+**x87 run with float-heavy heaps** (the 628 x87 functions, 16 trials each over 4 heap images): 10,047 trials, 3,919 completed and matching, **0 mismatches**. 540 of the 628 functions completed at least one matching trial.
+
+The first x87 run (616 functions) had 19 failing trials in 4 functions. None was a lifter bug: they were the three emulator deviations above.
 
 **Results (v0.5.0, slice 2):**
 
@@ -260,7 +308,7 @@ The function and jump-table counts are **what we have found so far, not totals r
 1. **Every byte of the code we lift is accounted for.** It is either an instruction of a function, or a known kind of data: a jump table, a byte index table, alignment padding, or a constant. ✅ **Done in v0.4.0:** 0 unknown bytes in the game code, the Rare libraries and the EH funclets (`qilin coverage`). The 97.8% quoted before was for all of `.text`, including XAPI and the CRT, which aren't lifted.
 2. **Every switch has a proven size.** ✅ **Done for lifted code:** every jump table in the game code and Rare libraries is bounded by a `cmp`, an `and` mask or the value-range analysis. 7 tables are still sized by scanning, all in XDK libraries that get replaced. The lifter also traps on any index outside a table.
 3. **Every indirect jump is resolved.** ✅ **Done for lifted code:** the 9 that aren't switches are indirect tail calls through function pointers (`jmp [eax+0x14]`, `jmp eax`, `jmp [0x304EC4]`, two record tables in `.rdata`). They go through the indirect-call dispatcher, which traps on an unknown target.
-4. **Every function lifts.** The lift report must show zero failures. Today 5,098 of 5,747 functions in the game code and Rare libraries lift (88.7%). The rest are 628 x87 users (slice 3), 20 functions with C++ exception frames, and one CPU-ID probe (`pushfd`) that the runtime will replace. None is a fragment.
+4. **Every function lifts.** The lift report must show zero failures. Today 5,726 of 5,747 functions in the game code and Rare libraries lift (99.6%). The rest are 20 functions with C++ exception frames and one CPU-ID probe (`pushfd`) that the runtime will replace. None is a fragment.
 5. **Nothing turns up at runtime.** An indirect call to an address we don't have a function for traps with the address logged. A full playthrough (and the attract mode, menus and every level) with no such trap closes the list. The Ghoulies PC Recomp's seed list of functions found during play is an extra cross-check.
 
 Checks 1–4 are static and will be reported by `qilin` itself. Check 5 needs the runtime (roadmap step 3) and a playable build.
@@ -272,8 +320,10 @@ Checks 1–4 are static and will be reported by `qilin` itself. Check 5 needs th
 4. **MXCSR is assumed to be the default** (round-to-nearest, no flush-to-zero). This must be confirmed against what the game or XDK sets at boot.
 5. **Library sections have low coverage** (DSOUND 35%, WMADEC 36%). They get replaced, so this doesn't block anything.
 6. **The Ghoulies PC Recomp seed list hasn't been used yet** as a cross-check (see `prior-art.md`).
+7. **x87 transcendentals come from the host's maths library.** The 23 `fsin`, `fcos`, `fptan`, `fpatan` and `fyl2x` instructions in lifted code call `std::sin` and the like, which can differ in the last bit between glibc, Apple's libm and the MSVC runtime. Neither matches the x87's own results exactly. The game rounds most of these to `float` on store, so a difference should be very rare, but results aren't guaranteed identical across hosts. The fix is a bundled implementation, the same on every host.
+8. **Unicorn's x87 differs from the hardware** in three known places (`rdtsc`, the `fcomi` family's OF/SF/AF, `fyl2x` with an operand ≤ 0). The harness corrects or skips them; other deviations may exist that the trials haven't reached yet.
 
 ## Next
-1. **Slice 3: x87.** 628 functions. Use host `double`, honour precision control where the game sets it, and keep x87 state in the Context across calls.
-2. **C++ exception frames:** 20 functions write `fs:[0]`. The strategy is still to be chosen: map to host C++ exceptions, or keep an explicit frame chain.
-3. **Indirect-call dispatch** is a binary search over 5,098 entries, about 13 steps. A direct-mapped table indexed by address (16-byte granularity in the aligned regions) would make it one lookup. Do this when the runtime measures it.
+1. **C++ exception frames:** 20 functions write `fs:[0]`, the last game functions that don't lift apart from the CPU-ID probe. The strategy is still to be chosen: map to host C++ exceptions, or keep an explicit frame chain.
+2. **Transcendentals, the same on every host:** bundle portable `sin`, `cos`, `tan`, `atan2` and `log2` for the 23 x87 transcendentals (known issue 7).
+3. **Indirect-call dispatch** is a binary search over 5,726 entries, about 13 steps. A direct-mapped table indexed by address (16-byte granularity in the aligned regions) would make it one lookup. Do this when the runtime measures it.
