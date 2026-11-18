@@ -358,11 +358,18 @@ inline double fld32(uint32_t u) { const double d = f32_raw(u); return d == d ? d
 inline double fld64(uint64_t u) { const double d = dfrom(u); return d == d ? d : quiet64(d); }
 // fst m32: round to single precision and range (nearest); a NaN keeps the
 // top of its payload.
+#if defined(_MSC_VER)
+#pragma warning(push)
+#pragma warning(disable : 4756)  // overflow to infinity is intended (IEEE)
+#endif
 inline uint32_t fst32(double d) {
     const uint64_t b = dbits(d);
     if (is_nan64(b)) return uint32_t(b >> 63) << 31 | 0x7FC00000u | uint32_t((b >> 29) & 0x3FFFFFu);
     return u32(float(d));
 }
+#if defined(_MSC_VER)
+#pragma warning(pop)
+#endif
 
 // Round to a 24-bit significand, ties to even, keeping double's exponent range.
 inline double round24(double x) {
