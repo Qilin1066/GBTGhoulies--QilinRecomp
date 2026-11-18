@@ -36,7 +36,7 @@ namespace fs = std::filesystem;
 namespace {
 
 // ---------------------------------------------------------------- statuses
-constexpr uint32_t kSuccess = 0, kNoMoreFiles = 0x80000006, kBufferOverflow = 0x80000005, kInvalidInfoClass = 0xC0000003,
+constexpr uint32_t kSuccess = 0, kNoMoreFiles = 0x80000006, kBufferOverflow = 0x80000005,
                    kInfoLengthMismatch = 0xC0000004, kInvalidHandle = 0xC0000008, kInvalidParameter = 0xC000000D,
                    kNoSuchFile = 0xC000000F, kInvalidDeviceRequest = 0xC0000010, kBufferTooSmall = 0xC0000023, kEndOfFile = 0xC0000011,
                    kAccessDenied = 0xC0000022, kObjectNameInvalid = 0xC0000033, kNameNotFound = 0xC0000034,
