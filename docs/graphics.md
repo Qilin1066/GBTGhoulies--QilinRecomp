@@ -50,7 +50,7 @@ The game has 24 vertex shaders, written in Xbox shader assembly (`vs.1.0` and `x
 | `D3DDevice_GetBackBuffer2`, `GetDepthStencilSurface2`, `GetRenderTarget2` | The surfaces, with a reference added. Index −1 is the front buffer |
 | `D3DResource_Release`, `D3DResource_Register` | As the original (`AddRef` is lifted). Freeing a resource isn't modelled yet and stops the runtime |
 | `D3D_BlockOnResource`, `D3DVertexBuffer_Lock2` | See the lifted resource code above |
-| `D3DDevice_CreateVertexShader` | Decodes and keeps the program and declaration (Vertex shaders, above) |
+| `D3DDevice_CreateVertexShader` | Builds the original's shader object, and decodes the program (Vertex shaders, above) |
 | `D3DDevice_SetVerticalBlankCallback` | Kept; called at each vblank (below) |
 | `D3DDevice_SetGammaRamp` | Kept; frames written with `--dump-frames` go through it, as the TV would show them |
 | `D3DDevice_BlockUntilIdle` | Waits for the GPU |
