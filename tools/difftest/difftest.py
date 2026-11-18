@@ -44,7 +44,8 @@ from collections import Counter
 
 from unicorn import (UC_ARCH_X86, UC_ERR_WRITE_PROT, UC_HOOK_CODE, UC_HOOK_INTR, UC_HOOK_MEM_WRITE, UC_MODE_32, UC_PROT_ALL,
                      UC_PROT_EXEC, UC_PROT_READ, Uc, UcError)
-from unicorn.x86_const import (UC_X86_REG_CR0, UC_X86_REG_CR4, UC_X86_REG_EAX, UC_X86_REG_EBP,
+from unicorn.x86_const import (UC_X86_REG_CR0, UC_X86_REG_CR4, UC_X86_REG_CS, UC_X86_REG_DS, UC_X86_REG_EAX,
+                               UC_X86_REG_EBP, UC_X86_REG_ES, UC_X86_REG_FS, UC_X86_REG_GDTR, UC_X86_REG_SS,
                                UC_X86_REG_EBX, UC_X86_REG_ECX, UC_X86_REG_EDI, UC_X86_REG_EDX,
                                UC_X86_REG_EFLAGS, UC_X86_REG_EIP, UC_X86_REG_ESI, UC_X86_REG_ESP,
                                UC_X86_REG_FP0, UC_X86_REG_FPCW, UC_X86_REG_FPSW, UC_X86_REG_FPTAG,
@@ -58,6 +59,12 @@ SCRATCH = 0x01000000
 SCRATCH_SIZE = 4 << 20
 STACK_LO, STACK_HI = 0x03F00000, 0x03F10000
 STACK_TOP = 0x03F08000
+# Thread information block: fs:[0] heads the exception-registration chain that
+# functions with C++ exception handling link into. The chain starts at a
+# caller's record further up the stack.
+TIB = 0x03F10000
+TIB_INIT = struct.pack("<I", STACK_TOP + 0x100)
+GDT = 0x03F11000
 SENTINEL = 0x03FFFFF0
 MAX_INSNS = 200_000
 UC_TIMEOUT_US = 1_000_000  # rep-prefixed instructions count once; cap wall time too
@@ -74,7 +81,7 @@ class Xmm(C.Structure):
 
 class Context(C.Structure):
     _fields_ = [(r, C.c_uint32) for r in GPRS] + [
-        ("eflags", C.c_uint32), ("ret_to", C.c_uint32), ("xmm", Xmm * 8),
+        ("eflags", C.c_uint32), ("ret_to", C.c_uint32), ("fs_base", C.c_uint32), ("xmm", Xmm * 8),
         ("st", C.c_double * 8), ("ftop", C.c_uint32), ("ftag", C.c_uint32), ("fpcw", C.c_uint32), ("fpsw", C.c_uint32),
         ("mem", C.c_void_p), ("mem_size", C.c_uint64)]
 
@@ -136,8 +143,10 @@ def f2u(f):
     return struct.unpack("<I", struct.pack("<f", f))[0]
 
 
-def rand_word(rng, floaty=False):
-    k = rng.choices(range(4), (2, 1, 8, 1) if floaty else (4, 3, 3, 1))[0]
+def rand_word(rng, kind_weights=(4, 3, 3, 1), floaty=False):
+    """A random 32-bit word: a scratch pointer, a small int, a float or random
+    bits, by kind_weights. floaty: the float-heavy heap's mix and floats."""
+    k = rng.choices(range(4), (2, 1, 8, 1) if floaty else kind_weights)[0]
     if k == 0:  # pointer into scratch, 16-aligned plus a small offset
         return SCRATCH + rng.randrange(0, SCRATCH_SIZE - 0x10000, 16) + rng.choice([0, 0, 0, 4, 8, 12])
     if k == 1:
@@ -155,7 +164,7 @@ def make_scratch(seed, floaty=False):
     """floaty: a heap of mostly floats with full significands, where rounding
     differences (x87 precision control, SSE) show up far more often."""
     rng = random.Random(seed)
-    words = [rand_word(rng, floaty) for _ in range(SCRATCH_SIZE // 4)]
+    words = [rand_word(rng, floaty=floaty) for _ in range(SCRATCH_SIZE // 4)]
     return struct.pack(f"<{len(words)}I", *words)
 
 
@@ -264,6 +273,25 @@ def reset_fp(uc):
     uc.reg_write(UC_X86_REG_MXCSR, 0x1F80)
 
 
+def seg_desc(base, limit, access, flags):
+    return struct.pack("<Q", (limit & 0xFFFF) | (base & 0xFFFFFF) << 16 | access << 40 | (limit >> 16 & 0xF) << 48
+                       | flags << 52 | (base >> 24) << 56)
+
+
+# Flat 32-bit code and data segments, and fs on the TIB, as on the Xbox.
+GDT_BYTES = (bytes(8) + seg_desc(0, 0xFFFFF, 0x9B, 0xC) + seg_desc(0, 0xFFFFF, 0x93, 0xC)
+             + seg_desc(TIB, 0xFFF, 0x93, 0x4))
+
+
+def setup_segments(uc):
+    """Load the GDT's segments (the GDT must already be in uc's memory).
+    Unicorn ignores FS_BASE in 32-bit mode, so fs needs a real descriptor."""
+    uc.reg_write(UC_X86_REG_GDTR, (0, GDT, len(GDT_BYTES) - 1, 0))
+    for r, sel in ((UC_X86_REG_CS, 0x08), (UC_X86_REG_SS, 0x10), (UC_X86_REG_DS, 0x10),
+                   (UC_X86_REG_ES, 0x10), (UC_X86_REG_FS, 0x18)):
+        uc.reg_write(r, sel)
+
+
 def enable_sse(uc):
     # CR0.EM=0, CR0.MP=1; CR4.OSFXSR | OSXMMEXCPT.
     uc.reg_write(UC_X86_REG_CR0, (uc.reg_read(UC_X86_REG_CR0) & ~4) | 2)
@@ -313,6 +341,10 @@ class Runner:
             self.intr2 = intno
             uc.emu_stop()
         self.uc2.hook_add(UC_HOOK_INTR, on_intr2)
+        self.write_both(GDT, GDT_BYTES)
+        self.write_both(TIB, TIB_INIT)
+        setup_segments(self.uc)
+        setup_segments(self.uc2)
         self.fixups = EmuFixups(insns_path or os.path.join(os.path.dirname(lib_path), "insns.txt"))
         self.fix_uc = self.fixups.install(self.uc)
         self.fix_uc2 = self.fixups.install(self.uc2)
@@ -406,7 +438,7 @@ class Runner:
 
     def pristine_bytes(self, a, n):
         out = bytearray(n)
-        for lo, data in ((self.base, self.image), (SCRATCH, self.scratch)):
+        for lo, data in ((self.base, self.image), (SCRATCH, self.scratch), (TIB, TIB_INIT), (GDT, GDT_BYTES)):
             s, e = max(a, lo), min(a + n, lo + len(data))
             if s < e:
                 out[s - a:e - a] = data[s - lo:e - lo]
@@ -460,6 +492,7 @@ class Runner:
         except UcError as e:
             status = "budget" if e.errno == UC_ERR_WRITE_PROT else "fault"
             why = f"{e} at {uc_eip(uc):08X}"
+        self.last_why = why  # for debugging a single trial
         if status == "budget" or self.fixups.quirk:  # never run the lifted code on a state the original didn't finish
             self.restore(list(self.uc_writes) + [(STACK_TOP, len(stack))])
             return "skip", "", regs
@@ -478,6 +511,7 @@ class Runner:
         for p in range(8):
             ctx.st[p] = fst[p]
         ctx.ftop, ctx.ftag, ctx.fpcw, ctx.fpsw = ftop, fvalid, self.fpcw, 0
+        ctx.fs_base = TIB
         ctx.mem = C.addressof(self.hmem)
         ctx.mem_size = MEM_SIZE
         err = C.create_string_buffer(256)

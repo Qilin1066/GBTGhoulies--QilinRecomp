@@ -49,6 +49,7 @@ struct Context {
     uint32_t eax, ecx, edx, ebx, esp, ebp, esi, edi;
     uint32_t eflags;  // not modelled across calls yet; reserved
     uint32_t ret_to;  // return address popped by the last `ret` (callers check it)
+    uint32_t fs_base; // guest address of the thread's TIB: fs:[0] heads its exception-registration chain
     Xmm xmm[8];
     // x87 (slice 3). Registers are doubles, in physical order: ST(i) is
     // st[(ftop + i) & 7]. See the x87 section below for why doubles are exact.

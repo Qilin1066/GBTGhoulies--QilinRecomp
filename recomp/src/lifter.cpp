@@ -272,16 +272,22 @@ int FnEmitter::width(const Insn& i, const Operand& o) const {
     return w;
 }
 
+// fs: is the thread information block (on the Xbox, the KPCR's NT_TIB):
+// fs:[0] is the head of the thread's exception-registration chain, which
+// functions with C++ exception handling link and unlink. It lives in guest
+// memory at c.fs_base, so the chain is kept exactly as the original keeps it.
 std::string FnEmitter::addr(const Insn& i, const Operand& o) {
-    if (o.seg != ZYDIS_REGISTER_DS && o.seg != ZYDIS_REGISTER_SS && o.seg != ZYDIS_REGISTER_ES &&
+    const bool fs = o.seg == ZYDIS_REGISTER_FS;
+    if (!fs && o.seg != ZYDIS_REGISTER_DS && o.seg != ZYDIS_REGISTER_SS && o.seg != ZYDIS_REGISTER_ES &&
         o.seg != ZYDIS_REGISTER_NONE)
-        unsupported(i, "segment override (fs:/gs:) not supported yet");
-    std::string e;
+        unsupported(i, "segment override (gs:) not supported");
+    std::string e = fs ? "c.fs_base" : "";
     if (o.base != ZYDIS_REGISTER_NONE) {
         auto r = gpr(o.base);
         if (!r || r->width != 32) unsupported(i, "base register");
         use(r->gpr);
-        e = r->name();
+        if (!e.empty()) e += " + ";
+        e += r->name();
     }
     if (o.index != ZYDIS_REGISTER_NONE) {
         auto r = gpr(o.index);
@@ -442,6 +448,7 @@ void FnEmitter::emit(const Insn& i, uint8_t live_out) {
         }
         case ZYDIS_MNEMONIC_LEA: {
             if (width(i, d) != 32) unsupported(i, "16-bit lea");
+            if (s.seg == ZYDIS_REGISTER_FS) unsupported(i, "lea with fs:");  // lea ignores the segment base
             line(write(i, d, 32, addr(i, s)));
             return;
         }

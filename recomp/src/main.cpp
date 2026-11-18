@@ -46,7 +46,7 @@ namespace {
 struct Range {
     uint32_t lo, hi;
 };
-constexpr Range kGameCode{0x11000, 0x14A895};
+constexpr Range kGameCode{0x11000, 0x14A840};  // XAPI starts with IsBadReadPtr at 0x14A840
 constexpr Range kRareLibs{0x152780, 0x165C00};
 
 struct Failure {

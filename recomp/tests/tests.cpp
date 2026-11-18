@@ -198,6 +198,21 @@ std::vector<uint8_t> make_xbe() {
     };
     std::memcpy(&d[0x1370], x87, sizeof x87);
     put32(d, 0x1420, 0x11370);
+    // 11390: a C++ exception frame linked into fs:[0] and unlinked again.
+    const uint8_t ehframe[] = {
+        0x6A, 0xFF,                                // 11390 push -1 (state)
+        0x68, 0xD0, 0x12, 0x01, 0x00,              // 11392 push 0x112D0 (__ehhandler stub)
+        0x64, 0xA1, 0x00, 0x00, 0x00, 0x00,        // 11397 mov eax, fs:[0]
+        0x50,                                      // 1139D push eax
+        0x64, 0x89, 0x25, 0x00, 0x00, 0x00, 0x00,  // 1139E mov fs:[0], esp
+        0x8B, 0x0C, 0x24,                          // 113A5 mov ecx, [esp]
+        0x64, 0x89, 0x0D, 0x00, 0x00, 0x00, 0x00,  // 113A8 mov fs:[0], ecx
+        0x64, 0x8B, 0x41, 0x18,                    // 113AF mov eax, fs:[ecx+0x18]
+        0x83, 0xC4, 0x0C,                          // 113B3 add esp, 0xC
+        0xC3,                                      // 113B6 ret
+    };
+    std::memcpy(&d[0x1390], ehframe, sizeof ehframe);
+    put32(d, 0x1424, 0x11390);
     return d;
 }
 
@@ -260,7 +275,7 @@ int main() {
     if (f.contains(0x112A0)) CHECK(std::ranges::binary_search(f.at(0x112A0).insns, 0x112B0u));
     CHECK(f.contains(0x112D0) && f.at(0x112D0).origin == Origin::Eh);  // __ehhandler stub
     CHECK(f.contains(0x112E0));  // unwind funclet
-    CHECK(f.size() == 11);  // nothing seeded inside the jump/index tables or the filler
+    CHECK(f.size() == 12);  // nothing seeded inside the jump/index tables or the filler
     if (f.contains(0x11300) && f.at(0x11300).jtabs.size() == 1) {
         auto& t = f.at(0x11300).jtabs[0];  // proven by value ranges, not by a cmp next to the jump
         CHECK(t.how == "range" && t.bounded && t.first == 0);
@@ -381,6 +396,16 @@ int main() {
             CHECK(r->contains("c.ftop = ftop; c.ftag = ftag;"));  // the return value stays on the x87 stack
         }
     }
+    if (f.contains(0x11390)) {
+        auto r = lifter.lift(f.at(0x11390));
+        CHECK(r.has_value());
+        if (r) {
+            CHECK(r->contains("eax = rt::ld32(m, uint32_t(c.fs_base), 0x11397u);"));
+            CHECK(r->contains("rt::st32(m, uint32_t(c.fs_base), esp, 0x1139Eu);"));
+            CHECK(r->contains("rt::st32(m, uint32_t(c.fs_base), ecx, 0x113A8u);"));
+            CHECK(r->contains("eax = rt::ld32(m, uint32_t(c.fs_base + ecx + 0x18u), 0x113AFu);"));
+        }
+    } else CHECK(false);
     if (f.contains(0x11340)) {
         auto r = lifter.lift(f.at(0x11340));  // negative cases: unsigned values of ecx
         CHECK(r.has_value() && r->contains("case 4294967292u: goto L_00011353;") &&

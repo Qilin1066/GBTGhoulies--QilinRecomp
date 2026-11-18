@@ -14,8 +14,8 @@ from analyze import load_listing  # noqa: E402
 
 # .text sub-regions found by alignment / string / call-graph analysis
 TEXT_REGIONS = [
-    ("game", 0x11000, 0x14A895),
-    ("xapi", 0x14A895, 0x152780),
+    ("game", 0x11000, 0x14A840),  # XAPI starts with IsBadReadPtr at 0x14A840
+    ("xapi", 0x14A840, 0x152780),
     ("rare-libs", 0x152780, 0x165C00),
     ("crt", 0x165C00, 0x170D80),
     ("game-eh-funclets", 0x170D80, 0x171020),

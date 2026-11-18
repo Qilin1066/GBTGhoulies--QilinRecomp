@@ -11,6 +11,30 @@ Each release is a git tag (`vX.Y.Z`) with a matching GitHub release. The version
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-11-18
+C++ exception frames. 5,745 of the 5,746 functions in the game code and Rare libraries lift now. The one left is a CPU-ID probe in the Rare libraries, which the runtime replaces.
+
+### Added
+- **`fs:` memory operands in lifted code,** relative to `c.fs_base`, the guest address of the thread's information block. The 20 functions that link a C++ exception record into `fs:[0]` and unlink it lift now, and the chain lives in guest memory exactly as in the original.
+- **Exception-handling policy, decided:** keep the frame chain explicit, and have the runtime's `_CxxThrowException` stop the game with the exception's type and message instead of unwinding. No exception the game can throw is ever handled:
+  - its throws are STL `logic_error`s (`length_error`, `out_of_range`);
+  - 16 of the 17 `catch (...)` blocks in lifted code clean up and rethrow;
+  - the last one guards an `operator new` call that returns NULL rather than throwing.
+
+  The analysis is in `docs/recompiler-core.md`, and `tools/check/eh_report.py` reproduces it.
+- **Difftest segments:** both emulators get a GDT with flat segments and `fs` on a thread information block, which the lifted side gets as `c.fs_base`. Unicorn ignores a plain FS base in 32-bit mode.
+- **Results:** 5,745 functions, 45,959 trials, 0 mismatches, also under UBSan. 7 of the 20 exception-frame functions complete a trial; the rest allocate memory, which needs the kernel the harness doesn't have. A planted bug in the epilogue's unlink was caught in every one that completed.
+- **A unit test** for the exception-frame prologue and epilogue, and for an `fs:` operand with a base register.
+
+### Fixed
+- **The game code ended at `0x14A895`, inside XAPI's `IsBadReadPtr`** (`0x14A840`). That function was lifted as game code without the part past `0x14A895`, which holds its `__except` handler and its NULL-pointer return. A bad pointer would have crashed the recomp, and a NULL one would have jumped to a stub for `0x14A8A0` and trapped; the original returns TRUE for both. The game range now ends at `0x14A840`, and `IsBadReadPtr` is a stub for the runtime to replace, like the rest of XAPI. The lifted ranges hold 5,746 functions, not 5,747.
+
+- **Difftest inputs:** in 0.6.0, the float-heavy heap option's new parameter took the place of `rand_word`'s kind weights, so the xmm registers and the `ST(0)` argument were drawn with the float-heavy mix by mistake. They use their own mix again. The 0.6.0 full-run results were produced before that change; the float-heavy x87 run was after it.
+
+### Changed
+- **Stubs:** 276, all library entry points (D3D 90, XAPI 79, CRT 41, XACT 28, D3DX 17, BINK 7, XPP 7, XGRPH 6, DSOUND 1). No game function is a stub any more.
+- **`rt::Context` has a new field, `fs_base`.** The runtime must set it per guest thread.
+
 ## [0.6.0] - 2026-11-18
 Lifter slice 3 (x87). 5,726 of the 5,747 functions in the game code and Rare libraries lift now (99.6%), up from 5,098. The 21 left are 20 functions with C++ exception frames and one CPU-ID probe.
 

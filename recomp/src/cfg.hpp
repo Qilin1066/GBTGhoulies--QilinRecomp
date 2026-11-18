@@ -85,7 +85,7 @@ struct CfgConfig {
     // build settings): Ghoulies game code and Rare libs, 16 bytes. Verified:
     // all 4,041 directly-called functions there are 16-byte aligned. A
     // misaligned entry in these regions needs a direct call to count.
-    std::vector<std::pair<uint32_t, uint32_t>> aligned_regions = {{0x11000, 0x14A895}, {0x152780, 0x165C00}};
+    std::vector<std::pair<uint32_t, uint32_t>> aligned_regions = {{0x11000, 0x14A840}, {0x152780, 0x165C00}};
     uint32_t alignment = 16;
     // Regions of .text for the coverage report (docs/code-analysis.md);
     // other code sections are reported per section, as replaced libraries.
@@ -95,7 +95,7 @@ struct CfgConfig {
         bool lifted;
     };
     std::vector<Region> text_regions = {
-        {"game", 0x11000, 0x14A895, true},       {"xapi", 0x14A895, 0x152780, false},
+        {"game", 0x11000, 0x14A840, true},       {"xapi", 0x14A840, 0x152780, false},
         {"rare-libs", 0x152780, 0x165C00, true}, {"crt", 0x165C00, 0x1707B0, false},
         {"eh-funclets", 0x1707B0, 0x171020, true},
     };
