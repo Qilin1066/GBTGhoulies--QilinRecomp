@@ -63,7 +63,7 @@ The game has 24 vertex shaders, written in Xbox shader assembly (`vs.1.0` and `x
 
 ## Next
 
-1. **State:** the game sets its transforms next (`SetTransform`), then render and texture states, textures, streams and shaders. D3D's state tables stay in guest memory, where the originals keep them.
+1. **State:** `SetTransform` (the matrix into the device, as the original, which the lifted `GetTransform` reads back) and `SetRenderState_Simple` are in; the game stops at `SetViewport` next. **Open design question:** D3D's setters keep a lot of derived state in the device object (`SetViewport` stores the viewport at `+0xED0…` and derives fog, depth and the projection-viewport matrix at `+0x938…+0x9AC`, which the lifted `GetProjectionViewportMatrix` reads back), and 70 of the 90 entry points write GPU commands. Rewriting each natively is in effect rewriting D3D. The alternative is to lift D3D's setters and lazy state code too and have the renderer read the GPU commands they write (an NV2A method decoder, the roadmap's `BeginPush` interpreter widened), not the D3D calls.
 2. **Shaders to SPIR-V:** the decoded vertex programs, the fixed-function pipeline, and the pixel combiners.
 3. **A window** on SDL3, so frames are shown and not only saved.
 4. **Drawing:** vertex formats and buffers, the fixed-function pipeline and vertex shaders, the pixel-shader combiners (to SPIR-V), textures (swizzled and DXT formats), render states from the guest tables, render targets. Then the `BeginPush` immediate-mode draws.

@@ -441,6 +441,41 @@ void create_vertex_shader(rt::Context& c) {
     ret(c, 0, 16);
 }
 
+// ---------------------------------------------------------------- state
+// Setters store state where the original keeps it when the game (or
+// lifted D3D code) reads it back; state only the GPU saw goes to the
+// renderer's own copy (gfx state, filled in with drawing). None of them
+// writes GPU commands: the draw calls turn the state into Vulkan.
+constexpr uint32_t kDirtyFlags = 0x181968;      // D3D__DirtyFlags
+constexpr uint32_t kTransformDirty = 0x17FD90;  // the dirty bits each transform sets (a table in D3D's data)
+constexpr uint32_t kDevTransforms = 0xC50;      // the device's matrices, 64 bytes each
+
+// VOID D3DDevice_SetTransform(D3DTRANSFORMSTATETYPE, CONST D3DMATRIX*): as the
+// original, the matrix into the device (GetTransform, lifted, reads it
+// there) and the transform's dirty bits. The values the original derives
+// from the projection for fog and depth are the renderer's to compute.
+void set_transform(rt::Context& c) {
+    const uint32_t state = arg(c, 0), m = arg(c, 1);
+    if (state > 21) unmodelled("D3DDevice_SetTransform", strf("transform state %u", state));
+    for (uint32_t k = 0; k < 16; ++k) st(c, kDeviceStorage + kDevTransforms + 64 * state + 4 * k, ld(c, m + 4 * k));
+    st(c, kDirtyFlags, ld(c, kDirtyFlags) | ld(c, kTransformDirty + 4 * state));
+    ret(c, c.eax, 8);
+}
+
+// VOID FASTCALL D3DDevice_SetRenderState_Simple(DWORD Method, DWORD Value):
+// the GPU method and value for a render state that maps straight onto one.
+// The game's inline SetRenderState has already stored the D3D value in
+// D3D__RenderState, which the renderer reads; the method is kept for the
+// states that have no table entry.
+std::map<uint32_t, uint32_t>& simple_methods() {
+    static std::map<uint32_t, uint32_t> m;
+    return m;
+}
+void set_render_state_simple(rt::Context& c) {
+    simple_methods()[c.ecx] = c.edx;
+    ret(c, c.eax, 0);
+}
+
 struct D3dFn {
     const char* name;
     uint32_t arg_bytes;  // the original's stdcall argument bytes, as its ret n pops them (checked when written)
@@ -461,6 +496,8 @@ constexpr D3dFn kD3d[] = {
     {"D3DDevice_BlockUntilIdle", 0, block_until_idle},
     {"D3DDevice_Clear", 24, clear},
     {"D3DDevice_CreateVertexShader", 16, create_vertex_shader},
+    {"D3DDevice_SetTransform", 8, set_transform},
+    {"D3DDevice_SetRenderState_Simple", 0, set_render_state_simple},
     {"D3DDevice_Swap", 4, swap},
 };
 

@@ -11,6 +11,15 @@ Each release is a git tag (`vX.Y.Z`) with a matching GitHub release. The version
 
 ## [Unreleased]
 
+## [0.18.0] - 2026-11-18
+D3DX is lifted, and the first state setters are in. The game sets its transforms and stops at its first viewport.
+
+### Added
+- **D3DX lifted** (the `D3DX` section, 24 functions of matrix and vector maths): 2,376 difftest trials, 0 mismatches.
+- **`D3DDevice_SetTransform`** (the matrix into the device and its dirty bits, as the original) and **`D3DDevice_SetRenderState_Simple`** (the GPU method and value kept; the D3D value is already in `D3D__RenderState`). **`D3DDevice_GetTransform`** lifted.
+- **`graphics.md`: the open design question** for D3D state: native setters at API level, or lifting D3D's setters and reading the GPU commands they write.
+
+
 ## [0.17.0] - 2026-11-18
 Vertex programs are decoded, and the game creates all its shaders. It stops at its first transform.
 

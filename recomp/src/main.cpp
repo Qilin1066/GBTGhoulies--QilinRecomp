@@ -71,7 +71,8 @@ constexpr Range kCrt{0x165C00, 0x1707B0};
 constexpr Range kXapi{0x14A840, 0x152780};
 constexpr Range kXact{0x1BABA0, 0x1C57D0};   // the XACTENG section
 constexpr Range kXgrph{0x185440, 0x1A59D8};  // the XGRPH section: XGraphics (resource headers, swizzling, maths)
-constexpr Range kLibraries[] = {kXapi, kCrt, kXact, kXgrph};
+constexpr Range kD3dx{0x184600, 0x185440};   // the D3DX section: D3DX's maths helpers
+constexpr Range kLibraries[] = {kXapi, kCrt, kXact, kXgrph, kD3dx};
 
 // DirectSound is replaced natively (it drives the APU), except these pure
 // helpers XACT calls, which compute without touching the hardware and are
@@ -109,6 +110,7 @@ constexpr uint32_t kLiftedD3d[] = {
     0x175300,  // D3DDevice_CreatePixelShader: {refs, created, &def, a copy of the D3DPIXELSHADERDEF}
     0x175350,  // D3DDevice_DeletePixelShader
     0x177980,  // D3D_AllocContiguousMemory: the game's allocator with alignment flags
+    0x173EC0,  // D3DDevice_GetTransform: reads the device's matrices
 };
 
 // Entry points the runtime calls itself: XAPI's process start-up (heap,
@@ -371,7 +373,7 @@ int cmd_lift(const Xbe& xbe, Decoder& dec, std::span<const std::string_view> arg
     write_file(dir / "failures.txt", failures);
 
     std::println("lifted {} of {} functions ({} call targets without a lifted body get stubs)", done.size(), total, stubs.size());
-    if (lib_n) std::println("  {} of them are C runtime, XAPI, XACT, XGraphics, DirectSound-helper and D3D-resource functions that lifted code can reach", lib_n);
+    if (lib_n) std::println("  {} of them are C runtime, XAPI, XACT, XGraphics, D3DX, DirectSound-helper and D3D-resource functions that lifted code can reach", lib_n);
     if (lib_failed) {
         std::println(stderr, "qilin: error: {} reachable library functions don't lift (see failures.txt)", lib_failed);
         return 3;
