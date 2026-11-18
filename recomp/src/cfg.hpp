@@ -81,6 +81,10 @@ struct CfgConfig {
     // candidate code pointers (game code + Rare libs for Ghoulies).
     uint32_t dataptr_lo = 0x11000;
     uint32_t dataptr_hi = 0x165C00;
+    // A library's own data section holding tables of its functions: Bink's
+    // blitter tables in BINKDATA point into the BINK… sections.
+    std::string lib_data_section = "BINKDATA";
+    uint32_t lib_dataptr_lo = 0x1A59E0, lib_dataptr_hi = 0x1BABA0;
     std::string gap_section = ".text";
     // Regions where every function entry is aligned (MSVC /Gy + the game's
     // build settings): Ghoulies game code and Rare libs, 16 bytes. Verified:

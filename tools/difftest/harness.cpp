@@ -58,6 +58,7 @@ void trap(uint32_t guest_addr, const char* why) { throw Trap{guest_addr, why}; }
 // faults on them: the lifted code traps, and the trial counts as faulting in both.
 uint32_t mmio_read32(uint32_t addr, uint32_t at) { (void)addr; trap(at, "device register read"); }
 void mmio_write32(uint32_t addr, uint32_t value, uint32_t at) { (void)addr; (void)value; trap(at, "device register write"); }
+uint64_t rdtsc(uint32_t at) { trap(at, "rdtsc (the clock differs from the reference's)"); }
 void trace_write(uint32_t addr, uint32_t size) {
     g_writes.push_back(addr);
     g_writes.push_back(size);

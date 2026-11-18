@@ -961,6 +961,63 @@ void FnEmitter::emit(const Insn& i, uint8_t live_out) {
             mark_fx(FTAG);
             line("ftag = 0u;");
             return;
+        case ZYDIS_MNEMONIC_RDTSC:
+            mark(0);
+            mark(2);
+            line(std::format("{{ const uint64_t t_ = rt::rdtsc(0x{:X}u); eax = uint32_t(t_); edx = uint32_t(t_ >> 32); }}", i.addr));
+            return;
+        case ZYDIS_MNEMONIC_MOVD: case ZYDIS_MNEMONIC_PADDW: case ZYDIS_MNEMONIC_PADDSW: case ZYDIS_MNEMONIC_PSUBUSW:
+        case ZYDIS_MNEMONIC_PMULLW: case ZYDIS_MNEMONIC_PMULHW: case ZYDIS_MNEMONIC_POR: case ZYDIS_MNEMONIC_PXOR:
+        case ZYDIS_MNEMONIC_PAND: case ZYDIS_MNEMONIC_PANDN:
+        case ZYDIS_MNEMONIC_PSLLW: case ZYDIS_MNEMONIC_PSLLD: case ZYDIS_MNEMONIC_PSLLQ:
+        case ZYDIS_MNEMONIC_PSRLW: case ZYDIS_MNEMONIC_PSRLD: case ZYDIS_MNEMONIC_PSRLQ:
+        case ZYDIS_MNEMONIC_PUNPCKLBW: case ZYDIS_MNEMONIC_PUNPCKHBW: case ZYDIS_MNEMONIC_PUNPCKLDQ: case ZYDIS_MNEMONIC_PUNPCKHDQ: {
+            const bool dm = d.kind == Operand::Kind::Reg && mm_index(d.reg) >= 0;
+            const bool sm = s.kind == Operand::Kind::Reg && mm_index(s.reg) >= 0;
+            if (!dm && !sm) unsupported(i, "this form (not MMX)");
+            mark_fx(FTOP);
+            mark_fx(FTAG);
+            line("ftop = 0u; ftag = 0xFFu;");
+            if (M == ZYDIS_MNEMONIC_MOVD) {  // 32 bits to or from the low half; loads zero the high half
+                if (dm) line(std::format("c.mm[{}] = uint64_t({});", mm_index(d.reg), read(i, s, 32)));
+                else line(write(i, d, 32, std::format("uint32_t(c.mm[{}])", mm_index(s.reg))));
+                return;
+            }
+            if (!dm) unsupported(i, "MMX destination");
+            const int r = mm_index(d.reg);
+            std::string src;
+            if (sm) src = std::format("c.mm[{}]", mm_index(s.reg));
+            else if (s.kind == Operand::Kind::Mem && s.size == 32) src = std::format("uint64_t(rt::ld32(m, {}, 0x{:X}u))", addr(i, s), i.addr);
+            else if (s.kind == Operand::Kind::Mem) src = std::format("rt::ld64(m, {}, 0x{:X}u)", addr(i, s), i.addr);
+            else if (s.kind == Operand::Kind::Imm) src = std::format("uint64_t({}u)", uint32_t(s.imm & 0xFF));
+            else unsupported(i, "MMX source operand");
+            const std::string a = std::format("c.mm[{}]", r);
+            std::string e;
+            switch (M) {
+                case ZYDIS_MNEMONIC_PADDW: e = std::format("rt::mmx::paddw({}, {})", a, src); break;
+                case ZYDIS_MNEMONIC_PADDSW: e = std::format("rt::mmx::paddsw({}, {})", a, src); break;
+                case ZYDIS_MNEMONIC_PSUBUSW: e = std::format("rt::mmx::psubusw({}, {})", a, src); break;
+                case ZYDIS_MNEMONIC_PMULLW: e = std::format("rt::mmx::pmullw({}, {})", a, src); break;
+                case ZYDIS_MNEMONIC_PMULHW: e = std::format("rt::mmx::pmulhw({}, {})", a, src); break;
+                case ZYDIS_MNEMONIC_POR: e = std::format("({} | {})", a, src); break;
+                case ZYDIS_MNEMONIC_PXOR: e = sm && s.reg == d.reg ? "uint64_t(0)" : std::format("({} ^ {})", a, src); break;
+                case ZYDIS_MNEMONIC_PAND: e = std::format("({} & {})", a, src); break;
+                case ZYDIS_MNEMONIC_PANDN: e = std::format("(~{} & {})", a, src); break;
+                case ZYDIS_MNEMONIC_PSLLW: e = std::format("rt::mmx::shl<uint16_t>({}, {})", a, src); break;
+                case ZYDIS_MNEMONIC_PSLLD: e = std::format("rt::mmx::shl<uint32_t>({}, {})", a, src); break;
+                case ZYDIS_MNEMONIC_PSLLQ: e = std::format("rt::mmx::shl<uint64_t>({}, {})", a, src); break;
+                case ZYDIS_MNEMONIC_PSRLW: e = std::format("rt::mmx::shr<uint16_t>({}, {})", a, src); break;
+                case ZYDIS_MNEMONIC_PSRLD: e = std::format("rt::mmx::shr<uint32_t>({}, {})", a, src); break;
+                case ZYDIS_MNEMONIC_PSRLQ: e = std::format("rt::mmx::shr<uint64_t>({}, {})", a, src); break;
+                case ZYDIS_MNEMONIC_PUNPCKLBW: e = std::format("rt::mmx::unpack<uint8_t>({}, {}, false)", a, src); break;
+                case ZYDIS_MNEMONIC_PUNPCKHBW: e = std::format("rt::mmx::unpack<uint8_t>({}, {}, true)", a, src); break;
+                case ZYDIS_MNEMONIC_PUNPCKLDQ: e = std::format("rt::mmx::unpack<uint32_t>({}, {}, false)", a, src); break;
+                case ZYDIS_MNEMONIC_PUNPCKHDQ: e = std::format("rt::mmx::unpack<uint32_t>({}, {}, true)", a, src); break;
+                default: unsupported(i, "MMX operation");
+            }
+            line(std::format("c.mm[{}] = {};", r, e));
+            return;
+        }
         case ZYDIS_MNEMONIC_MOVQ: case ZYDIS_MNEMONIC_PUNPCKLWD: case ZYDIS_MNEMONIC_PUNPCKHWD: {
             const bool dm = d.kind == Operand::Kind::Reg && mm_index(d.reg) >= 0;
             const bool sm = s.kind == Operand::Kind::Reg && mm_index(s.reg) >= 0;
@@ -971,6 +1028,7 @@ void FnEmitter::emit(const Insn& i, uint8_t live_out) {
             line("ftop = 0u; ftag = 0xFFu;");
             auto src64 = [&]() -> std::string {
                 if (sm) return std::format("c.mm[{}]", mm_index(s.reg));
+                if (s.kind == Operand::Kind::Mem && s.size == 32) return std::format("uint64_t(rt::ld32(m, {}, 0x{:X}u))", addr(i, s), i.addr);
                 if (s.kind == Operand::Kind::Mem) return std::format("rt::ld64(m, {}, 0x{:X}u)", addr(i, s), i.addr);
                 unsupported(i, "MMX source operand");
             };

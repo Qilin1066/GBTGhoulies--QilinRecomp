@@ -1,6 +1,6 @@
 # Graphics: Direct3D on Vulkan (roadmap step 4)
 
-Last updated 2026-11-18 (v0.20.0: state setters, draws recorded, push-buffer sink; v0.17.0: vertex programs decoded, pixel-shader objects lifted; v0.16.0: D3D's resource code lifted; guest RAM's kernel windows; v0.14.0: the renderer and the Direct3D device).
+Last updated 2026-11-18 (v0.21.0: resources destroyed as the original; v0.20.0: state setters, draws recorded, push-buffer sink; v0.17.0: vertex programs decoded, pixel-shader objects lifted; v0.16.0: D3D's resource code lifted; guest RAM's kernel windows; v0.14.0: the renderer and the Direct3D device).
 
 The game draws through the Xbox's Direct3D 8 library (D3D8, XDK 5659), which is linked into the XBE. Its calls stay in the recompiled code; what answers them is the runtime. Every D3D function the game calls is replaced natively (`recomp/runtime/host/d3d.cpp`) over a Vulkan 1.3 renderer (`recomp/runtime/gfx/`). There is no DirectX anywhere, and the Xbox's GPU (the NV2A) isn't emulated: the replacements see what the game asks for (clear this, draw that mesh with this texture) and do it with Vulkan.
 
@@ -48,7 +48,7 @@ The game has 24 vertex shaders, written in Xbox shader assembly (`vs.1.0` and `x
 | `Direct3D_SetPushBufferSize` | Kept where the original keeps the values; there's no push buffer |
 | `Direct3D_CreateDevice` | Reads the presentation parameters and starts the renderer. Makes the frame buffers (front plus back buffers) and the depth buffer as guest surfaces held by the device, with their pixels in contiguous memory, as the original does. The game asks for 640×480, one back buffer, D24S8 depth, no multisampling (`0x11` is `D3DMULTISAMPLE_NONE` on the Xbox, 1×1 samples) and presentation interval 2: 30 frames per second, as on the console. Any other multisample type stops the runtime |
 | `D3DDevice_GetBackBuffer2`, `GetDepthStencilSurface2`, `GetRenderTarget2` | The surfaces, with a reference added. Index −1 is the front buffer |
-| `D3DResource_Release`, `D3DResource_Register` | As the original (`AddRef` is lifted). Freeing a resource isn't modelled yet and stops the runtime |
+| `D3DResource_Release`, `D3DResource_Register` | As the original (`AddRef` is lifted). A resource with no references left is destroyed by D3D's own `D3D_DestroyResource`, lifted (v0.21.0) |
 | `D3D_BlockOnResource`, `D3DVertexBuffer_Lock2` | See the lifted resource code above |
 | `D3DDevice_CreateVertexShader` | Builds the original's shader object, and decodes the program (Vertex shaders, above) |
 | `D3DDevice_SetVerticalBlankCallback` | Kept; called at each vblank (below) |
@@ -73,7 +73,7 @@ The game has 24 vertex shaders, written in Xbox shader assembly (`vs.1.0` and `x
 
 The draws are recorded but not drawn yet: the first frames print how many (`frame 0: 22 draws`).
 
-**Not modelled yet:** drawing, textures, CPU writes to a frame buffer reaching the screen (the disc-error screen draws into the front buffer this way), the device's own `Release`, freeing resources, draws from `SetVertexShaderInput` streams, `Swap` keeping a render target that isn't the back buffer, a window.
+**Not modelled yet:** drawing, textures, CPU writes to a frame buffer reaching the screen (the disc-error screen draws into the front buffer this way), the device's own `Release`, draws from `SetVertexShaderInput` streams, `Swap` keeping a render target that isn't the back buffer, a window.
 
 ## Next
 

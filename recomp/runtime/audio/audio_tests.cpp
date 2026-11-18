@@ -85,6 +85,29 @@ int main() {
     CHECK((audio::Format{audio::Format::Codec::XboxAdpcm, 2, 44100, 4}.block_bytes() == 72));
     CHECK((audio::Format{audio::Format::Codec::XboxAdpcm, 1, 44100, 4}.bytes_to_frames(72) == 128));
 
+    // Submixing: a mono voice into a stereo submix at -6.02 dB (half), and the
+    // submix to the speakers at full volume, its channels to left and right.
+    {
+        audio::Voice src, sub;
+        src.set_format(audio::Format{});
+        src.set_data(0x100, sizeof pcm);
+        src.volume = -602;
+        src.play(false);
+        sub.make_submix(2);
+        sub.mix_bins = {{audio::kFrontLeft, 0}, {audio::kFrontRight, 0}};
+        sub.play(true);
+        CHECK(sub.submix() && sub.playing());
+        sub.clear_input(4);
+        src.mix_into(mem.data(), mem.size(), sub, 4);
+        std::vector<float> o(8, 0.0f);
+        sub.mix(mem.data(), mem.size(), o.data(), 4);
+        CHECK(near(o[0], 0.25f, 1e-3f) && near(o[1], 0.25f, 1e-3f) && near(o[2], -0.25f, 1e-3f) && near(o[4], 0.125f, 1e-3f));
+        sub.clear_input(4);  // nothing fed: silence
+        std::vector<float> o2(8, 0.0f);
+        sub.mix(mem.data(), mem.size(), o2.data(), 4);
+        CHECK(near(o2[0], 0.0f) && sub.playing());
+    }
+
     if (failures) std::fprintf(stderr, "%d check(s) failed\n", failures);
     else std::printf("all audio tests passed\n");
     return failures != 0;

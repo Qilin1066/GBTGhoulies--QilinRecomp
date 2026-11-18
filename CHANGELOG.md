@@ -11,6 +11,18 @@ Each release is a git tag (`vX.Y.Z`) with a matching GitHub release. The version
 
 ## [Unreleased]
 
+## [0.21.0] - 2026-11-18
+Bink is lifted, and the game runs its attract sequence: about 1,100 frames in two minutes, loading movies and bundles from the disc as it goes. Its draws are still recorded, not drawn.
+
+### Added
+- **Bink lifted:** RAD's video codec and its pixel-format blitters (`0x1A59E0`–`0x1BABA0`). Its MMX probe is answered as the Xbox's Pentium III (it has MMX).
+- **MMX arithmetic for Bink** (`movd`, adds, saturating subtracts, multiplies, logic, shifts, unpacks) and **`rdtsc`** (the runtime's 733 MHz counter) in the lifter.
+- **Function discovery:** Bink's blitter tables in `BINKDATA`; immediate code pointers after a function's final `jmp`; the immediate-pointer round repeated until it finds nothing (DirectSound's full-HRTF table). The game's own code is unchanged.
+- **DirectSound submixes** (`DSBCAPS_MIXIN`, `SetOutputBuffer`) in the audio engine, with a test.
+- **DirectSound's 3D calculator lifted** (the maths XACT uses to position sounds), with the full-HRTF table and DirectSound's start-up initializers, which now run.
+- **`D3DResource_Release` as the original:** a surface releases its texture, and a resource with no references left is destroyed by D3D's own `D3D_DestroyResource` (lifted), which frees it to the game's allocator; so is one the device drops last.
+- **Missing disc files are named** once (`… isn't in the game folder`): a game folder copied without one shows up as the game's disc-error screen.
+
 ## [0.20.0] - 2026-11-18
 The game gets through its first frames: shaders, streams, textures, constants, render targets and draws are in, and each frame's draws are recorded for the renderer (not drawn yet). The first frames are the attract sequence's loading; it stops next at a DirectSound submix buffer.
 

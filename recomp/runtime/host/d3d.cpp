@@ -347,16 +347,28 @@ void vertex_buffer_lock2(rt::Context& c) { ret(c, ld(c, arg(c, 0) + 4) | rt::kRa
 
 // ULONG D3DResource_Release(D3DResource*): as the original. A surface's
 // parent texture is released with it, and a resource the device still holds
-// (internal references) stays. Freeing one isn't modelled yet.
-void resource_release(rt::Context& c) {
-    const uint32_t r = arg(c, 0), common = ld(c, r);
+// (internal references) stays. One with neither is destroyed by D3D's own
+// D3D_DestroyResource (lifted), which frees it to the game's allocator.
+uint32_t release(rt::Context& c, uint32_t r) {
+    const uint32_t common = ld(c, r);
     if ((common & kRefMask) == 0) unmodelled("D3DResource_Release", strf("releasing %08X, which has no references", r));
     if ((common & kRefMask) == 1) {
-        if ((common & kTypeMask) == kTypeSurface && ld(c, r + 20)) unmodelled("D3DResource_Release", "a surface of a texture");
-        if (!(common & kIntRefMask)) unmodelled("D3DResource_Release", strf("freeing resource %08X", r));
+        // The last reference: a surface of a texture releases its texture,
+        // and a resource the device no longer holds either is destroyed.
+        if ((common & kTypeMask) == kTypeSurface && ld(c, r + 20)) release(c, ld(c, r + 20));
+        if (!(ld(c, r) & kIntRefMask)) {
+            host::call_guest(c, 0x175890, {r});  // D3D_DestroyResource, lifted
+            return 0;
+        }
     }
-    st(c, r, common - 1);
-    ret(c, (common - 1) & kRefMask, 4);
+    const uint32_t now = ld(c, r) - 1;
+    st(c, r, now);
+    return now & kRefMask;
+}
+
+void resource_release(rt::Context& c) {
+    const uint32_t refs = release(c, arg(c, 0));
+    ret(c, refs, 4);
 }
 
 // VOID D3DResource_Register(D3DResource*, PVOID pBase): a resource loaded
@@ -870,13 +882,13 @@ void set_render_state_simple(rt::Context& c) {
 }
 
 // Drops the device's internal reference on a resource, as the original:
-// Lock takes the current fence, and one with no references left would be
-// freed (not modelled yet).
-void drop_internal_ref(rt::Context& c, uint32_t r, const char* fn) {
+// Lock takes the current fence, and one with no references left is
+// destroyed (D3D_DestroyResource, lifted).
+void drop_internal_ref(rt::Context& c, uint32_t r, const char*) {
     st(c, r + 8, ld(c, kDeviceStorage + kDevFence));
     const uint32_t common = ld(c, r) - kIntRef1;
     st(c, r, common);
-    if ((common & (kIntRefMask | kRefMask)) == 0) unmodelled(fn, strf("freeing resource %08X", r));
+    if ((common & (kIntRefMask | kRefMask)) == 0) host::call_guest(c, 0x175890, {r});  // D3D_DestroyResource, lifted
 }
 
 // VOID D3DDevice_SetTexture(DWORD Stage, D3DBaseTexture*): as the original.

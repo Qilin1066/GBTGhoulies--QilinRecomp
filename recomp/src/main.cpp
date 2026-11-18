@@ -10,6 +10,7 @@
 //   qilin coverage <default.xbe> [--list]            byte accounting: code / tables / padding / unknown
 //
 // Exit status is non-zero on any error; nothing fails silently.
+#include <array>
 #include <algorithm>
 #include <charconv>
 #include <cstdio>
@@ -57,11 +58,9 @@ struct Replaced {
     uint32_t addr;
     std::string_view why;
 };
-constexpr Replaced kReplaced[] = {
-    {0x162570, "Bink helper; its one caller is in BINK (0x1A958C)"},
-    {0x1626B0, "Bink helper; its one caller is in BINK (0x1A9571)"},
-    {0x162840, "Bink's MMX probe (pushfd, cpuid); its one caller is in BINK (0x1AE916), and only BINK reads its result"},
-};
+// (Bink's helpers in the Rare code were here while Bink was to be replaced;
+// it's lifted now, with them.)
+constexpr std::array<Replaced, 0> kReplaced{};
 
 // The C runtime (LIBCMT) and XAPI aren't lifted as regions: only the
 // functions lifted code can reach are (library_closure), and the runtime
@@ -72,14 +71,28 @@ constexpr Range kXapi{0x14A840, 0x152780};
 constexpr Range kXact{0x1BABA0, 0x1C57D0};   // the XACTENG section
 constexpr Range kXgrph{0x185440, 0x1A59D8};  // the XGRPH section: XGraphics (resource headers, swizzling, maths)
 constexpr Range kD3dx{0x184600, 0x185440};   // the D3DX section: D3DX's maths helpers
-constexpr Range kLibraries[] = {kXapi, kCrt, kXact, kXgrph, kD3dx};
+constexpr Range kBink{0x1A59E0, 0x1BABA0};   // RAD's Bink video: the BINK section and its blitters (BINK32 … BINK32M)
+constexpr Range kLibraries[] = {kXapi, kCrt, kXact, kXgrph, kD3dx, kBink};
 
 // DirectSound is replaced natively (it drives the APU), except these pure
 // helpers XACT calls, which compute without touching the hardware and are
 // lifted so their results are the original's: XAudioCalculatePitch (x87
 // log2) with its lock helpers and fyl2x core, and the PCM and Xbox ADPCM
-// WAVEFORMATEX builders (each a jump stub and its body).
-constexpr uint32_t kLiftedDsound[] = {0x1C5AF1, 0x1C5849, 0x1C586E, 0x1CB40D, 0x1C5B3B, 0x1C8BDF, 0x1C5B40, 0x1C8C29};
+// WAVEFORMATEX builders (each a jump stub and its body); and its 3D
+// calculator, which XACT uses to turn listener and emitter positions into
+// voice settings (volumes, pitch, filter and HRTF coefficients): CPU maths
+// over XACT's structures, with the full-HRTF table DirectSoundUseFullHRTF
+// installs, and the four start-up initializers that point DirectSound's
+// globals at their static objects.
+constexpr uint32_t kLiftedDsound[] = {
+    0x1C5AF1, 0x1C5849, 0x1C586E, 0x1CB40D, 0x1C5B3B, 0x1C8BDF, 0x1C5B40, 0x1C8C29,
+    0x1C8100, 0x1C7446, 0x1C7DDF, 0x1C67F7,  // IDirectSound3DCalculator_Calculate3D, _GetVoiceData and their bodies
+    0x1C5AD2, 0x1C9576, 0x1C5A15,            // DirectSoundUseFullHRTF, CHRTFSource_SetFullHRTF5Channel, DirectSoundEnterCriticalSection
+    0x1C8E42, 0x1C8E8B, 0x1C8FEE, 0x1C9084, 0x1C90CF, 0x1C91E0, 0x1C9270, 0x1C933F, 0x1C93E1, 0x1C945A,  // the full-HRTF table
+    0x1C8D48, 0x1C8D53, 0x1CBAD6, 0x1CBAE1,  // initializers
+    0x1C58CB, 0x1C5918, 0x1C5941, 0x1C5978, 0x1C5998, 0x1C59CC, 0x1C59EE, 0x1C8D5E, 0x1C8D85, 0x1C8DBC,
+    0x1C8E05, 0x1CB384, 0x1CE3F6, 0x1CE3FF, 0x1CE78B, 0x1CE923,  // the maths they share
+};
 
 // Direct3D is replaced natively, except its resource code, which is pure
 // computation over the game's allocator (0xF7270): creating textures,
@@ -118,6 +131,8 @@ constexpr uint32_t kLiftedD3d[] = {
     0x172EE0,  // LoadVertexShader's shadow copies (program at device +0x1098, constants at 0x180D50)
     0x175970,  // a surface's internal reference (and its texture's)
     0x175B90,  // dropping one (freeing the resource at none)
+    0x175890,  // D3D_DestroyResource: waits for the GPU, drops private data, frees header and data
+    0x175840,  // a resource's private data (SetPrivateData) dropped
     0x17B080,  // a depth buffer's largest depth value, into the device (+0x944)
     0x174080,  // a depth buffer's format bits (+0x948)
     0x17AF60,  // the render target's anti-aliasing mode (+0x19FC)
@@ -132,7 +147,7 @@ constexpr uint32_t kLiftedD3d[] = {
 // drive letters), which XAPI's main-thread procedure (0x14FA75) runs first,
 // and the D3D internals the native D3D calls (the device's default state,
 // the fixed-function shader object for an FVF).
-constexpr uint32_t kStartupRoots[] = {0x151011, 0x179FE0, 0x172DA0, 0x1731A0, 0x173000, 0x172F90, 0x172EE0, 0x175970, 0x175B90, 0x17B080, 0x174080, 0x17AF60, 0x171F40};
+constexpr uint32_t kStartupRoots[] = {0x151011, 0x179FE0, 0x172DA0, 0x1731A0, 0x173000, 0x172F90, 0x172EE0, 0x1C8D48, 0x1C8D53, 0x1CBAD6, 0x1CBAE1, 0x175890, 0x1C8E42, 0x1C8E8B, 0x1C8FEE, 0x1C9084, 0x1C90CF, 0x1C91E0, 0x1C9270, 0x1C933F, 0x1C93E1, 0x1C945A, 0x175970, 0x175B90, 0x17B080, 0x174080, 0x17AF60, 0x171F40};
 
 // Library functions the runtime replaces natively instead: never lifted, and
 // the closure doesn't follow them. Each needs a registered replacement.
@@ -141,6 +156,7 @@ constexpr Replaced kNative[] = {
     {0x151B45, "XAPI's shutdown notification (registered with HalRegisterShutdownNotification at 0x32CF18): reloads the GDT; the runtime never shuts the console down"},
     {0x14B924, "OutputDebugStringA: int 0x2D, the kernel debugger's print service; the runtime prints the string"},
     {0x14C29C, "QueryPerformanceCounter: rdtsc; the runtime reads the host clock"},
+    {0x162840, "Bink's MMX probe (pushfd/popfd on the ID flag, then cpuid): the runtime answers as the Xbox's Pentium III, which has MMX"},
 };
 bool is_native(uint32_t a) { return std::ranges::any_of(kNative, [&](const Replaced& r) { return r.addr == a; }); }
 
@@ -311,7 +327,7 @@ int cmd_lift(const Xbe& xbe, Decoder& dec, std::span<const std::string_view> arg
     auto replaced = [](uint32_t a) { return std::ranges::any_of(kReplaced, [&](const Replaced& r) { return r.addr == a; }); };
     auto wanted = [&](uint32_t a) {
         if (only) return a == *only;
-        return !replaced(a) && std::ranges::any_of(ranges, [&](const Range& r) { return a >= r.lo && a < r.hi; });
+        return !replaced(a) && !is_native(a) && std::ranges::any_of(ranges, [&](const Range& r) { return a >= r.lo && a < r.hi; });
     };
 
     Cfg cfg(xbe, dec);

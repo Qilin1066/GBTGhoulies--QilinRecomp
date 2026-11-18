@@ -63,10 +63,26 @@ public:
 
     // Mixes `frames` output frames into out (interleaved stereo), reading
     // guest memory mem[0, mem_size). Stops the voice at the end of a
-    // non-looping play region.
+    // non-looping play region. A submix voice plays its input instead.
     void mix(const uint8_t* mem, size_t mem_size, float* out, uint32_t frames);
 
+    // Submixing (DirectSound's DSBCAPS_MIXIN): a submix voice has no sample
+    // data; other voices mix into its input, one float per channel and
+    // frame at the output rate, and it plays that like a voice's data, with
+    // its own volume and mix bins (its pitch doesn't apply). The input is
+    // cleared before each block is mixed.
+    void make_submix(uint32_t channels);
+    bool submix() const { return submix_; }
+    void clear_input(uint32_t frames) { input_.assign(size_t(frames) * format_.channels, 0.0f); }
+    // Mixes `frames` frames of this voice into a submix voice's input: channel
+    // k into the submix's channel k (a mono submix takes the sum), at this
+    // voice's volume.
+    void mix_into(const uint8_t* mem, size_t mem_size, Voice& submix, uint32_t frames);
+
 private:
+    // Renders frames into out (`dst` channels interleaved), channel c of the
+    // voice scaled by to[c][d] into channel d.
+    void render(const uint8_t* mem, size_t mem_size, float* out, uint32_t dst, const float to[2][2], uint32_t frames);
     void decode_frame(const uint8_t* mem, size_t mem_size, uint64_t frame, float* lr);
     uint64_t region_end() const;
 
@@ -75,6 +91,8 @@ private:
     uint64_t play_start_ = 0, play_len_ = 0, loop_start_ = 0, loop_len_ = 0;  // in frames
     double pos_ = 0;  // in frames from the buffer's start
     bool playing_ = false, looping_ = false;
+    bool submix_ = false;
+    std::vector<float> input_;
     // The ADPCM block last decoded, per channel.
     uint64_t cached_block_ = UINT64_MAX;
     std::array<std::array<int16_t, 64>, 2> block_{};

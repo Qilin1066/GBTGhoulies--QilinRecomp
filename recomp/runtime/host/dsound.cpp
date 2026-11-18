@@ -50,6 +50,7 @@ constexpr uint32_t kDsOk = 0;
 struct Buffer {
     uint32_t refs = 1;
     uint32_t flags = 0;
+    uint32_t output = 0;  // the submix buffer it feeds (SetOutputBuffer), or 0 for the mix bins
     audio::Voice voice;
 };
 
@@ -101,7 +102,13 @@ void catch_up(rt::Context& c) {
     while (d.mixed < target) {
         const uint32_t n = uint32_t(std::min<uint64_t>(target - d.mixed, 1024));
         out.assign(size_t(n) * 2, 0.0f);
-        for (auto& [addr, b] : d.buffers) b->voice.mix(c.mem, c.mem_size, out.data(), n);
+        // Submixes first: clear their inputs and mix their sources into them.
+        for (auto& [addr, b] : d.buffers)
+            if (b->voice.submix()) b->voice.clear_input(n);
+        for (auto& [addr, b] : d.buffers)
+            if (b->output) b->voice.mix_into(c.mem, c.mem_size, d.buffers.at(b->output)->voice, n);
+        for (auto& [addr, b] : d.buffers)
+            if (!b->output) b->voice.mix(c.mem, c.mem_size, out.data(), n);
         if (d.wav) d.wav->write(out.data(), n);
         d.mixed += n;
     }
@@ -169,9 +176,6 @@ void ds_release(rt::Context& c) {
     ret(c, d.refs, 4);
 }
 
-// VOID DirectSoundUseFullHRTF(): selects the full HRTF filter set for 3D voices.
-void use_full_hrtf(rt::Context& c) { ret(c, c.eax, 0); }
-
 // HRESULT IDirectSound_SetMixBinHeadroom(LPDIRECTSOUND, DWORD dwMixBin, DWORD dwHeadroom):
 // the bin's headroom (its attenuation before the speakers), recorded.
 void set_mix_bin_headroom(rt::Context& c) { ret(c, kDsOk, 12); }
@@ -181,12 +185,15 @@ void set_mix_bin_headroom(rt::Context& c) { ret(c, kDsOk, 12); }
 void create_sound_buffer(rt::Context& c) {
     const uint32_t desc = arg(c, 1), out = arg(c, 2);
     const uint32_t flags = ld(c, desc + 4), bytes = ld(c, desc + 8), wfx = ld(c, desc + 12), bins = ld(c, desc + 16);
-    if (flags & 0x2000) unmodelled("IDirectSound_CreateSoundBuffer", "a submix destination buffer (DSBCAPS_MIXIN)");
     if (flags & 0x80000) unmodelled("IDirectSound_CreateSoundBuffer", "an effects input buffer (DSBCAPS_FXIN)");
     if (bytes) unmodelled("IDirectSound_CreateSoundBuffer", "a buffer with its own memory (dwBufferBytes != 0)");
     auto b = std::make_unique<Buffer>();
     b->flags = flags;
-    if (wfx) b->voice.set_format(read_format(c, wfx, "IDirectSound_CreateSoundBuffer"));
+    if (flags & 0x2000) {  // DSBCAPS_MIXIN: a submix destination, with the format's channels
+        b->voice.make_submix(wfx ? read_format(c, wfx, "IDirectSound_CreateSoundBuffer").channels : 1);
+    } else if (wfx) {
+        b->voice.set_format(read_format(c, wfx, "IDirectSound_CreateSoundBuffer"));
+    }
     b->voice.mix_bins = read_mix_bins(c, bins);
     if (flags & 0x10) notice_once("3D positioning (DSBCAPS_CTRL3D buffers play unpositioned)");
     const uint32_t obj = guest_object();
@@ -201,6 +208,8 @@ void buffer_release(rt::Context& c) {
     const uint32_t refs = --b.refs;
     if (refs == 0) {
         catch_up(c);
+        for (auto& [addr, other] : ds().buffers)
+            if (other->output == a) unmodelled("IDirectSoundBuffer_Release", "releasing a submix buffer other buffers still feed");
         ds().buffers.erase(a);  // its guest header page stays allocated: freeing contiguous memory isn't modelled
     }
     ret(c, refs, 4);
@@ -210,6 +219,7 @@ void buffer_release(rt::Context& c) {
 void set_buffer_data(rt::Context& c) {
     catch_up(c);
     Buffer& b = buffer(c, arg(c, 0), "IDirectSoundBuffer_SetBufferData");
+    if (b.voice.submix()) unmodelled("IDirectSoundBuffer_SetBufferData", "sample data for a submix buffer");
     b.voice.stop();
     b.voice.set_data(arg(c, 1), arg(c, 2));
     ret(c, kDsOk, 12);
@@ -219,6 +229,7 @@ void set_buffer_data(rt::Context& c) {
 void set_format(rt::Context& c) {
     catch_up(c);
     Buffer& b = buffer(c, arg(c, 0), "IDirectSoundBuffer_SetFormat");
+    if (b.voice.submix()) unmodelled("IDirectSoundBuffer_SetFormat", "a submix buffer's format");
     b.voice.set_format(read_format(c, arg(c, 1), "IDirectSoundBuffer_SetFormat"));
     ret(c, kDsOk, 8);
 }
@@ -253,10 +264,19 @@ BUFFER_SETTER(set_current_position, 8, b.voice.set_position(arg(c, 1)))
 BUFFER_SETTER(stop, 4, b.voice.stop())
 
 // HRESULT IDirectSoundBuffer_SetOutputBuffer(LPDIRECTSOUNDBUFFER, LPDIRECTSOUNDBUFFER pOutputBuffer):
-// null sends the voice to the mix bins (the default).
+// the voice feeds a submix buffer (DSBCAPS_MIXIN) instead of the mix bins;
+// null sends it back to the mix bins (the default).
 void set_output_buffer(rt::Context& c) {
-    if (arg(c, 1)) unmodelled("IDirectSoundBuffer_SetOutputBuffer", "submixing into another buffer");
-    buffer(c, arg(c, 0), "IDirectSoundBuffer_SetOutputBuffer");
+    const char* fn = "IDirectSoundBuffer_SetOutputBuffer";
+    catch_up(c);
+    Buffer& b = buffer(c, arg(c, 0), fn);
+    const uint32_t to = arg(c, 1);
+    if (to) {
+        const Buffer& target = buffer(c, to, fn);
+        if (!target.voice.submix()) unmodelled(fn, "an output buffer that isn't a submix (DSBCAPS_MIXIN) buffer");
+        if (b.voice.submix()) unmodelled(fn, "a submix feeding another submix");
+    }
+    b.output = to;
     ret(c, kDsOk, 8);
 }
 
@@ -340,7 +360,6 @@ struct DsFn {
 constexpr DsFn kDs[] = {
     {"DirectSoundCreate", direct_sound_create},
     {"IDirectSound_Release", ds_release},
-    {"DirectSoundUseFullHRTF", use_full_hrtf},
     {"IDirectSound_SetMixBinHeadroom", set_mix_bin_headroom},
     {"IDirectSound_CreateSoundBuffer", create_sound_buffer},
     {"IDirectSound_CommitDeferredSettings", commit_deferred_settings},

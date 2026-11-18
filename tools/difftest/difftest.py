@@ -752,9 +752,15 @@ class Runner:
             # the code that uses them (XGraphics' swizzler) only lets their
             # values out through memory, which is compared, before its emms.
             # x87: TOP, which registers hold values, those values, the control word.
+            # A function that ends in MMX state (no emms: TOP 0, every
+            # register tagged in use, as Bink's blitters leave it) has the
+            # MMX values in the x87 registers' mantissas; the lifted code keeps
+            # MMX registers apart from its x87 doubles, so only TOP and the
+            # tags are compared then.
+            mmx_state = ctx.ftop == 0 and ctx.ftag == 0xFF and uc_fx["top"] == 0 and uc_fx["valid"] == 0xFF
             if ctx.ftop != uc_fx["top"] or ctx.ftag != uc_fx["valid"]:
                 diffs.append(f"x87 TOP/tags: original {uc_fx['top']}/{uc_fx['valid']:02X} lifted {ctx.ftop}/{ctx.ftag:02X}")
-            else:
+            elif not mmx_state:
                 for p in range(8):
                     if uc_fx["valid"] >> p & 1 and d2x80(ctx.st[p]) != tuple(uc_fx["regs"][p]):
                         o, exact = x802d(uc_fx["regs"][p])

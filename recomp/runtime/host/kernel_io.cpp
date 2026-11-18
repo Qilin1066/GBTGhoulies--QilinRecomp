@@ -12,6 +12,7 @@
 // information classes), and I/O completes synchronously. Anything the game
 // asks for that isn't modelled yet (an APC routine, an event handle, an
 // information class) stops the runtime with its name.
+#include <set>
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
@@ -120,6 +121,15 @@ struct Resolved {
     fs::path host;          // empty for the device itself
     std::string object;     // the full object name, after links
 };
+
+// A file the game looks for on a read-only device (the disc) that isn't in
+// the game folder: said once, since a folder copied without it shows up
+// as the game's disc-error screen.
+void note_missing(const Resolved& r) {
+    static std::set<std::string> said;
+    if (r.device && !r.device->writable && said.insert(r.object).second)
+        std::printf("qilin_run: %s isn't in the game folder\n", r.object.c_str());
+}
 
 // An object name, relative to `root` (an object name too) if it isn't
 // absolute, through symbolic links to a device and a host path.
@@ -287,7 +297,10 @@ uint32_t create_file(const rt::Context& c, uint32_t phandle, uint32_t access, ui
     }
     std::error_code ec;
     const bool exists = fs::exists(r->host, ec), is_dir = exists && fs::is_directory(r->host, ec);
-    if (!fs::exists(r->host.parent_path(), ec)) return kPathNotFound;
+    if (!fs::exists(r->host.parent_path(), ec)) {
+        note_missing(*r);
+        return kPathNotFound;
+    }
     if (want_write && !r->device->writable) return kWriteProtected;
     uint32_t info = 1;  // FILE_OPENED
     if (options & kDirectoryFile) {
@@ -320,7 +333,7 @@ uint32_t create_file(const rt::Context& c, uint32_t phandle, uint32_t access, ui
     }
     bool truncate = false;
     switch (disposition) {
-        case kOpen: if (!exists) return kNameNotFound; break;
+        case kOpen: if (!exists) { note_missing(*r); return kNameNotFound; } break;
         case kCreate: if (exists) return kNameCollision; info = 2; truncate = true; break;
         case kOpenIf: if (!exists) { info = 2; truncate = true; } break;
         case kOverwrite: if (!exists) return kNameNotFound; info = 3; truncate = true; break;
@@ -599,7 +612,10 @@ void nt_query_full_attributes_file(rt::Context& c) {
     uint32_t status = kSuccess;
     const auto r = resolve_attributes(c, arg(c, 0), &status);
     std::error_code ec;
-    if (r && (r->host.empty() || !fs::exists(r->host, ec))) status = r->host.empty() ? kInvalidParameter : kNameNotFound;
+    if (r && (r->host.empty() || !fs::exists(r->host, ec))) {
+        status = r->host.empty() ? kInvalidParameter : kNameNotFound;
+        if (!r->host.empty()) note_missing(*r);
+    }
     if (r && !status) network_open_info(c, arg(c, 1), r->host, r->device->writable);
     ret(c, status, 8);
 }

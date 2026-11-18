@@ -22,6 +22,8 @@ lifted game code  →  XACT (lifted)  →  DirectSound (native, dsound.cpp)  →
 - **Mix bins:** each channel goes to the speaker bins it names (front left/right/centre, back left/right) at their volumes, folded down to stereo: centre at −3 dB to both sides, back bins to their side.
 - **Regions:** play regions, loop regions, looping, the play position, stopping at the end of a non-looping region.
 - **The mix** is 48 kHz stereo, the APU's rate. Its clock is the host's: on every DirectSound call (and `DirectSoundDoWork`, which the game calls each frame) the mixer catches up to the time since `DirectSoundCreate`, so a sound plays as long as on the console and `GetStatus` reports its end when it comes. `qilin_run --dump-audio FILE.wav` writes everything mixed to a WAV file.
+- **Submixes** (v0.21.0): a `DSBCAPS_MIXIN` buffer is a submix voice with no sample data. Voices sent to it with `SetOutputBuffer` mix into its input (channel for channel; a mono submix takes the sum) at their own volume, and it plays that input with its own volume and mix bins. One level: a submix feeding another stops the runtime.
+- **3D positioning's maths is lifted** (v0.21.0): DirectSound's 3D calculator (`IDirectSound3DCalculator_Calculate3D` and `GetVoiceData`, which XACT calls), the full-HRTF table `DirectSoundUseFullHRTF` installs, and DirectSound's four start-up initializers, 41 functions. The voice settings it produces (`Set3DVoiceData`) are recorded but not applied yet.
 - **Tests** (`qilin_audio_tests`, CI): PCM playback, end of data, volume, looping, half-rate playback with interpolation, mix bins, the ADPCM decoder, ADPCM sizes.
 
 ## Not applied yet
@@ -33,13 +35,13 @@ These are accepted and recorded, and `qilin_run` names each once when the game f
 - **3D positioning** (`Set3DVoiceData`, `Use3DVoiceData`, HRTF): 3D voices play unpositioned.
 - **The LFE bin and headroom** (per voice and per mix bin: on the APU, voice headroom attenuates before mixing and bin headroom restores it, so ignoring both keeps the overall level).
 
-Not modelled, and stopping the runtime if reached: submix buffers (`SetOutputBuffer`, `DSBCAPS_MIXIN`), effect-input buffers, buffers with their own memory, `DSBPLAY_SYNCHPLAYBACK`, stopping at a time stamp, streams (`CreateSoundStream`: streamed wave banks and music, still to come), and WMA decoding (WMADEC, for music).
+Not modelled, and stopping the runtime if reached: submixes of submixes, effect-input buffers, buffers with their own memory, `DSBPLAY_SYNCHPLAYBACK`, stopping at a time stamp, streams (`CreateSoundStream`: streamed wave banks and music, still to come), and WMA decoding (WMADEC, for music).
 
 ## Surround (planned)
 
 The Xbox mixed in 5.1 natively, and so does this engine: every voice already goes to the six speaker bins (front left, front right, centre, LFE, back left, back right). Only the last step folds them to stereo. The plan:
 
-1. **3D positioning**, which decides a positioned sound's speaker volumes: DirectSound's 3D calculator (`CDirectSound3DCalculator`, and the full-HRTF path the game turns on with `DirectSoundUseFullHRTF`) looks like pure computation, so it would be lifted, like `XAudioCalculatePitch`, giving the console's exact panning. To confirm when it's reached.
+1. **3D positioning**, which decides a positioned sound's speaker volumes: DirectSound's 3D calculator (`CDirectSound3DCalculator`, and the full-HRTF path the game turns on with `DirectSoundUseFullHRTF`) is pure computation and lifted (v0.21.0), so the panning is the console's; what remains is applying the voice data it produces.
 2. **A speaker setting** (stereo, 5.1, and 7.1 with the back channels copied to the sides), reported to the game as the console's audio setting (`ExQueryNonVolatileSetting`'s audio flags, Stereo today), and used as the mixer's output layout: the six bins go to SDL3 as six channels, LFE included, and the OS carries them to HDMI, optical or a surround headset. The Xbox's real-time Dolby Digital encoder (the `DOLBY` section) existed because its optical output could only carry surround that way; it isn't needed.
 3. **The game does the rest**, as on a console set to surround: it and XACT send to the back speakers themselves.
 

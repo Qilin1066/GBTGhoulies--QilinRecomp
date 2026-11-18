@@ -103,7 +103,7 @@ uint32_t Voice::position_bytes() const { return uint32_t(format_.frames_to_bytes
 void Voice::play(bool looping) {
     looping_ = looping;
     if (!playing_ && (pos_ < double(play_start_) || pos_ >= double(region_end()))) pos_ = double(play_start_);
-    playing_ = bytes_ != 0;
+    playing_ = bytes_ != 0 || submix_;
 }
 
 void Voice::stop() { playing_ = false; }
@@ -141,7 +141,7 @@ void Voice::decode_frame(const uint8_t* mem, size_t mem_size, uint64_t frame, fl
 }
 
 void Voice::mix(const uint8_t* mem, size_t mem_size, float* out, uint32_t frames) {
-    if (!playing_ || bytes_ == 0) return;
+    if (!playing_ || (bytes_ == 0 && !submix_)) return;
     // Each channel's gain into the left and right outputs: the mix bins
     // folded down to stereo. Bins after BackRight are effect sends, which
     // aren't modelled yet.
@@ -159,6 +159,38 @@ void Voice::mix(const uint8_t* mem, size_t mem_size, float* out, uint32_t frames
             case kFrontCenter: to[c][0] += g * 0.70710678f; to[c][1] += g * 0.70710678f; break;
             default: break;  // LFE and effect sends
         }
+    }
+    render(mem, mem_size, out, 2, to, frames);
+}
+
+void Voice::make_submix(uint32_t channels) {
+    submix_ = true;
+    format_ = Format{};
+    format_.channels = channels;
+    format_.rate = kOutputRate;
+}
+
+void Voice::mix_into(const uint8_t* mem, size_t mem_size, Voice& submix, uint32_t frames) {
+    if (!playing_ || bytes_ == 0) return;
+    const float g = gain(volume);
+    float to[2][2] = {};
+    const uint32_t dst = submix.format_.channels;
+    for (uint32_t c = 0; c < format_.channels; ++c) {
+        if (dst == 1) to[c][0] = g;
+        else if (format_.channels == 1) to[0][0] = to[0][1] = g;
+        else to[c][c] = g;
+    }
+    if (submix.input_.size() < size_t(frames) * dst) submix.input_.resize(size_t(frames) * dst, 0.0f);
+    render(mem, mem_size, submix.input_.data(), dst, to, frames);
+}
+
+void Voice::render(const uint8_t* mem, size_t mem_size, float* out, uint32_t dst, const float to[2][2], uint32_t frames) {
+    const uint32_t ch = format_.channels;
+    if (submix_) {  // its input, frame for frame
+        for (uint32_t i = 0; i < frames && size_t(i) * ch < input_.size(); ++i)
+            for (uint32_t c = 0; c < ch; ++c)
+                for (uint32_t d = 0; d < dst; ++d) out[dst * i + d] += input_[size_t(i) * ch + c] * to[c][d];
+        return;
     }
     const double step = std::pow(2.0, double(pitch) / 4096.0);
     const uint64_t end = region_end();
@@ -182,14 +214,9 @@ void Voice::mix(const uint8_t* mem, size_t mem_size, float* out, uint32_t frames
         float a[2], b[2];
         decode_frame(mem, mem_size, f0, a);
         decode_frame(mem, mem_size, f1, b);
-        const float s0 = a[0] + (b[0] - a[0]) * t, s1 = a[1] + (b[1] - a[1]) * t;
-        if (ch == 1) {
-            out[2 * i] += s0 * to[0][0];
-            out[2 * i + 1] += s0 * to[0][1];
-        } else {
-            out[2 * i] += s0 * to[0][0] + s1 * to[1][0];
-            out[2 * i + 1] += s0 * to[0][1] + s1 * to[1][1];
-        }
+        const float s[2] = {a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t};
+        for (uint32_t c = 0; c < ch; ++c)
+            for (uint32_t d = 0; d < dst; ++d) out[dst * i + d] += s[c] * to[c][d];
         pos_ += step;
     }
 }

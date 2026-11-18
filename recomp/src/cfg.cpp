@@ -742,7 +742,11 @@ bool Cfg::absorb_fragments() {
 // `push imm`). Runs again in the final fixpoint, because code found late can
 // hold new ones. Returns whether any function was added.
 bool Cfg::imm_round() {
-    std::vector<uint32_t> ok;
+    bool added = false;
+    // Until none is left: a function found here can end where the next one,
+    // known only by an immediate, starts (a table of callbacks filled in
+    // code, each after the one before it).
+    for (std::vector<uint32_t> ok;; ok.clear()) {
     for (uint32_t v : imm_seeds_) {
         if (owned_.contains(v) || funcs_.contains(v) || !xbe_.mapped(v - 1)) continue;
         const uint8_t prev = xbe_.u8(v - 1);
@@ -756,13 +760,24 @@ bool Cfg::imm_round() {
                                      const Insn* r = dec_.decode(v - 3);
                                      return r && r->len == 3 && r->mnem == ZYDIS_MNEMONIC_RET;
                                  }();
+        // Or right after an unconditional jmp of a function already found
+        // (its last instruction, a loop's back edge or a tail jump), which
+        // nothing in that function jumped past (v isn't owned).
+        const bool after_jmp = [&] {
+            for (const uint32_t len : {2u, 5u}) {
+                if (v < len || !xbe_.mapped(v - len) || !owned_.contains(v - len)) continue;
+                const Insn* j = dec_.decode(v - len);
+                if (j && j->len == len && j->mnem == ZYDIS_MNEMONIC_JMP && (xbe_.u8(v - len) == 0xEB || xbe_.u8(v - len) == 0xE9))
+                    return true;
+            }
+            return false;
+        }();
         if (!entry_ok(v)) continue;
-        if (after_pad || after_ret_n || (in_aligned_region(v) && (clean_seed(v) || displaces_weak_seed(v)))) ok.push_back(v);
+        if (after_pad || after_ret_n || after_jmp || (in_aligned_region(v) && (clean_seed(v) || displaces_weak_seed(v)))) ok.push_back(v);
     }
-    bool added = false;
-    if (!ok.empty()) {
-        run_queue({ok.rbegin(), ok.rend()}, Origin::ImmPtr);
-        added = true;
+    if (ok.empty()) break;
+    run_queue({ok.rbegin(), ok.rend()}, Origin::ImmPtr);
+    added = true;
     }
     // Data and immediate pointers still blocked only by weak seeds inside them.
     for (const auto* seeds : {&dptr_, &imm_seeds_})
@@ -973,10 +988,12 @@ void Cfg::run() {
     // Aligned code pointers stored in data sections (vtables, callback tables).
     std::set<uint32_t>& dptr = dptr_;
     for (auto& s : xbe_.sections) {
-        if (s.name != ".rdata" && s.name != ".data") continue;
+        const bool lib = s.name == cfg_.lib_data_section;
+        if (s.name != ".rdata" && s.name != ".data" && !lib) continue;
+        const uint32_t lo = lib ? cfg_.lib_dataptr_lo : cfg_.dataptr_lo, hi = lib ? cfg_.lib_dataptr_hi : cfg_.dataptr_hi;
         for (uint32_t k = 0; k + 3 < s.rsize; k += 4) {
             const uint32_t v = xbe_.u32(s.va + k);
-            if (v >= cfg_.dataptr_lo && v < cfg_.dataptr_hi && v % 16 == 0 && dec_.decode(v) && entry_ok(v) && !eh_roots_.contains(v))
+            if (v >= lo && v < hi && v % 16 == 0 && dec_.decode(v) && entry_ok(v) && !eh_roots_.contains(v))
                 dptr.insert(v);
         }
     }

@@ -105,6 +105,60 @@ inline constexpr uint32_t kMmioLo = 0xFD000000u, kMmioHi = 0xFF000000u;
 uint32_t mmio_read32(uint32_t addr, uint32_t at);
 void mmio_write32(uint32_t addr, uint32_t value, uint32_t at);
 
+// rdtsc: the time-stamp counter, which the runtime keeps at the Xbox's
+// 733 MHz on the host's clock (the same count QueryPerformanceCounter gives).
+uint64_t rdtsc(uint32_t at);
+
+// ---- MMX: 64-bit registers as 8, 4 or 2 lanes, each operation as the CPU's.
+namespace mmx {
+template <typename L, typename F>
+inline uint64_t lanes(uint64_t a, uint64_t b, F f) {
+    constexpr int bits = int(sizeof(L) * 8);
+    constexpr uint64_t mask = bits == 64 ? ~0ull : (1ull << bits) - 1;
+    uint64_t r = 0;
+    for (int k = 0; k < 64; k += bits) r |= (uint64_t(f(L((a >> k) & mask), L((b >> k) & mask))) & mask) << k;
+    return r;
+}
+inline uint64_t paddw(uint64_t a, uint64_t b) { return lanes<uint16_t>(a, b, [](uint16_t x, uint16_t y) { return uint16_t(x + y); }); }
+inline uint64_t paddsw(uint64_t a, uint64_t b) {
+    return lanes<uint16_t>(a, b, [](uint16_t x, uint16_t y) {
+        const int32_t v = int32_t(int16_t(x)) + int32_t(int16_t(y));
+        return uint16_t(int16_t(v < -32768 ? -32768 : v > 32767 ? 32767 : v));
+    });
+}
+inline uint64_t psubusw(uint64_t a, uint64_t b) { return lanes<uint16_t>(a, b, [](uint16_t x, uint16_t y) { return uint16_t(x > y ? x - y : 0); }); }
+inline uint64_t pmullw(uint64_t a, uint64_t b) {
+    return lanes<uint16_t>(a, b, [](uint16_t x, uint16_t y) { return uint16_t(uint32_t(int32_t(int16_t(x)) * int32_t(int16_t(y)))); });
+}
+inline uint64_t pmulhw(uint64_t a, uint64_t b) {
+    return lanes<uint16_t>(a, b, [](uint16_t x, uint16_t y) { return uint16_t(uint32_t(int32_t(int16_t(x)) * int32_t(int16_t(y))) >> 16); });
+}
+// Shifts by a count from a register, memory or an immediate: past the lane's width, 0.
+template <typename L>
+inline uint64_t shl(uint64_t a, uint64_t n) {
+    if (n >= sizeof(L) * 8) return 0;
+    return lanes<L>(a, 0, [n](L x, L) { return L(x << n); });
+}
+template <typename L>
+inline uint64_t shr(uint64_t a, uint64_t n) {
+    if (n >= sizeof(L) * 8) return 0;
+    return lanes<L>(a, 0, [n](L x, L) { return L(x >> n); });
+}
+// Unpacks: the low (or high) halves of a and b, interleaved a, b, a, b.
+template <typename L>
+inline uint64_t unpack(uint64_t a, uint64_t b, bool high) {
+    constexpr int bits = int(sizeof(L) * 8);
+    constexpr uint64_t mask = bits == 64 ? ~0ull : (1ull << bits) - 1;
+    if (high) a >>= 32, b >>= 32;
+    uint64_t r = 0;
+    for (int k = 0; k < 32 / bits; ++k) {
+        r |= ((a >> (k * bits)) & mask) << (2 * k * bits);
+        r |= ((b >> (k * bits)) & mask) << ((2 * k + 1) * bits);
+    }
+    return r;
+}
+}  // namespace mmx
+
 #if defined(QILIN_TRACE_WRITES)
 void trace_write(uint32_t addr, uint32_t size);
 #endif
