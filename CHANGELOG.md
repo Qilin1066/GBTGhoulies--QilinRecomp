@@ -11,6 +11,16 @@ Each release is a git tag (`vX.Y.Z`) with a matching GitHub release. The version
 
 ## [Unreleased]
 
+## [0.25.0] - 2026-11-18
+The game makes sound: its music, effects and menu sounds play through the speakers.
+
+### Added
+- **Sound output through SDL3** (`platform/audio_out.*`): the mixer's 48 kHz output to the default playback device. A 60 ms cushion keeps the device fed between catch-ups, held there by trimming the playback rate (at most 0.5%) against clock drift. `--mute` plays nothing.
+- **DirectSound streams**, which XACT plays its wave banks through: `CreateSoundStream` and the stream's methods, reached through the original's vtable (`Process`, `GetStatus`, `Discontinuity`, `Flush`, `FlushEx`, `Pause`, `SetFormat`, the setters). Voices gain a packet queue: packets play as one signal, starve and resume, stop after a discontinuity. Finished packets are reported as the console's DPC reports them (status, size, event, callback), only below DISPATCH_LEVEL. `GetStatus`, `Pause` and `FlushEx` follow the original's code.
+- **`GetVoiceProperties`** for streams and buffers, with each mix bin's volume as the original reads it back from the APU (bin volume plus voice volume less headroom, in the hardware's 1/64 dB steps).
+- **The window and sound keep going while the game waits** without swapping (its busy loops call `QueryPerformanceCounter`), so the disc-error screen's loop no longer freezes the window.
+- Tests: streams (packets back to back, starvation, discontinuity, flush).
+
 ## [0.24.0] - 2026-11-18
 The game takes input: past "Press START" to its save-slot menu, its on-screen keyboard and a signed save.
 

@@ -7,7 +7,7 @@ if(APPLE AND NOT CMAKE_OSX_DEPLOYMENT_TARGET)
     set(CMAKE_OSX_DEPLOYMENT_TARGET 10.15 CACHE STRING "oldest macOS the runtime runs on")
 endif()
 # The single source of the version number (see CHANGELOG.md for the scheme).
-project(GBTGQilincomp VERSION 0.24.0 LANGUAGES C CXX)
+project(GBTGQilincomp VERSION 0.25.0 LANGUAGES C CXX)
 
 # ---- Language: C++23 everywhere (recompiler, runtime, generated code) ----
 set(CMAKE_CXX_STANDARD 23)
@@ -163,7 +163,8 @@ if(NOT TARGET SDL3::SDL3)
         EXCLUDE_FROM_ALL)
     FetchContent_MakeAvailable(SDL3)
 endif()
-add_library(qilin_platform STATIC recomp/runtime/platform/window.cpp recomp/runtime/platform/input.cpp)
+add_library(qilin_platform STATIC recomp/runtime/platform/window.cpp recomp/runtime/platform/input.cpp
+    recomp/runtime/platform/audio_out.cpp)
 target_include_directories(qilin_platform PUBLIC recomp/runtime/platform)
 target_link_libraries(qilin_platform PUBLIC SDL3::SDL3 PRIVATE qilin_warnings)
 

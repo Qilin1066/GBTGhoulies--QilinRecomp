@@ -8,6 +8,7 @@
 #pragma once
 
 #include <array>
+#include <deque>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -79,6 +80,26 @@ public:
     // voice's volume.
     void mix_into(const uint8_t* mem, size_t mem_size, Voice& submix, uint32_t frames);
 
+    // Streaming (DirectSound streams): the data comes as packets in guest
+    // memory, played one after another as one continuous signal (the
+    // interpolation runs across their edges). With none left the voice is
+    // starved: it plays silence and waits, and the next packet carries on.
+    // After a discontinuity it stops instead, when the packets run out,
+    // until more come. Each packet is a whole number of the format's blocks.
+    void make_stream();
+    bool stream() const { return stream_; }
+    void queue_packet(uint32_t guest_addr, uint32_t bytes, uint32_t id);
+    struct Done {
+        uint32_t id, bytes;  // the packet, and how much of it played
+    };
+    std::vector<Done> take_completed();  // packets played to their end since the last call, oldest first
+    std::vector<Done> flush();           // drops every packet not yet played (stopping the voice), oldest first
+    void discontinuity() { discontinuity_ = true; }
+    void pause(bool paused) { paused_ = paused; }
+    bool paused() const { return paused_; }
+    bool starved() const { return stream_ && playing_ && packets_.empty(); }
+    size_t packets_queued() const { return packets_.size(); }
+
 private:
     // Renders frames into out (`dst` channels interleaved), channel c of the
     // voice scaled by to[c][d] into channel d.
@@ -96,6 +117,17 @@ private:
     // The ADPCM block last decoded, per channel.
     uint64_t cached_block_ = UINT64_MAX;
     std::array<std::array<int16_t, 64>, 2> block_{};
+    // Streaming: the packets queued, each covering frames [first, first + frames).
+    struct Packet {
+        uint32_t addr, bytes, id;
+        uint64_t first, frames;
+    };
+    bool stream_ = false, discontinuity_ = false, paused_ = false;
+    std::deque<Packet> packets_;
+    uint64_t queued_end_ = 0;  // the frame after the last one queued
+    std::vector<Done> completed_;
+    void render_stream(const uint8_t* mem, size_t mem_size, float* out, uint32_t dst, const float to[2][2], uint32_t frames);
+    void retire_played();
 };
 
 // Xbox ADPCM: decodes one block (36 bytes per channel, channel headers then

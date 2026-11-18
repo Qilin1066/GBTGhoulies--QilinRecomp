@@ -1,6 +1,6 @@
 # Audio: XACT lifted, DirectSound native
 
-Last updated 2026-11-18 (v0.15.0: XACT lifted, DirectSound replaced over a software mixer).
+Last updated 2026-11-18 (v0.25.0: sound output through SDL3, DirectSound streams; v0.15.0: XACT lifted, DirectSound replaced over a software mixer).
 
 The game plays its sound through XACT, Microsoft's audio engine (cues, sound banks, wave banks, notifications), which sits on DirectSound, which programs the Xbox's audio chip (the APU: a voice processor that plays and mixes up to 256 voices, and a DSP that runs effects such as reverb).
 
@@ -24,6 +24,7 @@ lifted game code  →  XACT (lifted)  →  DirectSound (native, dsound.cpp)  →
 - **The mix** is 48 kHz stereo, the APU's rate. Its clock is the host's: on every DirectSound call (and `DirectSoundDoWork`, which the game calls each frame) the mixer catches up to the time since `DirectSoundCreate`, so a sound plays as long as on the console and `GetStatus` reports its end when it comes. `qilin_run --dump-audio FILE.wav` writes everything mixed to a WAV file.
 - **Submixes** (v0.21.0): a `DSBCAPS_MIXIN` buffer is a submix voice with no sample data. Voices sent to it with `SetOutputBuffer` mix into its input (channel for channel; a mono submix takes the sum) at their own volume, and it plays that input with its own volume and mix bins. One level: a submix feeding another stops the runtime.
 - **3D positioning's maths is lifted** (v0.21.0): DirectSound's 3D calculator (`IDirectSound3DCalculator_Calculate3D` and `GetVoiceData`, which XACT calls), the full-HRTF table `DirectSoundUseFullHRTF` installs, and DirectSound's four start-up initializers, 41 functions. The voice settings it produces (`Set3DVoiceData`) are recorded but not applied yet.
+- **Streams** (v0.25.0, `CreateSoundStream`): XACT plays its wave banks through DirectSound streams. A stream is a voice that plays packets (XMEDIAPACKET) of guest memory one after another as one signal, the interpolation running across their edges. With no packet left it's starved: silent, still running, and the next packet carries on; after `Discontinuity` it stops instead when the packets run out. The stream object is the original's shape where callers look (its first words are CDirectSoundStream's vtables, `0x20A038` and `0x20A028`), so XACT's calls through the vtable (`Process`, `GetStatus`, `Discontinuity`, `Flush`) reach the replacements at those methods' addresses; the setters are the buffer's. A finished packet is reported as the console's DPC reports it, and only where one could run, below DISPATCH_LEVEL (`DirectSoundDoWork`, `Swap`, the game's waits): the completed size and status (`S_OK`, or `E_ABORT` when flushed) into the packet's words, its event signalled, the stream's callback called. `GetStatus`, `Pause` (including mode 3, resume when the voice starts) and `FlushEx` follow the original's code (`0x1CA7AD`, `0x1CB290`, `0x1CA73B`); without envelopes a flush with a release is a flush now. `GetVoiceProperties` (streams and buffers) returns what the original reads back from the APU's voice: each bin's attenuation as DirectSound programs it (the bin's volume plus the voice's, less the headroom, in the hardware's 12-bit 1/64 dB steps), unused entries bin −1 at −10000, the pitch, zero 3D values; a 3D voice's properties stop the runtime. Stream flags `0x20000000` and `0x00400000` (which emulator sources call ACCURATENOTIFY and NOMERGE; not confirmed) change how the APU's hardware handles packets, not what's heard, and are accepted. Pause mode 2, time stamps, output packets and a format change with packets attached stop the runtime.
 - **Tests** (`qilin_audio_tests`, CI): PCM playback, end of data, volume, looping, half-rate playback with interpolation, mix bins, the ADPCM decoder, ADPCM sizes.
 
 ## Not applied yet
@@ -35,7 +36,7 @@ These are accepted and recorded, and `qilin_run` names each once when the game f
 - **3D positioning** (`Set3DVoiceData`, `Use3DVoiceData`, HRTF): 3D voices play unpositioned.
 - **The LFE bin and headroom** (per voice and per mix bin: on the APU, voice headroom attenuates before mixing and bin headroom restores it, so ignoring both keeps the overall level).
 
-Not modelled, and stopping the runtime if reached: submixes of submixes, effect-input buffers, buffers with their own memory, `DSBPLAY_SYNCHPLAYBACK`, stopping at a time stamp, streams (`CreateSoundStream`: streamed wave banks and music, still to come), and WMA decoding (WMADEC, for music).
+Not modelled, and stopping the runtime if reached: submixes of submixes, effect-input buffers, buffers with their own memory, `DSBPLAY_SYNCHPLAYBACK`, stopping at a time stamp, and WMA decoding (WMADEC, for music, if the game uses it).
 
 ## Surround (planned)
 
@@ -47,4 +48,6 @@ The Xbox mixed in 5.1 natively, and so does this engine: every voice already goe
 
 ## Output
 
-There's no audio device yet: the mix goes to `--dump-audio` or nowhere. The plan is SDL3 for the window, controller and audio output (the user's controller is an Xbox One pad over Bluetooth, which SDL3 supports with rumble on every target). Output then pulls from the mixer on SDL's audio thread, which is the roadmap's "audio mixing off the game thread".
+Since v0.25.0 the mix plays through SDL3 (`recomp/runtime/platform/audio_out.*`) on the default playback device, 48 kHz stereo floats. The mixer still runs on the audio clock (the host's steady clock), catching up on DirectSound calls, at each `Swap`, and in the game's waits; what it mixes is queued to the device. The queue starts with 60 ms of silence, so the device never runs dry between catch-ups, and is held there by trimming the playback rate a little (at most 0.5%, inaudible), which absorbs the drift between the sound card's clock and the host's. After a stall, frames older than the queue's limit (four times the cushion) are dropped, as they'd have played already on the console. The device buffer is asked to be 512 frames. Measured through SDL's disk driver, what reaches the device is the mix, about 0.2 s behind it there (that driver buffers more than a sound card does). `--mute` (and `--headless`) play nothing; `--dump-audio` still writes the mix.
+
+Next: mixing on SDL's audio thread instead of the game's (the roadmap's "audio mixing off the game thread"), then surround (above).

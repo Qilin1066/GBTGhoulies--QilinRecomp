@@ -22,6 +22,7 @@ uint64_t tsc_now() {
 }
 
 void query_performance_counter(rt::Context& c) {
+    idle(c);
     const uint64_t ticks = tsc_now();
     const rt::Mem m{c.mem, c.mem_size};
     const uint32_t out = arg(c, 0);

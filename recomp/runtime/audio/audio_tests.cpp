@@ -108,6 +108,45 @@ int main() {
         CHECK(near(o2[0], 0.0f) && sub.playing());
     }
 
+    // A stream: packets play back to back as one signal, complete in order,
+    // starve (silence, still playing) when they run out and carry on with the
+    // next; a discontinuity stops it at the end; a flush drops what's queued.
+    {
+        const int16_t a[3] = {16384, 16384, 16384}, b[2] = {-16384, -16384};
+        std::memcpy(mem.data() + 0x400, a, sizeof a);
+        std::memcpy(mem.data() + 0x500, b, sizeof b);
+        audio::Voice s;
+        s.set_format(audio::Format{});
+        s.make_stream();
+        CHECK(!s.playing());
+        s.queue_packet(0x400, sizeof a, 1);
+        s.queue_packet(0x500, sizeof b, 2);
+        std::vector<float> o(16, 0.0f);
+        s.mix(mem.data(), mem.size(), o.data(), 4);
+        CHECK(near(o[0], 0.5f) && near(o[4], 0.5f) && near(o[6], -0.5f));  // the second packet follows at once
+        auto done = s.take_completed();
+        CHECK(done.size() == 1 && done[0].id == 1 && done[0].bytes == sizeof a);
+        o.assign(16, 0.0f);
+        s.mix(mem.data(), mem.size(), o.data(), 4);  // one frame left, then starved
+        done = s.take_completed();
+        CHECK(near(o[0], -0.5f) && near(o[2], 0.0f) && done.size() == 1 && done[0].id == 2);
+        CHECK(s.playing() && s.starved());
+        s.queue_packet(0x400, sizeof a, 3);  // carries on
+        o.assign(16, 0.0f);
+        s.mix(mem.data(), mem.size(), o.data(), 2);
+        CHECK(near(o[0], 0.5f) && !s.starved());
+        s.discontinuity();
+        o.assign(16, 0.0f);
+        s.mix(mem.data(), mem.size(), o.data(), 4);
+        CHECK(!s.playing() && s.take_completed().size() == 1);
+        s.queue_packet(0x400, sizeof a, 4);
+        s.queue_packet(0x500, sizeof b, 5);
+        o.assign(16, 0.0f);
+        s.mix(mem.data(), mem.size(), o.data(), 1);
+        const auto flushed = s.flush();
+        CHECK(flushed.size() == 2 && flushed[0].id == 4 && flushed[0].bytes == 2 && flushed[1].bytes == 0 && !s.playing());
+    }
+
     if (failures) std::fprintf(stderr, "%d check(s) failed\n", failures);
     else std::printf("all audio tests passed\n");
     return failures != 0;

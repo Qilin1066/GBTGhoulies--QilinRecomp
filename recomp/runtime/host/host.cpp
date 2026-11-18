@@ -1,12 +1,14 @@
 #include "host.hpp"
 #include "strf.hpp"
 
+#include <chrono>
 #include <initializer_list>
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <map>
+#include <vector>
 #include <span>
 
 namespace qilin::host {
@@ -300,3 +302,23 @@ void mmio_write32(uint32_t addr, uint32_t value, uint32_t at) {
 }
 
 }  // namespace qilin::rt
+
+namespace qilin::host {
+namespace {
+std::vector<void (*)(rt::Context&)>& idle_hooks() {
+    static std::vector<void (*)(rt::Context&)> v;
+    return v;
+}
+}  // namespace
+
+void add_idle_hook(void (*hook)(rt::Context&)) { idle_hooks().push_back(hook); }
+
+void idle(rt::Context& c) {
+    static auto last = std::chrono::steady_clock::now();
+    const auto now = std::chrono::steady_clock::now();
+    if (now - last < std::chrono::milliseconds(16)) return;
+    last = now;
+    for (auto hook : idle_hooks()) hook(c);
+}
+
+}  // namespace qilin::host

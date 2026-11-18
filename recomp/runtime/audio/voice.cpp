@@ -111,9 +111,20 @@ void Voice::stop() { playing_ = false; }
 // One frame as left/right floats (mono: the same in both).
 void Voice::decode_frame(const uint8_t* mem, size_t mem_size, uint64_t frame, float* lr) {
     const uint32_t ch = format_.channels;
+    uint64_t base = data_, local = frame;  // where the frame's data starts, and its index there
+    if (stream_) {
+        const Packet* p = nullptr;
+        for (const Packet& q : packets_)
+            if (frame >= q.first && frame < q.first + q.frames) p = &q;
+        if (!p) {
+            lr[0] = lr[1] = 0;
+            return;
+        }
+        base = p->addr, local = frame - p->first;
+    }
     if (format_.codec == Format::Codec::XboxAdpcm) {
-        const uint64_t block = frame / 64;
-        const uint64_t at = data_ + block * format_.block_bytes();
+        const uint64_t block = frame / 64;  // packets hold whole blocks, so this numbers blocks across them
+        const uint64_t at = base + (local / 64) * format_.block_bytes();
         if (block != cached_block_) {
             if (at + format_.block_bytes() > mem_size) {
                 lr[0] = lr[1] = 0;
@@ -128,7 +139,7 @@ void Voice::decode_frame(const uint8_t* mem, size_t mem_size, uint64_t frame, fl
         lr[1] = float(block_[ch - 1][frame % 64]) / 32768.0f;
         return;
     }
-    const uint64_t at = data_ + frame * format_.block_bytes();
+    const uint64_t at = base + local * format_.block_bytes();
     if (at + format_.block_bytes() > mem_size) {
         lr[0] = lr[1] = 0;
         return;
@@ -141,7 +152,7 @@ void Voice::decode_frame(const uint8_t* mem, size_t mem_size, uint64_t frame, fl
 }
 
 void Voice::mix(const uint8_t* mem, size_t mem_size, float* out, uint32_t frames) {
-    if (!playing_ || (bytes_ == 0 && !submix_)) return;
+    if (!playing_ || (bytes_ == 0 && !submix_ && !stream_)) return;
     // Each channel's gain into the left and right outputs: the mix bins
     // folded down to stereo. Bins after BackRight are effect sends, which
     // aren't modelled yet.
@@ -171,7 +182,7 @@ void Voice::make_submix(uint32_t channels) {
 }
 
 void Voice::mix_into(const uint8_t* mem, size_t mem_size, Voice& submix, uint32_t frames) {
-    if (!playing_ || bytes_ == 0) return;
+    if (!playing_ || (bytes_ == 0 && !stream_)) return;
     const float g = gain(volume);
     float to[2][2] = {};
     const uint32_t dst = submix.format_.channels;
@@ -192,6 +203,7 @@ void Voice::render(const uint8_t* mem, size_t mem_size, float* out, uint32_t dst
                 for (uint32_t d = 0; d < dst; ++d) out[dst * i + d] += input_[size_t(i) * ch + c] * to[c][d];
         return;
     }
+    if (stream_) return render_stream(mem, mem_size, out, dst, to, frames);
     const double step = std::pow(2.0, double(pitch) / 4096.0);
     const uint64_t end = region_end();
     const uint64_t loop_start = looping_ ? std::max(loop_start_, play_start_) : 0;
@@ -219,6 +231,76 @@ void Voice::render(const uint8_t* mem, size_t mem_size, float* out, uint32_t dst
             for (uint32_t d = 0; d < dst; ++d) out[dst * i + d] += s[c] * to[c][d];
         pos_ += step;
     }
+}
+
+// ---------------------------------------------------------------- streaming
+void Voice::make_stream() {
+    stream_ = true;
+    packets_.clear();
+    completed_.clear();
+    queued_end_ = 0;
+    pos_ = 0;
+}
+
+void Voice::queue_packet(uint32_t guest_addr, uint32_t bytes, uint32_t id) {
+    const uint64_t frames = format_.bytes_to_frames(bytes);
+    packets_.push_back({guest_addr, bytes, id, queued_end_, frames});
+    // A voice stopped (after a discontinuity, or never started) starts again
+    // at the new packet: the frames since the last one are silence, not data.
+    if (!playing_) pos_ = double(queued_end_);
+    queued_end_ += frames;
+    playing_ = true;
+    discontinuity_ = false;
+}
+
+void Voice::retire_played() {
+    while (!packets_.empty() && packets_.front().first + packets_.front().frames <= uint64_t(pos_)) {
+        completed_.push_back({packets_.front().id, packets_.front().bytes});
+        packets_.pop_front();
+    }
+}
+
+std::vector<Voice::Done> Voice::take_completed() {
+    std::vector<Done> v;
+    v.swap(completed_);
+    return v;
+}
+
+std::vector<Voice::Done> Voice::flush() {
+    std::vector<Done> v;
+    for (const Packet& p : packets_) {
+        const uint64_t played = uint64_t(pos_) > p.first ? std::min<uint64_t>(uint64_t(pos_) - p.first, p.frames) : 0;
+        v.push_back({p.id, uint32_t(format_.frames_to_bytes(played))});
+    }
+    packets_.clear();
+    pos_ = double(queued_end_);
+    playing_ = false;
+    return v;
+}
+
+void Voice::render_stream(const uint8_t* mem, size_t mem_size, float* out, uint32_t dst, const float to[2][2], uint32_t frames) {
+    if (paused_) return;
+    const uint32_t ch = format_.channels;
+    const double step = std::pow(2.0, double(pitch) / 4096.0);
+    for (uint32_t i = 0; i < frames; ++i) {
+        retire_played();
+        if (packets_.empty() || pos_ >= double(queued_end_)) {
+            // Out of data: stopped after a discontinuity, else starved (waiting, silent).
+            if (discontinuity_) playing_ = false, discontinuity_ = false;
+            return;
+        }
+        const uint64_t f0 = uint64_t(pos_);
+        const uint64_t f1 = f0 + 1 < queued_end_ ? f0 + 1 : f0;
+        const float t = float(pos_ - double(f0));
+        float a[2], b[2];
+        decode_frame(mem, mem_size, f0, a);
+        decode_frame(mem, mem_size, f1, b);
+        const float s[2] = {a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t};
+        for (uint32_t c = 0; c < ch; ++c)
+            for (uint32_t d = 0; d < dst; ++d) out[dst * i + d] += s[c] * to[c][d];
+        pos_ += step;
+    }
+    retire_played();
 }
 
 // ---------------------------------------------------------------- WAV output

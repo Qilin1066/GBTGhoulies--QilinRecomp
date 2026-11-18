@@ -22,6 +22,8 @@
 #include "regions.hpp"
 #include "host.hpp"
 #include "xbe.hpp"
+#include "audio.hpp"
+#include "audio_out.hpp"
 #include "input.hpp"
 #include "window.hpp"
 
@@ -133,7 +135,7 @@ int main(int argc, char** argv) {
     const char* data_dir = nullptr;
     host::D3dConfig d3d;
     std::string dump_audio;
-    bool headless = false, fullscreen = false;
+    bool headless = false, fullscreen = false, mute = false;
     uint32_t ram_mb = host::kRetailRamMb;
     for (int k = 1; k < argc; ++k) {
         const std::string_view a = argv[k];
@@ -155,6 +157,8 @@ int main(int argc, char** argv) {
             d3d.max_frames = std::strtoull(argv[++k], nullptr, 10);
         } else if (a == "--headless") {
             headless = true;
+        } else if (a == "--mute") {
+            mute = true;
         } else if (a == "--fullscreen") {
             fullscreen = true;
         } else if (a == "--gpu" && k + 1 < argc) {
@@ -168,7 +172,7 @@ int main(int argc, char** argv) {
     }
     if (!path) {
         std::fprintf(stderr,
-                     "usage: qilin_run [--ram-mb N] [--game-dir DIR] [--data-dir DIR] [--dump-frames DIR] [--dump-audio FILE.wav] [--frames N] [--gpu N] [--headless] [--fullscreen] <default.xbe>\n"
+                     "usage: qilin_run [--ram-mb N] [--game-dir DIR] [--data-dir DIR] [--dump-frames DIR] [--dump-audio FILE.wav] [--frames N] [--gpu N] [--headless] [--fullscreen] [--mute] <default.xbe>\n"
                      "  --ram-mb N       guest RAM in MB (%u by default, as the retail Xbox)\n"
                      "  --game-dir DIR   the extracted disc (default: default.xbe's directory)\n"
                      "  --data-dir DIR   the hard disk: saves and caches (default: %s)\n"
@@ -177,7 +181,8 @@ int main(int argc, char** argv) {
                      "  --frames N       stop after N frames\n"
                      "  --gpu N          the Vulkan device to use, by index (default: the best one)\n"
                      "  --headless       no window (frames are still drawn, for --dump-frames)\n"
-                     "  --fullscreen     start fullscreen (F11 or Alt+Enter switches)\n",
+                     "  --fullscreen     start fullscreen (F11 or Alt+Enter switches)\n"
+                     "  --mute           no sound output (--headless implies it; --dump-audio still writes)\n",
                      host::kRetailRamMb, default_data_dir().string().c_str());
         return 2;
     }
@@ -276,7 +281,13 @@ int main(int argc, char** argv) {
     d3d.input = input.get();
     host::register_xinput(input.get());
     host::register_d3d(d3d);
-    host::register_dsound(dump_audio);
+    // Sound: the mixer's output to the default playback device, unless asked not to.
+    std::unique_ptr<platform::AudioOut> sound;
+    if (!headless && !mute) {
+        sound = std::make_unique<platform::AudioOut>();
+        if (!sound->start(audio::kOutputRate, 2)) sound.reset();
+    }
+    host::register_dsound(dump_audio, sound.get());
     host::register_kernel();
     const std::filesystem::path disc = game_dir ? std::filesystem::path(game_dir) : std::filesystem::path(path).parent_path();
     const std::filesystem::path data = data_dir ? std::filesystem::path(data_dir) : default_data_dir();

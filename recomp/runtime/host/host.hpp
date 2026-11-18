@@ -23,6 +23,7 @@
 namespace qilin::platform {
 class Window;
 class Input;
+class AudioOut;
 }
 
 namespace qilin::host {
@@ -132,7 +133,15 @@ const D3dConfig& d3d_config();
 
 // DirectSound (dsound.cpp), over the software mixer; dump_wav non-empty
 // writes everything mixed there (--dump-audio).
-void register_dsound(const std::string& dump_wav);
+void register_dsound(const std::string& dump_wav, platform::AudioOut* out);
+// Brings the mix up to now (DirectSound calls do this too); Swap calls it, so
+// sound keeps playing while the game doesn't reach DirectSound.
+void pump_audio(rt::Context& c);
+// The host's housekeeping while the game waits without swapping (its busy
+// loops read QueryPerformanceCounter), at most every 16 ms: what each
+// library added (D3D the window's events, DirectSound the mix).
+void idle(rt::Context& c);
+void add_idle_hook(void (*hook)(rt::Context&));
 
 // XInput (xinput.cpp): the controller ports, over `input` (null: nothing plugged in).
 void register_xinput(platform::Input* input);

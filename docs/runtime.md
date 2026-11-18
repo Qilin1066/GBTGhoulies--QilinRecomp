@@ -132,7 +132,7 @@ Names are matched case-insensitively, as on FATX and the disc's XDVDFS (an exact
 
 ## Next
 
-1. **Sound output** on SDL3 (the mixer's output to the speakers, then surround), and rendering into textures (`graphics.md`).
+1. **Rendering into textures** (`graphics.md`), and surround sound (`audio.md`).
 2. **Into the game:** past the menus to the first level, implementing what it stops at.
 3. **Audio still to come** (`audio.md`): streams (streamed wave banks, music), WMA, the I3DL2 reverb, envelopes, LFOs, filters, 3D.
 4. **The scheduler:** guest threads (`PsCreateSystemThreadEx`), waits, events, timers and DPCs. Until then a second thread stops the runtime.

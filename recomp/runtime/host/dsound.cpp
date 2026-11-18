@@ -22,6 +22,7 @@
 #include <vector>
 
 #include "audio.hpp"
+#include "audio_out.hpp"
 #include "host.hpp"
 #include "strf.hpp"
 
@@ -45,6 +46,8 @@ void notice_once(const std::string& what) {
 }
 
 constexpr uint32_t kDsOk = 0;
+// XMEDIAPACKET status values (the XDK's: S_OK, E_PENDING, E_ABORT).
+constexpr uint32_t kPacketSuccess = 0, kPacketPending = 0x8000000Au, kPacketFlushed = 0x80004004u;
 
 // ---------------------------------------------------------------- objects
 struct Buffer {
@@ -52,13 +55,32 @@ struct Buffer {
     uint32_t flags = 0;
     uint32_t output = 0;  // the submix buffer it feeds (SetOutputBuffer), or 0 for the mix bins
     audio::Voice voice;
+    // A stream (CreateSoundStream): its callback and context, how many packets
+    // it takes at once, and the packets submitted and not yet completed, by id.
+    bool stream = false;
+    bool resume_on_start = false;  // Pause(3) on a voice not yet running: resume when it starts
+    uint32_t callback = 0, context = 0, max_packets = 0;
+    struct Packet {
+        uint32_t completed_size = 0, status = 0, event = 0, context = 0;  // XMEDIAPACKET's pointers and context
+    };
+    std::map<uint32_t, Packet> packets;
+};
+
+// A packet the mixer finished (or a flush dropped), waiting to be reported
+// where the console would report it: in a DPC, so not while the processor's
+// level is raised to DISPATCH_LEVEL or above.
+struct Completion {
+    uint32_t stream, id, bytes, status;
 };
 
 struct DirectSound {
     uint32_t object = 0, refs = 0;
     std::map<uint32_t, std::unique_ptr<Buffer>> buffers;  // by guest address
     std::chrono::steady_clock::time_point epoch;
+    platform::AudioOut* out = nullptr;  // the speakers, if there's a sound device
     uint64_t mixed = 0;  // output frames mixed so far
+    uint32_t next_packet = 1;
+    std::vector<Completion> completions;
     std::unique_ptr<audio::WavWriter> wav;
     std::string dump_path;
 };
@@ -109,8 +131,37 @@ void catch_up(rt::Context& c) {
             if (b->output) b->voice.mix_into(c.mem, c.mem_size, d.buffers.at(b->output)->voice, n);
         for (auto& [addr, b] : d.buffers)
             if (!b->output) b->voice.mix(c.mem, c.mem_size, out.data(), n);
+        for (auto& [addr, b] : d.buffers)
+            if (b->stream)
+                for (const audio::Voice::Done& done : b->voice.take_completed()) d.completions.push_back({addr, done.id, done.bytes, kPacketSuccess});
         if (d.wav) d.wav->write(out.data(), n);
+        if (d.out) d.out->push(out.data(), n);
         d.mixed += n;
+    }
+}
+
+// Reports finished packets, as the console's DPC does: the completed size
+// and status into the packet's words, its event signalled, the stream's
+// callback called (pStreamContext, pPacketContext, dwStatus). Only below
+// DISPATCH_LEVEL, as a DPC would wait for the level to drop.
+void deliver(rt::Context& c) {
+    DirectSound& d = ds();
+    if (d.completions.empty()) return;
+    if (rt::ld8(mem(c), c.fs_base + 0x24, 0) >= 2) return;  // the KPCR's Irql
+    std::vector<Completion> now;
+    now.swap(d.completions);
+    for (const Completion& k : now) {
+        auto it = d.buffers.find(k.stream);
+        if (it == d.buffers.end()) continue;
+        Buffer& b = *it->second;
+        auto p = b.packets.find(k.id);
+        if (p == b.packets.end()) continue;
+        const Buffer::Packet pk = p->second;
+        b.packets.erase(p);
+        if (pk.completed_size) st(c, pk.completed_size, k.bytes);
+        if (pk.status) st(c, pk.status, k.status);
+        if (pk.event) st(c, pk.event + 4, 1);  // the KEVENT's SignalState (nothing waits on it without threads)
+        if (b.callback) call_guest(c, b.callback, {b.context, pk.context, k.status});
     }
 }
 
@@ -327,6 +378,7 @@ void commit_deferred_settings(rt::Context& c) {
 // VOID DirectSoundDoWork(): DirectSound's periodic work; here, mixing up to now.
 void do_work(rt::Context& c) {
     catch_up(c);
+    deliver(c);
     ret(c, c.eax, 0);
 }
 
@@ -351,6 +403,209 @@ void set_i3dl2_listener(rt::Context& c) {
     catch_up(c);
     notice_once("the DSP effects (I3DL2 reverb)");
     ret(c, kDsOk, 12);
+}
+
+// ---------------------------------------------------------------- streams
+// The stream object is the original's shape where callers look: its first
+// word is CDirectSoundStream's vtable (0x20A038: AddRef, Release, GetInfo,
+// GetStatus, Process, Discontinuity, Flush), the second its inner
+// interface's (0x20A028), so XACT's calls through the vtable reach the
+// replacements registered at those methods' addresses.
+constexpr uint32_t kStreamVtable = 0x20A038, kStreamInnerVtable = 0x20A028;
+
+// HRESULT IDirectSound_CreateSoundStream(LPDIRECTSOUND, LPCDSSTREAMDESC, LPDIRECTSOUNDSTREAM*, LPUNKNOWN)
+// DSSTREAMDESC: dwFlags, dwMaxAttachedPackets, lpwfxFormat, lpfnCallback, lpvContext, lpMixBins.
+void create_sound_stream(rt::Context& c) {
+    const char* fn = "IDirectSound_CreateSoundStream";
+    catch_up(c);
+    const uint32_t desc = arg(c, 1), out = arg(c, 2);
+    const uint32_t flags = ld(c, desc), max_packets = ld(c, desc + 4), wfx = ld(c, desc + 8);
+    // 0x10 is DSSTREAMCAPS_CTRL3D. XACT also sets 0x20000000 and 0x00400000,
+    // which emulator sources name DSSTREAMCAPS_ACCURATENOTIFY and NOMERGE (not
+    // confirmed against the XDK): how the APU reports and joins packets in
+    // hardware. A software mixer reporting each packet as it finishes
+    // playing hears the same either way. Any other flag stops the runtime.
+    if (flags & ~0x20400010u) unmodelled(fn, strf("stream flags %#x", flags));
+    if (!wfx) unmodelled(fn, "a stream without a format");
+    auto b = std::make_unique<Buffer>();
+    b->stream = true;
+    b->flags = flags;
+    b->max_packets = max_packets;
+    b->callback = ld(c, desc + 12);
+    b->context = ld(c, desc + 16);
+    b->voice.set_format(read_format(c, wfx, fn));
+    b->voice.make_stream();
+    b->voice.mix_bins = read_mix_bins(c, ld(c, desc + 20));
+    if (flags & 0x10) notice_once("3D positioning (DSSTREAMCAPS_CTRL3D streams play unpositioned)");
+    const uint32_t obj = guest_object();
+    st(c, obj, kStreamVtable);
+    st(c, obj + 4, kStreamInnerVtable);
+    ds().buffers[obj] = std::move(b);
+    st(c, out, obj);
+    ret(c, kDsOk, 16);
+}
+
+Buffer& stream(rt::Context& c, uint32_t a, const char* fn) {
+    Buffer& b = buffer(c, a, fn);
+    if (!b.stream) unmodelled(fn, strf("a stream call on a buffer (%08X)", a));
+    return b;
+}
+
+void stream_add_ref(rt::Context& c) { ret(c, ++stream(c, arg(c, 0), "CDirectSoundStream_AddRef").refs, 4); }
+
+void stream_release(rt::Context& c) {
+    const uint32_t a = arg(c, 0);
+    Buffer& b = stream(c, a, "CDirectSoundStream_Release");
+    const uint32_t refs = --b.refs;
+    if (refs == 0) {
+        catch_up(c);
+        if (!b.packets.empty()) unmodelled("CDirectSoundStream_Release", "releasing a stream with packets still attached");
+        ds().buffers.erase(a);
+    }
+    ret(c, refs, 4);
+}
+
+// HRESULT GetStatus(LPDWORD pdwStatus), as the original's (0x1CA7AD): READY
+// (1) while it takes another packet; a running voice is PAUSED (0x20000)
+// when paused or starved, STARVED (0x40000) too when starved, else PLAYING
+// (0x10000).
+void stream_get_status(rt::Context& c) {
+    catch_up(c);
+    Buffer& b = stream(c, arg(c, 0), "CDirectSoundStream_GetStatus");
+    uint32_t status = 0;
+    if (b.packets.size() < b.max_packets) status |= 1;
+    if (b.voice.playing()) {
+        if (b.voice.paused() || b.voice.starved()) status |= 0x20000;
+        if (b.voice.starved()) status |= 0x40000;
+        if (!(status & 0x20000)) status |= 0x10000;
+    }
+    st(c, arg(c, 1), status);
+    ret(c, kDsOk, 8);
+}
+
+// HRESULT Process(LPCXMEDIAPACKET pInputPacket, LPXMEDIAPACKET pOutputPacket):
+// XMEDIAPACKET { pvBuffer, dwMaxSize, pdwCompletedSize, pdwStatus,
+// hCompletionEvent, prtTimestamp, pContext }. The packet is queued behind
+// the others, its status pending until it has played.
+void stream_process(rt::Context& c) {
+    const char* fn = "CDirectSoundStream_Process";
+    catch_up(c);
+    DirectSound& d = ds();
+    Buffer& b = stream(c, arg(c, 0), fn);
+    const uint32_t pkt = arg(c, 1);
+    if (arg(c, 2)) unmodelled(fn, "an output packet");
+    if (b.packets.size() >= b.max_packets) unmodelled(fn, strf("more than the %u packets the stream takes", b.max_packets));
+    const uint32_t data = ld(c, pkt), bytes = ld(c, pkt + 4);
+    if (ld(c, pkt + 20)) unmodelled(fn, "a packet with a time stamp");
+    const uint32_t block = b.voice.format().block_bytes();
+    if (bytes % block) unmodelled(fn, strf("a packet of %u bytes (not whole %u-byte blocks)", bytes, block));
+    Buffer::Packet p{ld(c, pkt + 8), ld(c, pkt + 12), ld(c, pkt + 16), ld(c, pkt + 24)};
+    if (p.status) st(c, p.status, kPacketPending);
+    if (p.event) st(c, p.event + 4, 0);
+    const uint32_t id = d.next_packet++;
+    b.packets[id] = p;
+    b.voice.queue_packet(data, bytes, id);
+    if (b.resume_on_start) b.voice.pause(false), b.resume_on_start = false;
+    ret(c, kDsOk, 12);
+}
+
+// HRESULT SetFormat(LPCWAVEFORMATEX): a new format for the packets to come.
+void stream_set_format(rt::Context& c) {
+    const char* fn = "IDirectSoundStream_SetFormat";
+    catch_up(c);
+    Buffer& b = stream(c, arg(c, 0), fn);
+    if (!b.packets.empty()) unmodelled(fn, "changing the format with packets attached");
+    b.voice.set_format(read_format(c, arg(c, 1), fn));
+    ret(c, kDsOk, 8);
+}
+
+// HRESULT Discontinuity(): the data so far is all there is; the stream stops
+// when it runs out, instead of starving.
+void stream_discontinuity(rt::Context& c) {
+    catch_up(c);
+    stream(c, arg(c, 0), "CDirectSoundStream_Discontinuity").voice.discontinuity();
+    ret(c, kDsOk, 4);
+}
+
+// Drops the packets not yet played: each reported flushed, with how much of it played.
+void flush_stream(rt::Context& c, uint32_t a, Buffer& b) {
+    for (const audio::Voice::Done& done : b.voice.flush()) ds().completions.push_back({a, done.id, done.bytes, kPacketFlushed});
+    deliver(c);
+}
+
+// HRESULT Flush()
+void stream_flush(rt::Context& c) {
+    catch_up(c);
+    const uint32_t a = arg(c, 0);
+    flush_stream(c, a, stream(c, a, "CDirectSoundStream_Flush"));
+    ret(c, kDsOk, 4);
+}
+
+// HRESULT FlushEx(REFERENCE_TIME rtTimeStamp, DWORD dwFlags): as the
+// original (0x1CA73B), flags 2 and 4 let the envelope's release play out
+// before the packets are flushed, and 1 returns without waiting. Without
+// envelopes the release is instant, so each is a flush now. A time stamp
+// stops the runtime.
+void stream_flush_ex(rt::Context& c) {
+    const char* fn = "CDirectSoundStream_FlushEx";
+    catch_up(c);
+    const uint32_t a = arg(c, 0), flags = arg(c, 3);
+    if (arg(c, 1) || arg(c, 2)) unmodelled(fn, "a flush at a time stamp");
+    if (flags & ~7u) unmodelled(fn, strf("flags %#x", flags));
+    if (flags & 6) notice_once("envelopes (attack, decay, release)");
+    flush_stream(c, a, stream(c, a, fn));
+    ret(c, kDsOk, 16);
+}
+
+// HRESULT Pause(DWORD dwPause): 0 resumes, 1 pauses. 3, as the original's
+// voice code (0x1CB290) does it: resume now if the voice is running, else
+// when it starts (its first packet). 2 sets another of the voice's flags,
+// not modelled yet.
+void stream_pause(rt::Context& c) {
+    const char* fn = "CDirectSoundStream_Pause";
+    catch_up(c);
+    Buffer& b = stream(c, arg(c, 0), fn);
+    const uint32_t how = arg(c, 1);
+    if (how == 2 || how > 3) unmodelled(fn, strf("pause mode %u", how));
+    b.resume_on_start = false;
+    if (how == 3 && !b.voice.playing()) b.resume_on_start = true;
+    else b.voice.pause(how == 1);
+    ret(c, kDsOk, 8);
+}
+
+// HRESULT GetVoiceProperties(LPDSVOICEPROPS): what the APU's voice holds, as
+// the original reads it back (CMcpxVoiceClient_GetVoiceProperties,
+// 0x1CCB0F): the mix bins in the voice's order, each with the attenuation
+// DirectSound programmed for it, the bin's volume plus the voice's volume
+// less its headroom, in the hardware's 12-bit 1/64 dB steps (so rounded as
+// the hardware holds it), unused entries bin -1 at -10000; the pitch
+// register; and five values from a 3D voice's data, zero without 3D.
+void voice_properties(rt::Context& c) {
+    const char* fn = "GetVoiceProperties";
+    catch_up(c);
+    Buffer& b = buffer(c, arg(c, 0), fn);
+    if (b.flags & 0x10) unmodelled(fn, "the properties of a 3D voice");
+    const uint32_t out = arg(c, 1);
+    const audio::Voice& v = b.voice;
+    std::vector<audio::MixBinVolume> bins = v.mix_bins;
+    if (bins.empty()) bins = {{audio::kFrontLeft, 0}, {audio::kFrontRight, 0}};
+    if (bins.size() > 8) unmodelled(fn, strf("%zu mix bins", bins.size()));
+    st(c, out, uint32_t(bins.size()));
+    for (uint32_t i = 0; i < 8; ++i) {
+        uint32_t bin = 0xFFFFFFFFu;
+        int32_t volume = -10000;
+        if (i < bins.size()) {
+            const int64_t attenuation = -(int64_t(bins[i].volume) + v.volume - v.headroom);  // millibels, >= 0
+            const uint32_t hw = std::min<uint32_t>(0xFFF, uint32_t(uint32_t(attenuation) * 64u / 100u));
+            bin = bins[i].bin;
+            volume = -int32_t((hw * 100u) >> 6);
+        }
+        st(c, out + 4 + 8 * i, bin);
+        st(c, out + 8 + 8 * i, uint32_t(volume));
+    }
+    st(c, out + 0x44, uint32_t(int32_t(int16_t(v.pitch))));
+    for (uint32_t k = 0; k < 5; ++k) st(c, out + 0x48 + 4 * k, 0);
+    ret(c, kDsOk, 8);
 }
 
 struct DsFn {
@@ -387,12 +642,60 @@ constexpr DsFn kDs[] = {
     {"IDirectSoundBuffer_Stop", stop},
     {"IDirectSoundBuffer_StopEx", stop_ex},
     {"IDirectSoundBuffer_GetStatus", get_status},
+    {"IDirectSound_CreateSoundStream", create_sound_stream},
+    {"CDirectSoundStream_AddRef", stream_add_ref},
+    {"CDirectSoundStream_Release", stream_release},
+    {"CDirectSoundStream_GetStatus__r2", stream_get_status},
+    {"CDirectSoundStream_Process", stream_process},
+    {"CDirectSoundStream_Discontinuity", stream_discontinuity},
+    {"CDirectSoundStream_Flush", stream_flush},
+    // The stream's setters take the same arguments as the buffer's: the
+    // C++ methods, and the C interface's thunks that jump to them.
+    {"CDirectSoundStream_SetVolume", set_volume},
+    {"IDirectSoundStream_SetVolume", set_volume},
+    {"CDirectSoundStream_SetPitch", set_pitch},
+    {"IDirectSoundStream_SetPitch", set_pitch},
+    {"CDirectSoundStream_SetHeadroom", set_headroom},
+    {"IDirectSoundStream_SetHeadroom", set_headroom},
+    {"CDirectSoundStream_SetMixBins", set_mix_bins},
+    {"IDirectSoundStream_SetMixBins", set_mix_bins},
+    {"CDirectSoundStream_SetMixBinVolumes_8", set_mix_bin_volumes},
+    {"IDirectSoundStream_SetMixBinVolumes_8", set_mix_bin_volumes},
+    {"CDirectSoundStream_SetLFO", set_lfo},
+    {"IDirectSoundStream_SetLFO", set_lfo},
+    {"CDirectSoundStream_SetEG", set_eg},
+    {"IDirectSoundStream_SetEG", set_eg},
+    {"CDirectSoundStream_SetFilter", set_filter},
+    {"IDirectSoundStream_SetFilter", set_filter},
+    {"CDirectSoundStream_Set3DVoiceData", set_3d_voice_data},
+    {"IDirectSoundStream_Set3DVoiceData", set_3d_voice_data},
+    {"CDirectSoundStream_Use3DVoiceData", use_3d_voice_data},
+    {"IDirectSoundStream_Use3DVoiceData", use_3d_voice_data},
+    {"CDirectSoundStream_SetOutputBuffer", set_output_buffer},
+    {"IDirectSoundStream_SetOutputBuffer", set_output_buffer},
+    {"CDirectSoundStream_Pause", stream_pause},
+    {"IDirectSoundStream_Pause", stream_pause},
+    {"CDirectSoundStream_FlushEx", stream_flush_ex},
+    {"CDirectSoundStream_GetVoiceProperties", voice_properties},
+    {"CDirectSoundBuffer_GetVoiceProperties", voice_properties},
+    {"IDirectSoundBuffer_GetVoiceProperties", voice_properties},
+    {"IDirectSoundStream_GetVoiceProperties", voice_properties},
+    {"CDirectSoundStream_SetFormat", stream_set_format},
+    {"IDirectSoundStream_SetFormat", stream_set_format},
+    {"IDirectSoundStream_FlushEx", stream_flush_ex},
 };
 
 }  // namespace
 
-void register_dsound(const std::string& dump_wav) {
+void pump_audio(rt::Context& c) {
+    catch_up(c);
+    deliver(c);
+}
+
+void register_dsound(const std::string& dump_wav, platform::AudioOut* out) {
     ds().dump_path = dump_wav;
+    ds().out = out;
+    add_idle_hook(pump_audio);
     register_mmio_read(0xFE80200C, "APU global sample counter", apu_global_sample_count);
     for (const DsFn& f : kDs) {
         const XdkSymbol* s = xdk_symbol(f.name);

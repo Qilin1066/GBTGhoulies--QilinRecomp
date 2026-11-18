@@ -468,6 +468,19 @@ void clear(rt::Context& c) {
     ret(c, 0, 24);
 }
 
+// The window's events; closing it stops the runtime.
+void pump_window(const Device& d) {
+    platform::Window* w = d.config.window;
+    if (!w) return;
+    w->pump(d.config.input);
+    if (w->quit_requested()) {
+        std::fflush(stderr);
+        std::printf("qilin_run: the window was closed after %u frames\n", d.swaps);
+        std::fflush(stdout);
+        std::exit(0);
+    }
+}
+
 // DWORD D3DDevice_Swap(DWORD Flags): shows the frame at the vblank the
 // presentation interval asks for (D3DSWAP_DEFAULT) and returns the swap count.
 void swap(rt::Context& c) {
@@ -493,15 +506,8 @@ void swap(rt::Context& c) {
     mirror_device(c, d);
     run_vblanks(c, d, target, true);
     deliver_frame(d);
-    if (platform::Window* w = d.config.window) {
-        w->pump(d.config.input);
-        if (w->quit_requested()) {
-            std::fflush(stderr);
-            std::printf("qilin_run: the window was closed after %u frames\n", d.swaps);
-            std::fflush(stdout);
-            std::exit(0);
-        }
-    }
+    pump_audio(c);
+    pump_window(d);
     ret(c, d.swaps, 4);
 }
 
@@ -2228,6 +2234,9 @@ const D3dConfig& d3d_config() { return config_storage(); }
 
 void register_d3d(const D3dConfig& config) {
     config_storage() = config;
+    add_idle_hook([](rt::Context&) {
+        if (g_device) pump_window(*g_device);
+    });
     for (const D3dFn& f : kD3d) {
         const XdkSymbol* s = xdk_symbol(f.name);
         if (!s) {
