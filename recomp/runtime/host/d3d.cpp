@@ -19,12 +19,15 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <map>
 #include <memory>
+#include <optional>
 #include <string>
 #include <thread>
 #include <vector>
 
 #include "gfx.hpp"
+#include "vsh.hpp"
 #include "host.hpp"
 #include "strf.hpp"
 
@@ -389,6 +392,55 @@ void swap(rt::Context& c) {
     ret(c, d.swaps, 4);
 }
 
+// ---------------------------------------------------------------- vertex shaders
+struct VertexShader {
+    std::vector<uint32_t> declaration;          // D3DVSD tokens, up to D3DVSD_END
+    std::optional<gfx::vsh::Program> program;   // none: a declaration for the fixed-function pipeline
+};
+std::map<uint32_t, VertexShader>& vertex_shaders() {  // by handle
+    static std::map<uint32_t, VertexShader> v;
+    return v;
+}
+
+// HRESULT D3DDevice_CreateVertexShader(CONST DWORD* pDeclaration, CONST DWORD* pFunction,
+//     DWORD* pHandle, DWORD Usage): the handle is the shader object's address
+// with bit 0 set, as the original's (SetVertexShader tells programmable
+// shaders from FVF codes by that bit). QILIN_DUMP_VSH=1 prints each one's
+// declaration and disassembly, =2 its raw words too.
+void create_vertex_shader(rt::Context& c) {
+    Device& d = device("D3DDevice_CreateVertexShader");
+    const uint32_t decl = arg(c, 0), fn = arg(c, 1), out = arg(c, 2);
+    VertexShader vs;
+    for (uint32_t k = 0; decl && k < 256; ++k) {
+        const uint32_t t = ld(c, decl + 4 * k);
+        if (t == 0xFFFFFFFFu) break;  // D3DVSD_END
+        vs.declaration.push_back(t);
+    }
+    if (fn) {
+        const uint32_t n = std::min<uint32_t>(ld(c, fn) >> 16, 136);
+        std::vector<uint32_t> words(1 + 4 * size_t(n));
+        for (size_t k = 0; k < words.size(); ++k) words[k] = ld(c, fn + 4 * uint32_t(k));
+        std::string error;
+        vs.program = gfx::vsh::decode(words.data(), words.size(), &error);
+        if (const char* v = std::getenv("QILIN_DUMP_VSH"); v && *v == '2') {
+            std::fprintf(stderr, "vertex shader words:");
+            for (uint32_t w : words) std::fprintf(stderr, " %08X", w);
+            std::fprintf(stderr, "\n");
+        }
+        if (!vs.program) unmodelled("D3DDevice_CreateVertexShader", "a function that isn't a vertex program (" + error + ")");
+    }
+    const uint32_t obj = guest_alloc(d, 16);
+    const uint32_t handle = obj | 1u;
+    if (const char* v = std::getenv("QILIN_DUMP_VSH"); v && *v && *v != '0') {
+        std::fprintf(stderr, "vertex shader %08X: %zu declaration tokens", handle, vs.declaration.size());
+        for (uint32_t t : vs.declaration) std::fprintf(stderr, " %08X", t);
+        std::fprintf(stderr, "\n%s", vs.program ? gfx::vsh::disassemble(*vs.program).c_str() : "(no function)\n");
+    }
+    vertex_shaders()[handle] = std::move(vs);
+    if (out) st(c, out, handle);
+    ret(c, 0, 16);
+}
+
 struct D3dFn {
     const char* name;
     uint32_t arg_bytes;  // the original's stdcall argument bytes, as its ret n pops them (checked when written)
@@ -408,6 +460,7 @@ constexpr D3dFn kD3d[] = {
     {"D3DDevice_SetGammaRamp", 8, set_gamma_ramp},
     {"D3DDevice_BlockUntilIdle", 0, block_until_idle},
     {"D3DDevice_Clear", 24, clear},
+    {"D3DDevice_CreateVertexShader", 16, create_vertex_shader},
     {"D3DDevice_Swap", 4, swap},
 };
 

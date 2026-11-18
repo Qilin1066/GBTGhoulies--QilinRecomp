@@ -82,7 +82,8 @@ constexpr uint32_t kLiftedDsound[] = {0x1C5AF1, 0x1C5849, 0x1C586E, 0x1CB40D, 0x
 
 // Direct3D is replaced natively, except its resource code, which is pure
 // computation over the game's allocator (0xF7270): creating textures,
-// surfaces and vertex buffers, surface levels, descriptions and locks.
+// surfaces and vertex buffers, surface levels, descriptions and locks, and
+// pixel-shader objects.
 // Lifted, the headers, sizes, pitches and swizzled layouts are exactly the
 // original's. What it calls that touches the GPU or the command buffer
 // (D3D_BlockOnResource, MakeSpace, kick-offs, fences) stays native.
@@ -105,6 +106,9 @@ constexpr uint32_t kLiftedD3d[] = {
     0x175A40,  // D3DResource_GetType
     0x175930,  // whether a surface is a level of a texture
     0x1759B0,  // D3DResource_AddRef
+    0x175300,  // D3DDevice_CreatePixelShader: {refs, created, &def, a copy of the D3DPIXELSHADERDEF}
+    0x175350,  // D3DDevice_DeletePixelShader
+    0x177980,  // D3D_AllocContiguousMemory: the game's allocator with alignment flags
 };
 
 // Entry points the runtime calls itself: XAPI's process start-up (heap,

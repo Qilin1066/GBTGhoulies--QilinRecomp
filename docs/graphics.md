@@ -1,6 +1,6 @@
 # Graphics: Direct3D on Vulkan (roadmap step 4)
 
-Last updated 2026-11-18 (v0.16.0: D3D's resource code lifted; guest RAM's kernel windows; v0.14.0: the renderer and the Direct3D device).
+Last updated 2026-11-18 (v0.17.0: vertex programs decoded, pixel-shader objects lifted; v0.16.0: D3D's resource code lifted; guest RAM's kernel windows; v0.14.0: the renderer and the Direct3D device).
 
 The game draws through the Xbox's Direct3D 8 library (D3D8, XDK 5659), which is linked into the XBE. Its calls stay in the recompiled code; what answers them is the runtime. Every D3D function the game calls is replaced natively (`recomp/runtime/host/d3d.cpp`) over a Vulkan 1.3 renderer (`recomp/runtime/gfx/`). There is no DirectX anywhere, and the Xbox's GPU (the NV2A) isn't emulated: the replacements see what the game asks for (clear this, draw that mesh with this texture) and do it with Vulkan.
 
@@ -16,9 +16,21 @@ The game never reads the D3D device object, so the device is the runtime's. But 
 
 Resources (surfaces, textures, vertex buffers) stay D3D resource headers in guest memory, as the game passes them around and may read their format and size: `Common` (reference count in the low 16 bits, type, the device's internal references), `Data`, `Lock`, `Format`, `Size`, and a surface's `Parent`. Their data stays in guest memory too, where the game writes it; the renderer copies what it draws into Vulkan images when it draws.
 
-**D3D's resource code is lifted** (v0.16.0, `kLiftedD3d` in `recomp/src/main.cpp`): creating textures, surfaces and vertex buffers, surface levels, descriptions and locks, 18 functions. They're computation over the game's own allocator (`0xF7270`), so lifting them makes headers, sizes, pitches and swizzled layouts exactly the original's. What they call that touches the GPU stays native: `D3D_BlockOnResource`, the wait for the GPU to finish with a resource, returns at once (the GPU never holds guest memory here), and `D3DVertexBuffer_Lock2`, which in the original also writes a wait into the command buffer. The lifted code reads a few fields of the device object, which the runtime keeps current in the original layout: the frame buffers (`+0x1A04`, `+0x1A08`, `+0x1A0C`), the render target (`+0x19F4`), the depth buffer (`+0x19F8`) and the multisample type (`+0x195C`).
+**D3D's resource code is lifted** (v0.16.0, `kLiftedD3d` in `recomp/src/main.cpp`): creating textures, surfaces and vertex buffers, surface levels, descriptions and locks, pixel-shader objects and D3D's contiguous allocator, 21 functions. They're computation over the game's own allocator (`0xF7270`), so lifting them makes headers, sizes, pitches and swizzled layouts exactly the original's. What they call that touches the GPU stays native: `D3D_BlockOnResource`, the wait for the GPU to finish with a resource, returns at once (the GPU never holds guest memory here), and `D3DVertexBuffer_Lock2`, which in the original also writes a wait into the command buffer. The lifted code reads a few fields of the device object, which the runtime keeps current in the original layout: the frame buffers (`+0x1A04`, `+0x1A08`, `+0x1A0C`), the render target (`+0x19F4`), the depth buffer (`+0x19F8`) and the multisample type (`+0x195C`).
 
 **Locks return addresses in the kernel's windows onto RAM**: a vertex buffer's `Data | 0x80000000`, a surface's `Data | 0xF0000000` (write-combined). The game writes vertices and pixels through them, so guest RAM is mapped at both (`runtime.md`).
+
+## Vertex shaders
+
+The game has 24 vertex shaders, written in Xbox shader assembly (`vs.1.0` and `xvs.1.1`, a table at `0x4271E4`) and assembled when it starts by XGraphics' `XGAssembleShader`, which is lifted. So the microcode `CreateVertexShader` receives is exactly what the console's would be.
+
+`recomp/runtime/gfx/vsh.*` decodes it: a header word (program type, instruction count), then 128-bit NV2A instructions, each pairing a MAC operation (`mov mul add mad dp3 dph dp4 dst min max slt sge arl`) with an ILU one (`mov rcp rcc rsq expp logp lit`), three operands (A, B, C) from temporaries, inputs or the 192 constants (D3D's c-96…c95), with swizzles, negation and a0.x-relative constants, writing temporaries, an output register (`oPos oD0 oD1 oFog oPts oB0 oB1 oT0`–`oT3`) or a constant. `ADD` reads A and C; the ILU reads C, and writes `r1` whenever the MAC slot holds an operation (the assembler keeps `r1` free for it).
+
+**Checked against the sources:** each of the game's 24 programs disassembles to its source text, after what the assembler itself does: it renames temporaries, writes `sub` as `add` with a negated operand, narrows write masks, expands `m4x4` into four `dp4`, pairs ILU operations with MAC ones, and appends the screen-space transform (`mul oPos.xyz, oPos, c-38` with `rcc r1.x, oPos.w`, then `mad oPos.xyz, oPos, r1.x, c-37`: D3D's reserved viewport constants). `qilin_gfx_tests` checks one of them, as the assembler produced it, against its disassembly. `QILIN_DUMP_VSH=1` prints every program and its declaration as it's created (`=2` adds the raw words).
+
+`CreateVertexShader` keeps each program with its declaration (`D3DVSD` stream and register tokens) and returns the original's kind of handle: the object's address with bit 0 set, which tells programmable shaders from fixed-function vertex formats. Next, the programs become SPIR-V.
+
+**Pixel shaders** are the NV2A's register combiners: `CreatePixelShader` and `DeletePixelShader` are lifted (they only allocate, copy the game's `D3DPIXELSHADERDEF` and free), so the renderer reads the combiner settings from the original object.
 
 ## The renderer
 
@@ -38,6 +50,7 @@ Resources (surfaces, textures, vertex buffers) stay D3D resource headers in gues
 | `D3DDevice_GetBackBuffer2`, `GetDepthStencilSurface2`, `GetRenderTarget2` | The surfaces, with a reference added. Index −1 is the front buffer |
 | `D3DResource_Release`, `D3DResource_Register` | As the original (`AddRef` is lifted). Freeing a resource isn't modelled yet and stops the runtime |
 | `D3D_BlockOnResource`, `D3DVertexBuffer_Lock2` | See the lifted resource code above |
+| `D3DDevice_CreateVertexShader` | Decodes and keeps the program and declaration (Vertex shaders, above) |
 | `D3DDevice_SetVerticalBlankCallback` | Kept; called at each vblank (below) |
 | `D3DDevice_SetGammaRamp` | Kept; frames written with `--dump-frames` go through it, as the TV would show them |
 | `D3DDevice_BlockUntilIdle` | Waits for the GPU |
@@ -50,7 +63,8 @@ Resources (surfaces, textures, vertex buffers) stay D3D resource headers in gues
 
 ## Next
 
-1. **Shaders:** the game creates its first vertex shader next. Xbox vertex shaders are NV2A microcode, and pixel shaders configure the register combiners; both become SPIR-V.
-2. **A window** on SDL3, so frames are shown and not only saved.
-3. **Drawing:** vertex formats and buffers, the fixed-function pipeline and vertex shaders, the pixel-shader combiners (to SPIR-V), textures (swizzled and DXT formats), render states from the guest tables, render targets. Then the `BeginPush` immediate-mode draws.
-4. The improvements the design allows: higher resolutions, SMAA, better texture filtering.
+1. **State:** the game sets its transforms next (`SetTransform`), then render and texture states, textures, streams and shaders. D3D's state tables stay in guest memory, where the originals keep them.
+2. **Shaders to SPIR-V:** the decoded vertex programs, the fixed-function pipeline, and the pixel combiners.
+3. **A window** on SDL3, so frames are shown and not only saved.
+4. **Drawing:** vertex formats and buffers, the fixed-function pipeline and vertex shaders, the pixel-shader combiners (to SPIR-V), textures (swizzled and DXT formats), render states from the guest tables, render targets. Then the `BeginPush` immediate-mode draws.
+5. The improvements the design allows: higher resolutions, SMAA, better texture filtering.

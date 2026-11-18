@@ -11,6 +11,18 @@ Each release is a git tag (`vX.Y.Z`) with a matching GitHub release. The version
 
 ## [Unreleased]
 
+## [0.17.0] - 2026-11-18
+Vertex programs are decoded, and the game creates all its shaders. It stops at its first transform.
+
+### Added
+- **NV2A vertex programs** (`recomp/runtime/gfx/vsh.*`): decoding the microcode `CreateVertexShader` receives (MAC and ILU operations, operands with swizzles and negation, temporaries, inputs, constants with a0.x, output, temporary and constant writes) and disassembling it. The game's 24 shaders, assembled at start-up by the lifted `XGAssembleShader`, each match their source text once the assembler's own rewrites are allowed for; `qilin_gfx_tests` checks one, as the assembler produced it. `QILIN_DUMP_VSH=1` (or `2`, with raw words).
+- **`D3DDevice_CreateVertexShader`:** keeps the program and its declaration; the handle is the object's address with bit 0 set, as the original's.
+- **Lifted:** `D3DDevice_CreatePixelShader`, `D3DDevice_DeletePixelShader` and `D3D_AllocContiguousMemory` (allocation and copies over the game's allocator).
+
+### Fixed
+- **`qilin_gfx_tests`** reports failures of its GPU-free checks even where there's no Vulkan device to run the rest.
+
+
 ## [0.16.0] - 2026-11-18
 Guest RAM is mapped at the Xbox kernel's windows, D3D's resource code is lifted, and the game creates its textures. It stops at its first vertex shader.
 

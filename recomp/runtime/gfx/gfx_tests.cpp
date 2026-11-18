@@ -4,6 +4,7 @@
 #include <string>
 
 #include "gfx.hpp"
+#include "vsh.hpp"
 
 using namespace qilin;
 
@@ -24,6 +25,65 @@ bool pixel_is(const gfx::Image& im, uint32_t x, uint32_t y, uint8_t r, uint8_t g
 }  // namespace
 
 int main(int argc, char** argv) {
+    // Vertex programs, before the renderer (no GPU needed): one of the game's
+    // shaders as the lifted XGAssembleShader assembles it. Its source:
+    //   dp4 r0, v0, c5 / m4x4 oPos, v0, c0 / sge r1.w, r0, c10 / m4x4 oT0, v0, c6 / mul oD0, r1.w, c4
+    // The assembler renames r1 (keeping it for the screen-space 1/w), narrows
+    // masks and appends the screen-space transform with c-38 and c-37.
+    {
+        const uint32_t words[] = {
+        0x000D2078u, 0x00000000u, 0x00ECA01Bu, 0x0836B800u, 0x28000000u,
+        0x00000000u, 0x00EC001Bu, 0x08361800u, 0x20B08800u, 0x00000000u,
+        0x00EC201Bu, 0x08363800u, 0x20B04800u, 0x00000000u, 0x00EC401Bu,
+        0x08365800u, 0x20902800u, 0x00000000u, 0x00EC601Bu, 0x08367800u,
+        0x20901800u, 0x00000000u, 0x018D4000u, 0x05FF5800u, 0x21B00000u,
+        0x00000000u, 0x0647401Au, 0xC4355BFFu, 0x10B8E800u, 0x00000000u,
+        0x00ECC01Bu, 0x0836D800u, 0x20B08848u, 0x00000000u, 0x00ECE01Bu,
+        0x0836F800u, 0x20B04848u, 0x00000000u, 0x00ED001Bu, 0x08371800u,
+        0x20A02848u, 0x00000000u, 0x00ED201Bu, 0x08373800u, 0x20A01848u,
+        0x00000000u, 0x004C80FFu, 0xB4369800u, 0x20A0F818u, 0x00000000u,
+        0x0087601Au, 0xC400286Au, 0xF0B0E801u};
+        std::string error;
+        const auto p = gfx::vsh::decode(words, sizeof words / 4, &error);
+        CHECK(p.has_value() && p->code.size() == 13 && p->code.back().final);
+        if (p) {
+            const std::string text = gfx::vsh::disassemble(*p);
+            CHECK(text == R"(dp4 r0.x, v0, c5
+dp4 oPos.x, v0, c0
+dp4 oPos.y, v0, c1
+dp4 oPos.z, v0, c2
+dp4 oPos.w, v0, c3
+sge r11.w, r0.x, c10.w
+mul oPos.xyz, oPos.xyzz, c-38.xyzz
+  + rcc r1.x, oPos.w
+dp4 oT0.x, v0, c6
+dp4 oT0.y, v0, c7
+dp4 oT0.z, v0, c8
+dp4 oT0.w, v0, c9
+mul oD0, r11.w, c4
+mad oPos.xyz, oPos.xyzz, r1.x, c-37.xyzz
+)");
+            if (text != R"(dp4 r0.x, v0, c5
+dp4 oPos.x, v0, c0
+dp4 oPos.y, v0, c1
+dp4 oPos.z, v0, c2
+dp4 oPos.w, v0, c3
+sge r11.w, r0.x, c10.w
+mul oPos.xyz, oPos.xyzz, c-38.xyzz
+  + rcc r1.x, oPos.w
+dp4 oT0.x, v0, c6
+dp4 oT0.y, v0, c7
+dp4 oT0.z, v0, c8
+dp4 oT0.w, v0, c9
+mul oD0, r11.w, c4
+mad oPos.xyz, oPos.xyzz, r1.x, c-37.xyzz
+)") std::fprintf(stderr, "%s", text.c_str());
+            CHECK(p->code[6].ilu == gfx::vsh::Ilu::Rcc && p->code[6].ilu_temp() == 1);  // the ILU writes r1 beside a MAC
+        }
+        const uint32_t not_vsh[] = {0x12345678u};
+        CHECK(!gfx::vsh::decode(not_vsh, 1, &error).has_value());
+    }
+
     gfx::Config cfg;
     cfg.width = 64;
     cfg.height = 48;
@@ -31,7 +91,11 @@ int main(int argc, char** argv) {
     std::string error;
     auto r = gfx::Renderer::create(cfg, &error);
     if (!r) {
-        std::printf("skipped: %s\n", error.c_str());
+        if (failures) {  // the GPU-free checks above still count
+            std::fprintf(stderr, "%d check(s) failed\n", failures);
+            return 1;
+        }
+        std::printf("renderer tests skipped: %s\n", error.c_str());
         return 77;
     }
     std::printf("device: %s\n", r->device_name().c_str());

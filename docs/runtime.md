@@ -1,6 +1,6 @@
 # Runtime: status (roadmap step 3)
 
-Last updated 2026-11-18 (v0.16.0: guest RAM mapped at the kernel's windows too; D3D's resource code lifted; the game creates its textures and stops at its first vertex shader. v0.15.0: audio starts, `audio.md`; the renderer and Direct3D are in `graphics.md`).
+Last updated 2026-11-18 (v0.17.0: the game creates its shaders and stops at its first transform; v0.16.0: guest RAM mapped at the kernel's windows too; D3D's resource code lifted; the game creates its textures and stops at its first vertex shader. v0.15.0: audio starts, `audio.md`; the renderer and Direct3D are in `graphics.md`).
 
 The runtime is everything the lifted game code needs that isn't lifted: guest memory, the Xbox kernel, D3D, DirectSound/XACT and the other XDK libraries. All of it is replaced natively (HLE); none of it is emulated.
 
@@ -123,7 +123,7 @@ Names are matched case-insensitively, as on FATX and the disc's XDVDFS (an exact
 
 **DirectSound** (`recomp/runtime/host/dsound.cpp`) over the software mixer, beneath the lifted XACT. See `audio.md`.
 
-**Where it stops now:** the game's `main` creates its graphics device on Vulkan, starts XACT (the engine, DirectSound, the effects image, the mix-bin headroom), checks its wave banks and the controller ports, loads `bundles/common.bnl` and the font, registers their resources, creates its textures, and stops at its first vertex shader: `D3DDevice_CreateVertexShader` from `0x65F37`. In v0.15.0 it stopped at the first texture. Earlier, start-up writes the title's save metadata and images to `partition1/UDATA/4d530053/`, gets cache partition 5 formatted with 64 KB clusters and mounted as Z:, and checks that `D:\loctext\english` exists. With a disc file missing, the game shows its disc-error screen, as the console does: it loads `dirtydisk_bitmap` and draws the message into the front buffer (`LockRect`). In v0.14.0 it stopped at the audio engine; in v0.13.0 at the first Direct3D call; in v0.12.0 at the first `NtOpenFile`.
+**Where it stops now:** the game's `main` creates its graphics device on Vulkan, starts XACT (the engine, DirectSound, the effects image, the mix-bin headroom), checks its wave banks and the controller ports, loads `bundles/common.bnl` and the font, registers their resources, creates its textures, assembles and creates its 24 vertex shaders and its pixel shaders, and stops at its first transform: `D3DDevice_SetTransform` from `0xF651A`. In v0.16.0 it stopped at the first vertex shader; in v0.15.0 at the first texture. Earlier, start-up writes the title's save metadata and images to `partition1/UDATA/4d530053/`, gets cache partition 5 formatted with 64 KB clusters and mounted as Z:, and checks that `D:\loctext\english` exists. With a disc file missing, the game shows its disc-error screen, as the console does: it loads `dirtydisk_bitmap` and draws the message into the front buffer (`LockRect`). In v0.14.0 it stopped at the audio engine; in v0.13.0 at the first Direct3D call; in v0.12.0 at the first `NtOpenFile`.
 
 ## Tests
 
@@ -131,7 +131,7 @@ Names are matched case-insensitively, as on FATX and the disc's XDVDFS (an exact
 
 ## Next
 
-1. **Shaders and drawing** (`graphics.md`): the game creates its first vertex shader next.
+1. **State, shaders and drawing** (`graphics.md`): the game sets its first transform next.
 2. **A window, input and audio output** on SDL3 (the controller to test against: an Xbox One pad over Bluetooth).
 3. **Audio still to come** (`audio.md`): streams (streamed wave banks, music), WMA, the I3DL2 reverb, envelopes, LFOs, filters, 3D.
 4. **The scheduler:** guest threads (`PsCreateSystemThreadEx`), waits, events, timers and DPCs. Until then a second thread stops the runtime.
