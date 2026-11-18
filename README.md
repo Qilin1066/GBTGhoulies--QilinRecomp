@@ -14,7 +14,8 @@ Roadmap step 2, **recompiler core**, is in progress.
 | x86 decoder (Zydis, vendored) | ✅ agrees with LLVM on every reachable instruction |
 | Function discovery + CFG (recursive descent, switch tables, C++ EH tables, data-as-code validation) | ✅ 8,842 functions, 556 jump tables (every one in lifted code has a proven size); **100% of the lifted code accounted for** (`qilin coverage`: 0 unknown bytes in the game code, Rare libraries and EH funclets) |
 | Lifter → C++ (integer, scalar SSE, x87 with the game's 24-bit precision control, jump tables, string ops; direct, indirect and tail calls; C++ exception frames) | ✅ all 5,743 functions (game code + Rare libraries; 3 more there belong to Bink and are replaced with it), differentially tested against the original x86 under Unicorn, whole call trees included, also under UBSan: 0 mismatches |
-| Runtime, HLE, Vulkan | later (see roadmap) |
+| Runtime: `qilin_run` loads the game and runs the lifted `main`, with a registry of native replacements for everything that isn't lifted | 🔨 started: 5 XAPI replacements; it now stops at the C runtime's `sprintf` (see `docs/runtime.md`) |
+| HLE of the XDK libraries, Vulkan | later (see roadmap) |
 
 ## Versions and changes
 
@@ -75,7 +76,8 @@ This runs the unit tests and the CFG pass, then cross-checks Zydis against LLVM'
 | `recomp/src/` | Recompiler core: `xbe` loader, `decoder` (Zydis wrapper), `cfg` (function discovery + control flow), `lifter` (x86 → C++), `main` (CLI) |
 | `recomp/tests/` | Unit tests on a synthetic in-memory XBE, so they need no game files |
 | `tools/analysis/` | The original Python analysis prototype, using LLVM via ctypes. Kept as the reference the C++ port is checked against |
-| `recomp/runtime/` | Runtime header the generated C++ includes (guest memory, flag and float helpers) |
+| `recomp/runtime/` | Runtime headers the generated C++ includes (guest memory, flag and float helpers, x87 maths) |
+| `recomp/runtime/host/` | The runtime's host side: `qilin_run`, the replacement registry, the guest heap and the replacements themselves |
 | `tools/check/` | The LLVM decoder cross-check, the x87 rounding and transcendental cross-checks, the C++ exception-handling report and the full local check script |
 | `tools/difftest/` | Differential test: lifted C++ against the original x86 under Unicorn |
 | `third_party/` | Vendored dependencies: Zydis and Zycore, MIT licensed. See `third_party/README.md` |

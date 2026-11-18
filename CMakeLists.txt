@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.25)
 # The single source of the version number (see CHANGELOG.md for the scheme).
-project(GBTGQilincomp VERSION 0.9.0 LANGUAGES C CXX)
+project(GBTGQilincomp VERSION 0.10.0 LANGUAGES C CXX)
 
 # ---- Language: C++23 everywhere (recompiler, runtime, generated code) ----
 set(CMAKE_CXX_STANDARD 23)
@@ -92,3 +92,22 @@ add_test(NAME qilin_tests COMMAND qilin_tests)
 add_executable(qilin_x87_consistency tools/check/x87/consistency.cpp)
 target_link_libraries(qilin_x87_consistency PRIVATE qilin_runtime qilin_warnings)
 add_test(NAME qilin_x87_consistency COMMAND qilin_x87_consistency 200000)
+
+# ---- Runtime host side: native replacements (HLE) for code that isn't lifted ----
+add_library(qilin_host STATIC recomp/runtime/host/host.cpp recomp/runtime/host/xapi.cpp)
+target_include_directories(qilin_host PUBLIC recomp/runtime/host)
+target_link_libraries(qilin_host PUBLIC qilin_runtime PRIVATE qilin_warnings)
+add_executable(qilin_host_tests recomp/runtime/host/host_tests.cpp)
+target_link_libraries(qilin_host_tests PRIVATE qilin_host qilin_warnings)
+add_test(NAME qilin_host_tests COMMAND qilin_host_tests)
+
+# qilin_run: the game, from `qilin lift` output (needs your own default.xbe):
+#   qilin lift default.xbe --out gen && cmake -B build -DQILIN_GEN_DIR=$PWD/gen
+set(QILIN_GEN_DIR "" CACHE PATH "qilin lift output directory to build qilin_run from")
+if(QILIN_GEN_DIR)
+    file(GLOB QILIN_GEN_SOURCES CONFIGURE_DEPENDS "${QILIN_GEN_DIR}/*.cpp")
+    add_executable(qilin_run recomp/runtime/host/run.cpp recomp/runtime/dispatch.cpp ${QILIN_GEN_SOURCES})
+    target_include_directories(qilin_run PRIVATE "${QILIN_GEN_DIR}")
+    target_compile_definitions(qilin_run PRIVATE QILIN_CHECKED_MEMORY)  # bring-up: bad guest accesses stop with an address
+    target_link_libraries(qilin_run PRIVATE qilin_host qilin_core)
+endif()

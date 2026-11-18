@@ -11,6 +11,16 @@ Each release is a git tag (`vX.Y.Z`) with a matching GitHub release. The version
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-11-18
+The runtime's first slice: the game runs. `qilin_run` calls the lifted `main`, which runs until the first function the runtime doesn't provide yet.
+
+### Added
+- **`qilin_run`** (built with `-DQILIN_GEN_DIR=<qilin lift output>`). It loads `default.xbe` into 64 MB of guest RAM and sets up the main thread's stack and information block. Kernel imports keep `0x80000000 | ordinal`, and data exports point at objects. It then calls the game's `main` at `0x32390`, replacing XAPI's start-up. See `docs/runtime.md`.
+- **The replacement registry** (`recomp/runtime/host/`): `rt::call_unlifted` runs the native replacement registered for a guest address. Anything else stops the game and names the target ("kernel NtCreateFile (ordinal 190)", "crt code at …") and its caller. It includes stdcall helpers and a page-granular guest heap.
+- **Kernel export table** from nxdk's `xboxkrnl.exe.def` (CC0, vendored in `third_party/nxdk/`): names, ordinals, argument sizes, and data and fastcall flags.
+- **First XAPI replacements:** `QueryPerformanceCounter` (host time at the Xbox's 733 MHz), `QueryPerformanceFrequency`, `GlobalMemoryStatus`, `XGetLaunchInfo` (cold boot) and `XGetLanguage` (English). The game now gets through them and stops at the C runtime's `sprintf`.
+- **`qilin_host_tests`** (CI): the export table, the registry and stdcall conventions, and the guest heap.
+
 ## [0.9.0] - 2026-11-18
 The x87 transcendentals give the same bits on every host. That was the last open item in the recompiler core.
 
