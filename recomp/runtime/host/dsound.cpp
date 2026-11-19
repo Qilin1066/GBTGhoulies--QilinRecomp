@@ -12,8 +12,8 @@
 // callback) never runs under it.
 //
 // Settings that change a voice's sound but aren't applied (LFOs, the
-// parametric EQ) are recorded and named once at run time. Anything not
-// modelled at all stops the runtime with its name.
+// multi envelope, mix bin headroom) are named once at run time if the game
+// uses them. Anything not modelled at all stops the runtime with its name.
 #include <algorithm>
 #include <atomic>
 #include <bit>
@@ -80,6 +80,13 @@ struct Buffer {
     // voice uses them (Use3DVoiceData).
     uint32_t d3[14] = {};
     bool has_3d = false, use_3d = false;
+    // A submix (DSBCAPS_MIXIN) buffer's status: it mixes whatever feeds it
+    // from the moment it's made, but GetStatus reports it playing only
+    // between a Play and a Stop of its own, as the original's does (the
+    // buffer's voice state, 0x1CDAFC, which nothing sets for a buffer never
+    // played). XACT's sound sources are such buffers, never played, and a
+    // source counts as free again once its status is 0 and no cue holds it.
+    bool submix_played = false;
 };
 
 // A packet the mixer finished (or a flush dropped), waiting to be reported
@@ -93,6 +100,7 @@ struct DirectSound {
     std::mutex m;  // everything below; never held while guest code runs
     uint32_t object = 0, refs = 0;
     std::map<uint32_t, std::unique_ptr<Buffer>> buffers;  // by guest address
+    std::vector<uint32_t> spare_objects;                  // guest slots for object headers, free
     std::chrono::steady_clock::time_point epoch;
     platform::AudioOut* out = nullptr;  // the speakers, if there's a sound device
     uint64_t mixed = 0;  // output frames mixed so far
@@ -123,12 +131,24 @@ DirectSound& ds() {
 }
 using Lock = std::unique_lock<std::mutex>;
 
-// Guest memory for object headers, so the game and XACT hold real pointers.
-uint32_t guest_object() {
-    const uint32_t a = contiguous(0x1000, 0, kPhysicalLimit - 1, 0x1000, 4);
-    if (!a) rt::trap(0, "DirectSound: out of guest memory for objects");
+// Guest memory for object headers, so the game and XACT hold real
+// pointers: 64-byte slots carved from pages of contiguous memory, a
+// released object's slot used again (the lock held). XACT makes and
+// releases a buffer and a stream or two for every sound it plays.
+constexpr uint32_t kObjectBytes = 64;
+uint32_t guest_object(rt::Context& c) {
+    std::vector<uint32_t>& spare = ds().spare_objects;
+    if (spare.empty()) {
+        const uint32_t page = contiguous(0x1000, 0, kPhysicalLimit - 1, 0x1000, 4);
+        if (!page) rt::trap(0, "DirectSound: out of guest memory for objects");
+        for (uint32_t at = 0x1000; at >= kObjectBytes; at -= kObjectBytes) spare.push_back(page + at - kObjectBytes);
+    }
+    const uint32_t a = spare.back();
+    spare.pop_back();
+    std::memset(c.mem + a, 0, kObjectBytes);
     return a;
 }
+void free_guest_object(uint32_t a) { ds().spare_objects.push_back(a); }
 
 Buffer& buffer(rt::Context& c, uint32_t a, const char* fn) {
     auto it = ds().buffers.find(a);
@@ -292,6 +312,11 @@ audio::Format read_format(rt::Context& c, uint32_t wfx, const char* fn) {
     return f;
 }
 
+// A new voice's headroom, as the original's settings start it (0x1C8249):
+// none for a submix or effects-input buffer (flags 0x182000) or a 3D
+// voice (0x200010), else 6 dB.
+int32_t default_headroom(uint32_t flags) { return (flags & 0x182000) || (flags & 0x200010) ? 0 : 600; }
+
 // DSMIXBINS: dwMixBinCount, lpMixBinVolumePairs ({dwMixBin, lVolume} each).
 std::vector<audio::MixBinVolume> read_mix_bins(rt::Context& c, uint32_t p) {
     std::vector<audio::MixBinVolume> v;
@@ -313,7 +338,7 @@ void direct_sound_create(rt::Context& c) {
     Lock lock_(ds().m);
     DirectSound& d = ds();
     if (!d.object) {
-        d.object = guest_object();
+        d.object = guest_object(c);
         d.epoch = std::chrono::steady_clock::now();
         d.mem = c.mem, d.mem_size = c.mem_size;
         d.mixer = std::thread(mixer_thread);
@@ -361,7 +386,8 @@ void create_sound_buffer(rt::Context& c) {
         b->voice.set_format(read_format(c, wfx, "IDirectSound_CreateSoundBuffer"));
     }
     b->voice.mix_bins = read_mix_bins(c, bins);
-    const uint32_t obj = guest_object();
+    b->voice.headroom = default_headroom(flags);
+    const uint32_t obj = guest_object(c);
     ds().buffers[obj] = std::move(b);
     st(c, out, obj);
     ret(c, kDsOk, 16);
@@ -376,7 +402,8 @@ void buffer_release(rt::Context& c) {
         catch_up(c);
         for (auto& [addr, other] : ds().buffers)
             if (other->output == a) unmodelled("IDirectSoundBuffer_Release", "releasing a submix buffer other buffers still feed");
-        ds().buffers.erase(a);  // its guest header page stays allocated: freeing contiguous memory isn't modelled
+        ds().buffers.erase(a);
+        free_guest_object(a);
     }
     ret(c, refs, 4);
 }
@@ -435,7 +462,7 @@ void apply_3d(Buffer& b) {
 
 BUFFER_SETTER(set_volume, 8, b.voice.volume = std::clamp(int32_t(arg(c, 1)), audio::kVolumeMin, 0))
 BUFFER_SETTER(set_pitch, 8, b.voice.pitch = int32_t(arg(c, 1)))
-BUFFER_SETTER(set_headroom, 8, b.voice.headroom = int32_t(arg(c, 1)))
+BUFFER_SETTER(set_headroom, 8, b.voice.headroom = std::clamp(int32_t(arg(c, 1)), 0, 10000))
 BUFFER_SETTER(set_mix_bins, 8, b.voice.mix_bins = read_mix_bins(c, arg(c, 1)))
 // SetMixBinVolumes changes the volumes of bins the voice already feeds.
 BUFFER_SETTER(set_mix_bin_volumes, 8, {
@@ -475,7 +502,10 @@ BUFFER_SETTER(use_3d_voice_data, 8, {
 BUFFER_SETTER(set_loop_region, 12, b.voice.set_loop_region(arg(c, 1), arg(c, 2)))
 BUFFER_SETTER(set_play_region, 12, b.voice.set_play_region(arg(c, 1), arg(c, 2)))
 BUFFER_SETTER(set_current_position, 8, b.voice.set_position(arg(c, 1)))
-BUFFER_SETTER(stop, 4, b.voice.stop())
+BUFFER_SETTER(stop, 4, {
+    if (b.voice.submix()) b.submix_played = false;
+    else b.voice.stop();
+})
 
 // HRESULT Set3DVoiceData(LPDIRECTSOUNDBUFFER, LPCDS3DVOICEDATA): the 3D
 // calculator's results (the game runs DirectSound's own, lifted), as the
@@ -621,8 +651,12 @@ void play(rt::Context& c) {
     Buffer& b = buffer(c, arg(c, 0), "IDirectSoundBuffer_Play");
     const uint32_t flags = arg(c, 3);
     if (flags & 4) unmodelled("IDirectSoundBuffer_Play", "DSBPLAY_SYNCHPLAYBACK");
-    if (flags & 2) b.voice.set_position(0);
-    b.voice.play((flags & 1) != 0);
+    if (b.voice.submix()) {
+        b.submix_played = true;  // its input plays whether it's started or not
+    } else {
+        if (flags & 2) b.voice.set_position(0);
+        b.voice.play((flags & 1) != 0);
+    }
     ret(c, kDsOk, 16);
 }
 
@@ -635,7 +669,9 @@ void stop_ex(rt::Context& c) {
     Buffer& b = buffer(c, arg(c, 0), "IDirectSoundBuffer_StopEx");
     if (arg(c, 1) || arg(c, 2)) unmodelled("IDirectSoundBuffer_StopEx", "stopping at a time stamp");
     const uint32_t flags = arg(c, 3);
-    if (flags & 2) {
+    if (b.voice.submix()) {
+        b.submix_played = false;
+    } else if (flags & 2) {
         if (b.voice.playing()) b.voice.play(false);  // leave the loop, finish the region
     } else if (flags & 1) {
         b.voice.release();  // the envelope's release, then it stops
@@ -646,12 +682,14 @@ void stop_ex(rt::Context& c) {
 }
 
 // HRESULT IDirectSoundBuffer_GetStatus(LPDIRECTSOUNDBUFFER, LPDWORD pdwStatus):
-// DSBSTATUS_PLAYING (1), DSBSTATUS_LOOPING (4).
+// DSBSTATUS_PLAYING (1), DSBSTATUS_LOOPING (4). A submix buffer's is its
+// own Play and Stop (Buffer::submix_played), not whether it's mixing.
 void get_status(rt::Context& c) {
     Lock lock_(ds().m);
     catch_up(c);
     Buffer& b = buffer(c, arg(c, 0), "IDirectSoundBuffer_GetStatus");
-    st(c, arg(c, 1), b.voice.playing() ? (b.voice.looping() ? 5u : 1u) : 0u);
+    const bool on = b.voice.submix() ? b.submix_played : b.voice.playing();
+    st(c, arg(c, 1), on ? (b.voice.looping() ? 5u : 1u) : 0u);
     ret(c, kDsOk, 8);
 }
 
@@ -740,7 +778,8 @@ void create_sound_stream(rt::Context& c) {
     b->voice.set_format(read_format(c, wfx, fn));
     b->voice.make_stream();
     b->voice.mix_bins = read_mix_bins(c, ld(c, desc + 20));
-    const uint32_t obj = guest_object();
+    b->voice.headroom = default_headroom(flags);
+    const uint32_t obj = guest_object(c);
     st(c, obj, kStreamVtable);
     st(c, obj + 4, kStreamInnerVtable);
     ds().buffers[obj] = std::move(b);
@@ -766,6 +805,7 @@ void stream_release(rt::Context& c) {
         catch_up(c);
         if (!b.packets.empty()) unmodelled("CDirectSoundStream_Release", "releasing a stream with packets still attached");
         ds().buffers.erase(a);
+        free_guest_object(a);
     }
     ret(c, refs, 4);
 }

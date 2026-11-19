@@ -402,7 +402,8 @@ bool Voice::process(const uint8_t* mem, size_t mem_size, uint32_t frames) {
 void Voice::mix(const uint8_t* mem, size_t mem_size, Bins& out, uint32_t frames, Voice* submix) {
     if (!process(mem, mem_size, frames)) return;
     if (submix) feed(submix, frames);
-    // Each route: the bin it feeds at the voice's volume plus the route's
+    // Each route: the bin it feeds at the voice's volume less its headroom
+    // (DirectSound keeps the two as one figure, 0x1C5E00) plus the route's
     // (and a 3D voice's offset for its bin), through the APU's attenuation
     // curve. A gain moves from the last block's in 32 steps over the first
     // frame (32 samples), as the hardware ramps it, and a voice just
@@ -420,7 +421,7 @@ void Voice::mix(const uint8_t* mem, size_t mem_size, Bins& out, uint32_t frames,
         const uint32_t bin = bins[k].bin;
         if (bin >= kMixBinCount) continue;
         const uint32_t c = ch == 1 ? 0 : uint32_t(k % ch);
-        const int64_t mb = int64_t(volume) + bins[k].volume + (three_d.active ? three_d.bin_offset[bin] : 0);
+        const int64_t mb = int64_t(volume) - headroom + bins[k].volume + (three_d.active ? three_d.bin_offset[bin] : 0);
         const float g = float(attenuation_gain(attenuation_for(mb))) / 16384.0f;
         const float from = fresh_ ? 0.0f : route_gain_[k] < 0 ? g : route_gain_[k];
         route_gain_[k] = g;
@@ -459,7 +460,7 @@ void Voice::mix_into(const uint8_t* mem, size_t mem_size, Voice& submix, uint32_
 
 void Voice::feed(Voice* target, uint32_t frames) {
     Voice& submix = *target;
-    const float g = float(attenuation_gain(attenuation_for(volume))) / 16384.0f;
+    const float g = float(attenuation_gain(attenuation_for(int64_t(volume) - headroom))) / 16384.0f;
     const uint32_t dst = submix.format_.channels, ch = format_.channels;
     if (submix.input_.size() < size_t(frames) * dst) submix.input_.resize(size_t(frames) * dst, 0.0f);
     for (uint32_t c = 0; c < ch; ++c) {

@@ -11,6 +11,13 @@ Each release is a git tag (`vX.Y.Z`) with a matching GitHub release. The version
 
 ## [Unreleased]
 
+## [0.33.5] - 2026-11-19
+
+### Fixed
+- **Sound stopped after the intro**: music and effects went silent about a minute in and stayed silent through the menus and play; only the videos' sound was heard. XACT's sound sources are DirectSound submix buffers, and `GetStatus` reported a submix buffer as always playing. The game reuses a pool of 48 sources as they come free, and none ever did, so the 49th sound and every one after it was never played. A submix buffer's status is now its own Play and Stop, as the original's `GetStatus` has it.
+- **Everything XACT plays was 6 dB too loud**: a voice's headroom (`SetHeadroom`, and DirectSound's default of 6 dB for a voice that isn't 3D) was stored and never applied. It comes off the volume now, as the original programs it. The clipping v0.33.1 limited was this: the same stretch of play now peaks at 0.65 of full scale.
+- **Guest memory no longer leaks a page for every sound**: DirectSound object headers come from 64-byte slots that are reused when the object is released. Before, each buffer and stream took a 4 KB page of the console's 64 MB that was never returned.
+
 ## [0.33.4] - 2026-11-19
 
 ### Fixed

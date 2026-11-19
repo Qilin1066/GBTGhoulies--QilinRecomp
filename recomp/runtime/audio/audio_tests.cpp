@@ -60,6 +60,13 @@ int main() {
     out = stereo(v, 1);
     CHECK(near(out[0], 0.25f, 1e-3f));
     v.volume = 0;
+    // Headroom comes off the volume: 602 of it is the same half amplitude.
+    v.headroom = 602;
+    v.set_position(0);
+    v.play(false);
+    out = stereo(v, 1);
+    CHECK(near(out[0], 0.25f, 1e-3f));
+    v.headroom = 0;
 
     // A loop keeps it playing past the end; a 24 kHz voice plays at half speed.
     out.assign(16, 0.0f);

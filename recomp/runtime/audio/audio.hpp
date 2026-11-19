@@ -142,6 +142,8 @@ public:
     bool playing() const { return playing_; }
     bool looping() const { return looping_; }
 
+    // headroom: millibels taken off the volume (SetHeadroom). DirectSound
+    // starts a voice with 600, or 0 for a 3D or submix voice (dsound.cpp).
     int32_t volume = 0, pitch = 0, headroom = 0;
     std::vector<MixBinVolume> mix_bins;  // which bins each channel feeds, in channel order
     Voice3d three_d;
