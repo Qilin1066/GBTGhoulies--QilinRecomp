@@ -146,6 +146,10 @@ struct D3dConfig {
 void register_d3d(const D3dConfig& config);
 const D3dConfig& d3d_config();
 
+// The console's audio setting the game reads (ExQueryNonVolatileSetting):
+// surround with Dolby Digital when the output is 5.1, else stereo.
+void set_audio_surround(bool surround);
+
 // DirectSound (dsound.cpp), over the software mixer; dump_wav non-empty
 // writes everything mixed there (--dump-audio).
 void register_dsound(const std::string& dump_wav, platform::AudioOut* out);
@@ -228,6 +232,7 @@ struct Region {
 };
 void set_regions(std::vector<Region> regions);  // the loader's map of code regions, for describe()
 std::string describe(uint32_t guest_addr);      // "kernel NtCreateFile (ordinal 190)", "D3D8 D3DDevice_Clear (00176970)", "XAPI code at ..."
+rt::Context* current_context();
 void set_current(rt::Context* c);               // the context trap() reports registers from
 
 }  // namespace qilin::host

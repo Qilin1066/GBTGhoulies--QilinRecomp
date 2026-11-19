@@ -31,7 +31,10 @@ enum FsUniform : uint32_t {
     kFsFogColor = 18,  // rgb
     kFsAlphaRef = 19,  // x: the alpha test's reference, 0..1
     kFsTexScale = 20,  // [4] per stage: xy multiply the coordinates (texel units for linear textures, else 1)
-    kFsUniformVec4s = 24,
+    kFsFogParams = 24, // xy: the fog unit's two parameters (fog_mode)
+    kFsBumpMat = 25,   // [4] per stage: the bump-environment matrix's four entries, in the GPU's order
+    kFsBumpLum = 29,   // [4] per stage: x the luminance scale, y its offset (BUMPENVMAP_LUM)
+    kFsUniformVec4s = 33,
 };
 
 // What decides a fragment shader (the constants are uniforms, so they don't).
@@ -42,7 +45,15 @@ struct CombinerSetup {
     uint32_t texture_modes = 0;   // PSTextureModes: 5 bits a stage
     uint32_t input_texture = 0, dot_mapping = 0, compare_mode = 0;
     uint32_t alpha_func = 0;      // 0 none (alpha test off), else D3DCMP_* (0x200 + n)
+    // The fog unit: 0 off (the fog register's alpha is the interpolated fog
+    // value), else the NV2A's mode: 0x2601 linear, 0x800 exp, 0x801 exp2,
+    // computed per pixel from the fog coordinate with kFsFogParams.
+    uint32_t fog_mode = 0;
     uint8_t texture_dims[4] = {}; // per stage: 0 none bound, 2 2D, 3 3D, 6 cube
+    // Point sprites (D3DRS_POINTSPRITEENABLE on a point list): stages 0-2
+    // take the position within the point, (0, 0) top left to (1, 1), for
+    // their texture coordinates; stage 3 keeps its own.
+    uint32_t point_sprite = 0;
 
     bool operator==(const CombinerSetup&) const = default;
     uint64_t hash() const;

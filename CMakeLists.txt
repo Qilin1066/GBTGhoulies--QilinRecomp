@@ -7,7 +7,7 @@ if(APPLE AND NOT CMAKE_OSX_DEPLOYMENT_TARGET)
     set(CMAKE_OSX_DEPLOYMENT_TARGET 10.15 CACHE STRING "oldest macOS the runtime runs on")
 endif()
 # The single source of the version number (see CHANGELOG.md for the scheme).
-project(GBTGQilincomp VERSION 0.29.0 LANGUAGES C CXX)
+project(GBTGQilincomp VERSION 0.30.0 LANGUAGES C CXX)
 
 # ---- Language: C++23 everywhere (recompiler, runtime, generated code) ----
 set(CMAKE_CXX_STANDARD 23)
@@ -130,7 +130,7 @@ add_test(NAME qilin_gfx_tests COMMAND qilin_gfx_tests)
 set_tests_properties(qilin_gfx_tests PROPERTIES SKIP_RETURN_CODE 77)
 
 # ---- Audio engine: voices and the software mixer ----
-add_library(qilin_audio STATIC recomp/runtime/audio/voice.cpp)
+add_library(qilin_audio STATIC recomp/runtime/audio/voice.cpp recomp/runtime/audio/reverb.cpp)
 target_include_directories(qilin_audio PUBLIC recomp/runtime/audio)
 target_link_libraries(qilin_audio PRIVATE qilin_warnings)
 add_executable(qilin_audio_tests recomp/runtime/audio/audio_tests.cpp)
@@ -169,7 +169,7 @@ target_include_directories(qilin_platform PUBLIC recomp/runtime/platform)
 target_link_libraries(qilin_platform PUBLIC SDL3::SDL3 PRIVATE qilin_warnings)
 
 # ---- Runtime host side: native replacements (HLE) for code that isn't lifted ----
-add_library(qilin_host STATIC recomp/runtime/host/host.cpp recomp/runtime/host/xapi.cpp recomp/runtime/host/kernel.cpp recomp/runtime/host/kernel_crypto.cpp
+add_library(qilin_host STATIC recomp/runtime/host/host.cpp recomp/runtime/host/xapi.cpp recomp/runtime/host/kernel.cpp recomp/runtime/host/kernel_crypto.cpp recomp/runtime/host/sched.cpp
                               recomp/runtime/host/kernel_io.cpp recomp/runtime/host/xinput.cpp
                               recomp/runtime/host/call_guest.cpp recomp/runtime/host/d3d.cpp
                               recomp/runtime/host/dsound.cpp recomp/runtime/host/guest_ram.cpp)

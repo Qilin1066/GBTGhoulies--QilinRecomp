@@ -30,7 +30,7 @@ std::vector<Region>& regions() {
     static std::vector<Region> r;
     return r;
 }
-rt::Context* g_current = nullptr;
+thread_local rt::Context* g_current = nullptr;
 
 }  // namespace
 
@@ -251,6 +251,7 @@ void set_memory_map(MemoryMap m) { g_map = m; }
 
 void set_regions(std::vector<Region> r) { regions() = std::move(r); }
 void set_current(rt::Context* c) { g_current = c; }
+rt::Context* current_context() { return g_current; }
 
 namespace {
 // XDK library symbols found by signature (tools/gen/xdk_symbols.py), then the
@@ -340,7 +341,8 @@ void mmio_write32(uint32_t addr, uint32_t value, uint32_t at) {
     if (const Context* c = host::g_current)
         std::fprintf(stderr, "  eax %08X ecx %08X edx %08X ebx %08X esp %08X ebp %08X esi %08X edi %08X\n", c->eax,
                      c->ecx, c->edx, c->ebx, c->esp, c->ebp, c->esi, c->edi);
-    std::exit(3);
+    std::fflush(stderr);
+    std::_Exit(3);  // other guest threads may be blocked: no static destructors
 }
 
 }  // namespace qilin::rt

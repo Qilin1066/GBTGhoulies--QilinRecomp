@@ -28,13 +28,12 @@ constexpr int16_t kStep[89] = {
     15289, 16818, 18500, 20350, 22385, 24623, 27086, 29794, 32767};
 constexpr int8_t kIndexAdjust[8] = {-1, -1, -1, -1, 2, 4, 6, 8};
 
-// dB/100 to a linear gain.
+}  // namespace
+
 float gain(int32_t millibels) {
     if (millibels <= kVolumeMin) return 0.0f;
     return float(std::pow(10.0, double(std::min(millibels, 0)) / 2000.0));
 }
-
-}  // namespace
 
 // IMA ADPCM with the Xbox's layout: per channel, a 4-byte header (the
 // predictor as a signed 16-bit sample, the step index, a reserved byte),
@@ -102,11 +101,95 @@ uint32_t Voice::position_bytes() const { return uint32_t(format_.frames_to_bytes
 
 void Voice::play(bool looping) {
     looping_ = looping;
+    const bool was = playing_;
     if (!playing_ && (pos_ < double(play_start_) || pos_ >= double(region_end()))) pos_ = double(play_start_);
     playing_ = bytes_ != 0 || submix_;
+    if (playing_ && !was) start_envelope();
 }
 
 void Voice::stop() { playing_ = false; }
+
+// ---------------------------------------------------------------- envelope and filter
+void Voice::set_envelope(const Envelope& e) {
+    const bool was_off = eg_.mode == 0;
+    eg_ = e;
+    if (e.mode == 0) stage_ = Stage::Off, level_ = 1.0f;
+    else if (was_off && playing_ && stage_ == Stage::Off) start_envelope();
+}
+
+void Voice::start_envelope() {
+    stage_frames_ = 0;
+    switch (eg_.mode) {
+        case 1: stage_ = Stage::Delay, level_ = 0.0f; break;
+        case 2: stage_ = Stage::Attack, level_ = 0.0f; break;
+        case 3: stage_ = Stage::Hold, level_ = 1.0f; break;
+        default: stage_ = Stage::Off, level_ = 1.0f; break;
+    }
+}
+
+void Voice::release() {
+    if (stage_ == Stage::Off || !playing_) {
+        stop();
+        return;
+    }
+    if (stage_ == Stage::Release) return;
+    stage_ = Stage::Release, stage_frames_ = 0, release_from_ = level_;
+}
+
+float Voice::envelope_step() {
+    constexpr uint64_t kUnit = 512;  // frames per envelope time unit
+    // Each stage runs its length in frames, then hands the frame on to the
+    // next (a zero-length stage takes none).
+    for (;;) {
+        const uint64_t n = stage_frames_;
+        auto next = [&](Stage s) { stage_ = s, stage_frames_ = 0; };
+        switch (stage_) {
+            case Stage::Off: return 1.0f;
+            case Stage::Delay:
+                if (n >= eg_.delay * kUnit) { next(Stage::Attack); continue; }
+                level_ = 0.0f;
+                break;
+            case Stage::Attack: {
+                const uint64_t t = eg_.attack * kUnit;
+                if (n >= t) { level_ = 1.0f, next(Stage::Hold); continue; }
+                level_ = float(n + 1) / float(t);
+                break;
+            }
+            case Stage::Hold:
+                if (n >= eg_.hold * kUnit) { next(Stage::Decay); continue; }
+                level_ = 1.0f;
+                break;
+            case Stage::Decay: {
+                // To about -64 dB over the decay time (the APU's curve), or the sustain level.
+                const float sustain = float(eg_.sustain & 0xFF) / 255.0f;
+                const uint64_t t = eg_.decay * kUnit;
+                if (n >= t) { next(Stage::Sustain); continue; }
+                level_ = std::max(sustain, std::exp(-7.34f * float(n + 1) / float(t)));
+                if (level_ <= sustain) { next(Stage::Sustain); continue; }
+                break;
+            }
+            case Stage::Sustain: level_ = float(eg_.sustain & 0xFF) / 255.0f; return level_;
+            case Stage::Release: {
+                const uint64_t t = eg_.release * kUnit;
+                if (n + 1 >= t) {
+                    level_ = 0.0f;
+                    stage_ = Stage::Off;
+                    playing_ = false;  // the release over, the voice stops
+                    return 0.0f;
+                }
+                level_ = release_from_ * (1.0f - float(n + 1) / float(t));
+                break;
+            }
+        }
+        ++stage_frames_;
+        return level_;
+    }
+}
+
+void Voice::set_filter(const Filter& f) {
+    if (f.mode != filter_.mode) std::memset(filter_state_, 0, sizeof filter_state_);
+    filter_ = f;
+}
 
 // One frame as left/right floats (mono: the same in both).
 void Voice::decode_frame(const uint8_t* mem, size_t mem_size, uint64_t frame, float* lr) {
@@ -151,27 +234,120 @@ void Voice::decode_frame(const uint8_t* mem, size_t mem_size, uint64_t frame, fl
     }
 }
 
-void Voice::mix(const uint8_t* mem, size_t mem_size, float* out, uint32_t frames) {
-    if (!playing_ || (bytes_ == 0 && !submix_ && !stream_)) return;
-    // Each channel's gain into the left and right outputs: the mix bins
-    // folded down to stereo. Bins after BackRight are effect sends, which
-    // aren't modelled yet.
-    float to[2][2] = {};
-    const float base = gain(volume);
+namespace {
+
+// The DLS2 low-pass, from the hardware's two coefficients: the cutoff
+// (4096·log2 of 2·sin(π·f/48000)) and the resonance (Q = 10^(−R/20) as a
+// 16-bit fraction, R up to 22.5 dB). A two-pole resonator, as the DLS2
+// specification has it: y = K·x − b1·y[−1] − b2·y[−2], b1 = −2r·cos θ,
+// b2 = r², K = 1 + b1 + b2 (unity at DC), the poles' radius r set by the
+// resonance's sharpness at the cutoff.
+struct Dls2 {
+    float b1, b2, k;
+};
+Dls2 dls2(uint32_t cutoff_code, uint32_t resonance_code) {
+    const double fc = std::min(2.0, std::pow(2.0, double(int16_t(uint16_t(cutoff_code))) / 4096.0));
+    const double theta = 2.0 * std::asin(fc / 2.0);  // 2π·f/48000
+    const double q = std::clamp(double(resonance_code & 0xFFFF) / 65535.0, 0.0749894, 1.0);
+    const double r_db = -20.0 * std::log10(q);
+    const double sharp = std::max(0.70710678, std::pow(10.0, r_db / 20.0));
+    const double r = std::clamp(1.0 - theta / (2.0 * sharp), 0.0, 0.9999);
+    const double b1 = -2.0 * r * std::cos(theta), b2 = r * r;
+    return {float(b1), float(b2), float(1.0 + b1 + b2)};
+}
+
+bool left_side(uint32_t bin) { return bin == kFrontLeft || bin == kBackLeft || bin == kXtlkFrontLeft || bin == kXtlkBackLeft; }
+bool right_side(uint32_t bin) { return bin == kFrontRight || bin == kBackRight || bin == kXtlkFrontRight || bin == kXtlkBackRight; }
+
+}  // namespace
+
+bool Voice::process(const uint8_t* mem, size_t mem_size, uint32_t frames) {
+    if (!playing_ || (bytes_ == 0 && !submix_ && !stream_)) return false;
+    const uint32_t ch = format_.channels;
+    // The source, resampled (a 3D voice's Doppler offset on its pitch).
+    std::vector<float> inter(size_t(frames) * ch, 0.0f);
+    const float identity[2][2] = {{1, 0}, {0, 1}};
+    const int32_t own_pitch = pitch;
+    if (three_d.active) pitch += three_d.pitch_offset;
+    render(mem, mem_size, inter.data(), ch, identity, frames);
+    pitch = own_pitch;
+    scratch_.assign(size_t(frames) * ch, 0.0f);
+    // The envelope.
+    for (uint32_t i = 0; i < frames; ++i) {
+        const float g = stage_ == Stage::Off ? 1.0f : envelope_step();
+        for (uint32_t c = 0; c < ch; ++c) scratch_[size_t(c) * frames + i] = inter[size_t(i) * ch + c] * g;
+        if (!playing_ && stage_ == Stage::Off && eg_.mode) break;  // released to silence
+    }
+    // The DLS2 filter (modes 1 and 3; a stereo voice's second channel takes
+    // the second pair of coefficients). The parametric EQ isn't applied.
+    if (filter_.mode == 1 || filter_.mode == 3) {
+        for (uint32_t c = 0; c < ch; ++c) {
+            const uint32_t pair = ch == 2 && filter_.mode == 1 ? c : 0;
+            const Dls2 f = dls2(filter_.coefficients[2 * pair], filter_.coefficients[2 * pair + 1]);
+            float* row = &scratch_[size_t(c) * frames];
+            float y1 = filter_state_[c][0], y2 = filter_state_[c][1];
+            for (uint32_t i = 0; i < frames; ++i) {
+                const float y = f.k * row[i] - f.b1 * y1 - f.b2 * y2;
+                y2 = y1, y1 = y, row[i] = y;
+            }
+            filter_state_[c][0] = y1, filter_state_[c][1] = y2;
+        }
+    }
+    // A 3D voice's head-related filter: 31 signed 8-bit taps a ear, the far
+    // ear (the quieter filter) delayed by the interaural delay. The taps
+    // count 1/512 each: the table's straight-ahead filter then passes about
+    // 0 dB around 1 kHz (as a filter for a source in front should), where
+    // 1/128 would make every 3D sound some 12 dB louder than its dry send.
+    if (three_d.active && three_d.hrtf && ch == 1) {
+        const uint32_t itd = uint32_t(std::min(std::abs(three_d.itd), 63));
+        const size_t hist = 30 + 63;
+        if (hrtf_history_.size() != hist) hrtf_history_.assign(hist, 0.0f);
+        std::vector<float> ext(hist + frames);
+        std::copy(hrtf_history_.begin(), hrtf_history_.end(), ext.begin());
+        std::copy(scratch_.begin(), scratch_.begin() + frames, ext.begin() + hist);
+        float energy[2] = {};
+        for (int e = 0; e < 2; ++e)
+            for (int k = 0; k < 31; ++k) energy[e] += float(three_d.taps[e][k]) * float(three_d.taps[e][k]);
+        const int far = energy[0] < energy[1] ? 0 : 1;
+        hrtf_out_.assign(size_t(frames) * 2, 0.0f);
+        for (int e = 0; e < 2; ++e) {
+            const uint32_t delay = e == far ? itd : 0;
+            float* o = &hrtf_out_[size_t(e) * frames];
+            for (uint32_t i = 0; i < frames; ++i) {
+                float acc = 0.0f;
+                const float* x = &ext[hist + i - delay];
+                for (int k = 0; k < 31; ++k) acc += float(three_d.taps[e][k]) * x[-k];
+                o[i] = acc * (1.0f / 512.0f);
+            }
+        }
+        std::copy(ext.end() - long(hist), ext.end(), hrtf_history_.begin());
+    }
+    return true;
+}
+
+void Voice::mix(const uint8_t* mem, size_t mem_size, Bins& out, uint32_t frames, Voice* submix) {
+    if (!process(mem, mem_size, frames)) return;
+    if (submix) feed(submix, frames);
+    // Each bin the voice feeds, at the voice's volume plus the bin's (and a
+    // 3D voice's offset for it), as the APU's attenuation: 1/64 dB steps,
+    // 0xFFF (64 dB) and beyond silent.
     const uint32_t ch = format_.channels;
     std::vector<MixBinVolume> bins = mix_bins;
     if (bins.empty()) bins = {{kFrontLeft, 0}, {kFrontRight, 0}};
+    const bool hrtf = three_d.active && three_d.hrtf && ch == 1 && !hrtf_out_.empty();
     for (size_t k = 0; k < bins.size(); ++k) {
+        const uint32_t bin = bins[k].bin;
+        if (bin >= kMixBinCount) continue;
         const uint32_t c = ch == 1 ? 0 : uint32_t(k % ch);
-        const float g = base * gain(bins[k].volume);
-        switch (bins[k].bin) {
-            case kFrontLeft: case kBackLeft: to[c][0] += g; break;
-            case kFrontRight: case kBackRight: to[c][1] += g; break;
-            case kFrontCenter: to[c][0] += g * 0.70710678f; to[c][1] += g * 0.70710678f; break;
-            default: break;  // LFE and effect sends
-        }
+        const int64_t mb = int64_t(volume) + bins[k].volume + (three_d.active ? three_d.bin_offset[bin] : 0);
+        if (mb >= 0 ? false : (-mb) * 64 / 100 >= 0xFFF) continue;
+        const float g = gain(int32_t(std::max<int64_t>(mb, kVolumeMin + 1)));
+        const float* src = &scratch_[size_t(c) * frames];
+        if (hrtf && left_side(bin)) src = &hrtf_out_[0];
+        else if (hrtf && right_side(bin)) src = &hrtf_out_[frames];
+        float* dst = out.bin(bin);
+        for (uint32_t i = 0; i < frames; ++i) dst[i] += src[i] * g;
     }
-    render(mem, mem_size, out, 2, to, frames);
 }
 
 void Voice::make_submix(uint32_t channels) {
@@ -179,20 +355,27 @@ void Voice::make_submix(uint32_t channels) {
     format_ = Format{};
     format_.channels = channels;
     format_.rate = kOutputRate;
+    playing_ = true;
 }
 
 void Voice::mix_into(const uint8_t* mem, size_t mem_size, Voice& submix, uint32_t frames) {
-    if (!playing_ || (bytes_ == 0 && !stream_)) return;
+    if (bytes_ == 0 && !stream_) return;
+    if (!process(mem, mem_size, frames)) return;
+    feed(&submix, frames);
+}
+
+void Voice::feed(Voice* target, uint32_t frames) {
+    Voice& submix = *target;
     const float g = gain(volume);
-    float to[2][2] = {};
-    const uint32_t dst = submix.format_.channels;
-    for (uint32_t c = 0; c < format_.channels; ++c) {
-        if (dst == 1) to[c][0] = g;
-        else if (format_.channels == 1) to[0][0] = to[0][1] = g;
-        else to[c][c] = g;
-    }
+    const uint32_t dst = submix.format_.channels, ch = format_.channels;
     if (submix.input_.size() < size_t(frames) * dst) submix.input_.resize(size_t(frames) * dst, 0.0f);
-    render(mem, mem_size, submix.input_.data(), dst, to, frames);
+    for (uint32_t c = 0; c < ch; ++c) {
+        const float* row = &scratch_[size_t(c) * frames];
+        for (uint32_t d = 0; d < dst; ++d) {
+            if (dst != 1 && ch != 1 && c != d) continue;  // stereo into stereo: channel for channel
+            for (uint32_t i = 0; i < frames; ++i) submix.input_[size_t(i) * dst + d] += row[i] * g;
+        }
+    }
 }
 
 void Voice::render(const uint8_t* mem, size_t mem_size, float* out, uint32_t dst, const float to[2][2], uint32_t frames) {
@@ -246,8 +429,9 @@ void Voice::queue_packet(uint32_t guest_addr, uint32_t bytes, uint32_t id) {
     const uint64_t frames = format_.bytes_to_frames(bytes);
     packets_.push_back({guest_addr, bytes, id, queued_end_, frames});
     // A voice stopped (after a discontinuity, or never started) starts again
-    // at the new packet: the frames since the last one are silence, not data.
-    if (!playing_) pos_ = double(queued_end_);
+    // at the new packet: the frames since the last one are silence, not data;
+    // its envelope starts again with it.
+    if (!playing_) pos_ = double(queued_end_), start_envelope();
     queued_end_ += frames;
     playing_ = true;
     discontinuity_ = false;

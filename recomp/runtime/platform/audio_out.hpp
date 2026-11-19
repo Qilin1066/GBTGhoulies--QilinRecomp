@@ -17,9 +17,11 @@ namespace qilin::platform {
 
 class AudioOut {
 public:
-    // Opens the default playback device for `channels` channels at `rate`.
-    // False (with a message printed) where there's no sound device; the
-    // game then runs silent.
+    // Opens the default playback device for `channels` channels at `rate`:
+    // 2 (stereo) or 6 (5.1: front left, right, centre, LFE, back left,
+    // right), or 0 for the device's own (6 where it has that many). False
+    // (with a message printed) where there's no sound device; the game then
+    // runs silent.
     bool start(uint32_t rate, uint32_t channels);
     ~AudioOut();
 

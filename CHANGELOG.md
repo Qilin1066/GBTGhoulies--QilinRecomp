@@ -11,6 +11,30 @@ Each release is a git tag (`vX.Y.Z`) with a matching GitHub release. The version
 
 ## [Unreleased]
 
+## [0.30.0] - 2026-11-19
+The missing pieces of the console's sound and picture: threads, fog, every texture mode, 3D sound, reverb and 5.1.
+
+### Added
+- **Guest threads on host threads** (`host/sched.*`), with the Xbox's single processor: the kernel's priorities, 20 ms quanta and preemption at lifted code's backward branches (one atomic flag), events and mutants, waits on them and on semaphores, threads and timers (single, multiple, with timeouts), sleeps, suspend and resume, timers and DPCs on a clock thread, the kernel's pool. Each switch carries the KPCR's per-thread fields. Critical sections wait on their events.
+- **The mixer on its own thread**, a few milliseconds behind the clock; DirectSound calls still catch it up first. Guest code never runs under its lock.
+- **The GPU runs one submission behind the CPU**: two slots, each with its own command buffer, fence, descriptor pool, ring and acquire semaphore; read-backs wait for both.
+- **Fog**: the NV2A's fog unit as the original's state flush sets it (linear, exp, exp2 from the render states and the image's constants), the factor per pixel; the fixed-function vertex fog coordinate (specular alpha, planar or radial); the final combiner with fog and the specular colour.
+- **Every NV2A texture mode the hardware pairs**: bump mapping (BUMPENVMAP, BUMPENVMAP_LUM, with the bump matrix and luminance from D3D's table), the dependent reads, DOT_ST, DOT_STR_3D, DOT_STR_CUBE, the diffuse and specular reflections, DOT_ZW at stage 2, the HILO hemisphere mappings; the bump-map formats V8U8, L6V5U5 and R8B8.
+- **Palettized (P8) textures**, through the stage's palette.
+- **Points and point sprites**: the point size from `oPts`, `D3DRS_POINTSIZE`, or the fixed-function attenuation as `LazySetPointParams` sets the GPU; sprite coordinates for stages 0-2.
+- **The gamma ramp on screen**: presenting is a pass through a shader that looks each channel up in the ramp.
+- **CPU writes to frame buffers are shown**: a locked frame buffer is copied to guest memory and what the CPU changes goes back to the GPU's image; the disc-error screen appears.
+- **The mix bins**: all 32, with the APU's 1/64 dB attenuation; **envelopes** (`SetEG`'s amplitude envelope; `StopEx` and `FlushEx` with the release); **the DLS2 filter**; **3D voices** as the original applies DirectSound's 3D voice data (bin volumes, Doppler pitch, the head-related filter from the XBE's own HRTF table, through its lifted lookup); **the I3DL2 reverb**, native, from `SetI3DL2Listener`'s parameters.
+- **5.1 output** where the sound device has six channels (`--audio-channels 2|6`), with the console's audio setting reporting surround so the game pans to the back speakers.
+- **WMA decoding lifted**: the XBE's WMADEC section, 132 functions; the lifter gained `xadd`, `psraw`/`psrad`, `paddd`, `psubw`/`psubd`/`psubsw`, the saturating packs, `pmaddwd`, `pshufw`, `cvtps2pi`/`cvttps2pi`/`cvtpi2ps`.
+- DirectSound's `SetFrequency`, `GetCurrentPosition`, `Lock` and `Unlock`.
+- Tests: every texture mode with every dot mapping as valid SPIR-V, point sprites with fog, the envelope, the DLS2 filter, 3D voices, the reverb, the new MMX helpers.
+
+### Fixed
+- **Submix voices play from their creation**: XACT never calls `Play` on its submixes, so the game's 3D sounds (most of its effects in play) were silent.
+- A voice feeding a submix still feeds its own mix bins, its effect sends.
+- A stream packet that has completed frees its place in the stream at once, before its completion is reported.
+
 ## [0.29.0] - 2026-11-19
 Chapter 1's first fight can be won: Baines congratulates Cooper on battling unarmed.
 

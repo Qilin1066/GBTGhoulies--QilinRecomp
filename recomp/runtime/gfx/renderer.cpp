@@ -19,6 +19,7 @@
 
 #include "gfx.hpp"
 #include "nv2a_shaders.hpp"
+#include "spirv.hpp"
 #include "texture.hpp"
 #include "volk.h"
 
@@ -114,6 +115,13 @@ public:
     void set_render_target(uint32_t id, uint32_t depth) override;
     Image read_front_buffer() override { return read(color_[front_]); }
     Image read_back_buffer() override { return read(color_[back_]); }
+    Image read_frame_buffer(uint32_t index) override { return read(color_.at(index)); }
+    void write_frame_buffer(uint32_t index, const Image& image) override;
+    void show_front() override {
+        end_pass();
+        show(color_[front_]);
+    }
+    void set_gamma_ramp(const uint8_t ramp[3][256]) override;
     uint32_t validation_errors() const override { return validation_errors_; }
 
 private:
@@ -137,8 +145,9 @@ private:
     void transition(Target& t, VkImageLayout to);
     void begin_pass();                               // makes sure the render pass is open, applying pending clears
     void end_pass();
-    // Ends the command buffer, submits it and waits for it; the submission can
-    // wait for a semaphore before its transfers and signal one when done.
+    // Ends the command buffer and submits it, moving to the next slot (which
+    // waits for that slot's last submission); the submission can wait for a
+    // semaphore before its transfers and signal one when done.
     void submit(VkSemaphore wait = VK_NULL_HANDLE, VkSemaphore signal = VK_NULL_HANDLE);
     void show(Target& frame);                        // to the window: scaled into the swapchain, then presented
     bool make_swapchain(uint32_t width, uint32_t height);
@@ -171,6 +180,8 @@ private:
     VkFormat swap_format_ = VK_FORMAT_UNDEFINED;
     VkExtent2D swap_extent_{};
     std::vector<VkImage> swap_images_;
+    std::vector<VkImageView> swap_views_;  // when the window's images can be drawn into (present_pass_)
+    bool present_pass_ = false;
     VkSemaphore acquired_ = VK_NULL_HANDLE;
     std::vector<VkSemaphore> rendered_;  // one for each swapchain image, which its presentation waits for
     bool swap_stale_ = false;            // out of date or suboptimal: made again before the next frame
@@ -226,6 +237,45 @@ private:
     std::unordered_map<uint32_t, Target> depth_targets_;  // by the same ids as textures
     std::vector<Texture> dead_textures_;                                  // freed once the GPU is done with them
     std::vector<std::pair<VkBuffer, VkDeviceMemory>> staging_;            // likewise
+
+    // Submissions in flight: the CPU records the next while the GPU runs
+    // the last. Each slot has its own command buffer, fence, descriptor
+    // pool, ring and acquire semaphore, and keeps what its submission used
+    // (staging buffers, destroyed textures) until its fence says the GPU is
+    // done; cmd_, fence_, descriptor_pool_, ring_* and acquired_ are the
+    // current slot's.
+    static constexpr uint32_t kSlots = 2;
+    struct Slot {
+        VkCommandBuffer cmd = VK_NULL_HANDLE;
+        VkFence fence = VK_NULL_HANDLE;
+        VkDescriptorPool pool = VK_NULL_HANDLE;
+        VkBuffer ring = VK_NULL_HANDLE;
+        VkDeviceMemory ring_memory = VK_NULL_HANDLE;
+        uint8_t* ring_mapped = nullptr;
+        VkSemaphore acquired = VK_NULL_HANDLE;
+        std::vector<Texture> dead;
+        std::vector<std::pair<VkBuffer, VkDeviceMemory>> staging;
+        bool pending = false;
+    };
+    Slot slots_[kSlots];
+    uint32_t slot_ = 0;
+    void use_slot(uint32_t i);
+    void retire(uint32_t i);  // waits for the slot's submission and frees what it used
+    void wait_idle();         // every submission done (before reading results back)
+
+    // Presenting: the frame through the gamma ramp into the window's image,
+    // a pass of its own (two samplers: the frame, the ramp as a 256×1 texture).
+    VkDescriptorSetLayout present_set_layout_ = VK_NULL_HANDLE;
+    VkPipelineLayout present_layout_ = VK_NULL_HANDLE;
+    VkPipeline present_pipeline_ = VK_NULL_HANDLE;
+    VkFormat present_format_ = VK_FORMAT_UNDEFINED;
+    VkShaderModule present_shaders_[2] = {};
+    uint32_t gamma_texture_ = 0;
+    uint8_t gamma_[3][256] = {};
+    bool gamma_set_ = false;
+    void present_through_pass(Target& frame, uint32_t index, int32_t dx, int32_t dy, uint64_t dw, uint64_t dh);
+    VkPipeline present_pipeline();
+    VkBuffer staging_buffer(const void* data, VkDeviceSize bytes);
 };
 
 bool VulkanRenderer::create_instance(std::string* error) {
@@ -412,8 +462,14 @@ void VulkanRenderer::create_device() {
     std::vector<const char*> extensions;
     if (portability_subset_) extensions.push_back("VK_KHR_portability_subset");
     if (surface_) extensions.push_back(VK_KHR_SWAPCHAIN_EXTENSION_NAME);
+    // Points wider than a pixel (the game's sprites), where the device has them.
+    VkPhysicalDeviceFeatures have{};
+    vkGetPhysicalDeviceFeatures(gpu_, &have);
+    VkPhysicalDeviceFeatures2 f2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+    f2.pNext = &f13;
+    f2.features.largePoints = have.largePoints;
     VkDeviceCreateInfo info{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
-    info.pNext = &f13;
+    info.pNext = &f2;
     info.queueCreateInfoCount = 1;
     info.pQueueCreateInfos = &q;
     info.enabledExtensionCount = uint32_t(extensions.size());
@@ -430,9 +486,12 @@ void VulkanRenderer::create_device() {
     alloc.commandPool = pool_;
     alloc.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
     alloc.commandBufferCount = 1;
-    check(vkAllocateCommandBuffers(device_, &alloc, &cmd_), "vkAllocateCommandBuffers");
     const VkFenceCreateInfo fence{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
-    check(vkCreateFence(device_, &fence, nullptr, &fence_), "vkCreateFence");
+    for (Slot& sl : slots_) {
+        check(vkAllocateCommandBuffers(device_, &alloc, &sl.cmd), "vkAllocateCommandBuffers");
+        check(vkCreateFence(device_, &fence, nullptr, &sl.fence), "vkCreateFence");
+    }
+    cmd_ = slots_[0].cmd, fence_ = slots_[0].fence;
 }
 
 uint32_t VulkanRenderer::memory_type(uint32_t allowed, VkMemoryPropertyFlags wanted) const {
@@ -527,6 +586,11 @@ void VulkanRenderer::destroy() {
         for (auto& [id, t] : render_targets_) drop(t);
         for (auto& [id, t] : depth_targets_) drop(t);
         drop(depth_);
+        for (VkImageView v : swap_views_) vkDestroyImageView(device_, v, nullptr);
+        if (present_pipeline_) vkDestroyPipeline(device_, present_pipeline_, nullptr);
+        if (present_layout_) vkDestroyPipelineLayout(device_, present_layout_, nullptr);
+        if (present_set_layout_) vkDestroyDescriptorSetLayout(device_, present_set_layout_, nullptr);
+        for (VkShaderModule m : present_shaders_) if (m) vkDestroyShaderModule(device_, m, nullptr);
         auto drop_texture = [&](Texture& t) {
             if (t.view) vkDestroyImageView(device_, t.view, nullptr);
             if (t.image) vkDestroyImage(device_, t.image, nullptr);
@@ -535,19 +599,22 @@ void VulkanRenderer::destroy() {
         for (auto& [id, t] : textures_) drop_texture(t);
         for (Texture& t : dead_textures_) drop_texture(t);
         for (auto& [b, m] : staging_) vkDestroyBuffer(device_, b, nullptr), vkFreeMemory(device_, m, nullptr);
+        for (uint32_t i = 0; i < kSlots; ++i) retire(i);
         for (auto& [k, pl] : pipelines_) vkDestroyPipeline(device_, pl, nullptr);
         for (auto& [k, m] : shaders_) vkDestroyShaderModule(device_, m, nullptr);
         for (auto& [d, smp] : samplers_) vkDestroySampler(device_, smp, nullptr);
-        if (ring_) vkDestroyBuffer(device_, ring_, nullptr);
-        if (ring_memory_) vkFreeMemory(device_, ring_memory_, nullptr);
-        if (descriptor_pool_) vkDestroyDescriptorPool(device_, descriptor_pool_, nullptr);
+        for (Slot& sl : slots_) {
+            if (sl.ring) vkDestroyBuffer(device_, sl.ring, nullptr);
+            if (sl.ring_memory) vkFreeMemory(device_, sl.ring_memory, nullptr);
+            if (sl.pool) vkDestroyDescriptorPool(device_, sl.pool, nullptr);
+            if (sl.fence) vkDestroyFence(device_, sl.fence, nullptr);
+            if (sl.acquired) vkDestroySemaphore(device_, sl.acquired, nullptr);
+        }
         if (pipeline_layout_) vkDestroyPipelineLayout(device_, pipeline_layout_, nullptr);
         if (set_layout_) vkDestroyDescriptorSetLayout(device_, set_layout_, nullptr);
         if (readback_) vkDestroyBuffer(device_, readback_, nullptr);
         if (readback_memory_) vkFreeMemory(device_, readback_memory_, nullptr);
-        if (fence_) vkDestroyFence(device_, fence_, nullptr);
         if (swapchain_) vkDestroySwapchainKHR(device_, swapchain_, nullptr);
-        if (acquired_) vkDestroySemaphore(device_, acquired_, nullptr);
         for (VkSemaphore sem : rendered_) vkDestroySemaphore(device_, sem, nullptr);
         if (pool_) vkDestroyCommandPool(device_, pool_, nullptr);
         vkDestroyDevice(device_, nullptr);
@@ -692,19 +759,17 @@ void VulkanRenderer::submit(VkSemaphore wait, VkSemaphore signal) {
         info.pSignalSemaphoreInfos = &sg;
     }
     check(vkQueueSubmit2(queue_, 1, &info, fence_), "vkQueueSubmit2");
-    check(vkWaitForFences(device_, 1, &fence_, VK_TRUE, UINT64_MAX), "vkWaitForFences");
-    check(vkResetFences(device_, 1, &fence_), "vkResetFences");
-    // The GPU is done with everything this submission used.
-    ring_used_ = 0;
-    if (descriptor_pool_) vkResetDescriptorPool(device_, descriptor_pool_, 0);
-    for (Texture& t : dead_textures_) {
-        vkDestroyImageView(device_, t.view, nullptr);
-        vkDestroyImage(device_, t.image, nullptr);
-        vkFreeMemory(device_, t.memory, nullptr);
-    }
+    // In flight: what it uses is kept with its slot, and the next slot
+    // (once its own submission is done) takes the recording.
+    Slot& done = slots_[slot_];
+    done.pending = true;
+    for (Texture& t : dead_textures_) done.dead.push_back(t);
     dead_textures_.clear();
-    for (auto& [b, m] : staging_) vkDestroyBuffer(device_, b, nullptr), vkFreeMemory(device_, m, nullptr);
+    for (auto& st : staging_) done.staging.push_back(st);
     staging_.clear();
+    const uint32_t next = (slot_ + 1) % kSlots;
+    retire(next);
+    use_slot(next);
 }
 
 void VulkanRenderer::present() {
@@ -778,6 +843,8 @@ bool VulkanRenderer::make_swapchain(uint32_t width, uint32_t height) {
     info.imageExtent = extent;
     info.imageArrayLayers = 1;
     info.imageUsage = VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+    present_pass_ = (caps.supportedUsageFlags & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) != 0;
+    if (present_pass_) info.imageUsage |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
     info.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
     info.preTransform = (caps.supportedTransforms & VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR) ? VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR
                                                                                            : caps.currentTransform;
@@ -801,8 +868,23 @@ bool VulkanRenderer::make_swapchain(uint32_t width, uint32_t height) {
     vkGetSwapchainImagesKHR(device_, swapchain_, &n, nullptr);
     swap_images_.resize(n);
     vkGetSwapchainImagesKHR(device_, swapchain_, &n, swap_images_.data());
+    for (VkImageView v : swap_views_) vkDestroyImageView(device_, v, nullptr);
+    swap_views_.clear();
+    if (present_pass_)
+        for (VkImage im : swap_images_) {
+            VkImageViewCreateInfo vi{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+            vi.image = im;
+            vi.viewType = VK_IMAGE_VIEW_TYPE_2D;
+            vi.format = swap_format_;
+            vi.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+            VkImageView v = VK_NULL_HANDLE;
+            check(vkCreateImageView(device_, &vi, nullptr, &v), "vkCreateImageView");
+            swap_views_.push_back(v);
+        }
     const VkSemaphoreCreateInfo sem{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
-    if (!acquired_) check(vkCreateSemaphore(device_, &sem, nullptr, &acquired_), "vkCreateSemaphore");
+    for (Slot& sl : slots_)
+        if (!sl.acquired) check(vkCreateSemaphore(device_, &sem, nullptr, &sl.acquired), "vkCreateSemaphore");
+    acquired_ = slots_[slot_].acquired;
     while (rendered_.size() < n) {
         VkSemaphore s = VK_NULL_HANDLE;
         check(vkCreateSemaphore(device_, &sem, nullptr, &s), "vkCreateSemaphore");
@@ -828,6 +910,13 @@ void VulkanRenderer::show(Target& frame) {
     if (got == VK_SUBOPTIMAL_KHR) swap_stale_ = true;
     else check(got, "vkAcquireNextImageKHR");
 
+    const uint64_t fw0 = config_.width, fh0 = config_.height, sw0 = swap_extent_.width, sh0 = swap_extent_.height;
+    uint64_t dw0 = sw0, dh0 = sh0;
+    if (sw0 * fh0 > sh0 * fw0) dw0 = std::max<uint64_t>(1, sh0 * fw0 / fh0);
+    else dh0 = std::max<uint64_t>(1, sw0 * fh0 / fw0);
+    if (present_pass_) return present_through_pass(frame, index, int32_t((sw0 - dw0) / 2), int32_t((sh0 - dh0) / 2), dw0, dh0);
+
+    // Without a pass (images that can only be copied into): a scaled copy, no gamma ramp.
     record();
     transition(frame, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
     const VkImage image = swap_images_[index];
@@ -883,6 +972,279 @@ void VulkanRenderer::show(Target& frame) {
     else check(shown, "vkQueuePresentKHR");
 }
 
+// ---- Presenting through the gamma ramp
+namespace {
+// A triangle over the destination rectangle: position xy, texture coordinate zw.
+std::vector<uint32_t> present_vs() {
+    spv::Builder b{spv::Stage::Vertex};
+    const spv::Id f = b.t_float(), v4 = b.t_vec(4);
+    const spv::Id in = b.input(v4, 0);
+    const spv::Id v = b.load(v4, in);
+    const spv::Id pos = b.builtin_var(spv::Storage::Output, v4, spv::builtin::Position);
+    b.store(pos, b.vec4(b.extract(f, v, 0), b.extract(f, v, 1), b.c_float(0), b.c_float(1)));
+    const spv::Id out = b.output(v4, 0);
+    b.store(out, b.vec4(b.extract(f, v, 2), b.extract(f, v, 3), b.c_float(0), b.c_float(0)));
+    return b.finish({in, pos, out});
+}
+// The frame, filtered, then each channel through its table (texel i at (i + 0.5) / 256).
+std::vector<uint32_t> present_fs() {
+    namespace op = spv::op;
+    spv::Builder b{spv::Stage::Fragment};
+    const spv::Id f = b.t_float(), v2 = b.t_vec(2), v4 = b.t_vec(4), s2 = b.t_sampler2d();
+    const spv::Id in = b.input(v4, 0);
+    const spv::Id uv = b.load(v4, in);
+    const spv::Id frame = b.load(s2, b.sampler(s2, 0, 0)), ramp = b.load(s2, b.sampler(s2, 0, 1));
+    const spv::Id c = b.op(op::ImageSampleImplicitLod, v4, {frame, b.shuffle(v2, uv, uv, {0, 1})});
+    auto through = [&](uint32_t k) {
+        const spv::Id x = b.op(op::FAdd, f, {b.op(op::FMul, f, {b.extract(f, c, k), b.c_float(255.0f / 256.0f)}), b.c_float(0.5f / 256.0f)});
+        const spv::Id at = b.op(op::CompositeConstruct, v2, {x, b.c_float(0.5f)});
+        return b.extract(f, b.op(op::ImageSampleImplicitLod, v4, {ramp, at}), k);
+    };
+    const spv::Id out = b.output(v4, 0);
+    b.store(out, b.vec4(through(0), through(1), through(2), b.c_float(1)));
+    return b.finish({in, out});
+}
+}  // namespace
+
+void VulkanRenderer::set_gamma_ramp(const uint8_t ramp[3][256]) {
+    if (gamma_set_ && std::memcmp(gamma_, ramp, sizeof gamma_) == 0) return;
+    std::memcpy(gamma_, ramp, sizeof gamma_);
+    gamma_set_ = true;
+    if (gamma_texture_) destroy_texture(gamma_texture_);
+    TextureData t;
+    t.width = 256;
+    t.height = 1;
+    t.rgba.resize(256 * 4);
+    for (uint32_t i = 0; i < 256; ++i) {
+        t.rgba[i * 4 + 0] = ramp[0][i];
+        t.rgba[i * 4 + 1] = ramp[1][i];
+        t.rgba[i * 4 + 2] = ramp[2][i];
+        t.rgba[i * 4 + 3] = 255;
+    }
+    gamma_texture_ = create_texture(t);
+}
+
+VkPipeline VulkanRenderer::present_pipeline() {
+    if (present_pipeline_ && present_format_ == swap_format_) return present_pipeline_;
+    if (!present_set_layout_) {
+        VkDescriptorSetLayoutBinding b[2]{};
+        for (uint32_t i = 0; i < 2; ++i) {
+            b[i].binding = i;
+            b[i].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+            b[i].descriptorCount = 1;
+            b[i].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+        }
+        VkDescriptorSetLayoutCreateInfo sl{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+        sl.bindingCount = 2;
+        sl.pBindings = b;
+        check(vkCreateDescriptorSetLayout(device_, &sl, nullptr, &present_set_layout_), "vkCreateDescriptorSetLayout");
+        VkPipelineLayoutCreateInfo pl{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+        pl.setLayoutCount = 1;
+        pl.pSetLayouts = &present_set_layout_;
+        check(vkCreatePipelineLayout(device_, &pl, nullptr, &present_layout_), "vkCreatePipelineLayout");
+        const std::vector<uint32_t> code[2] = {present_vs(), present_fs()};
+        for (int i = 0; i < 2; ++i) {
+            VkShaderModuleCreateInfo mi{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+            mi.codeSize = code[i].size() * 4;
+            mi.pCode = code[i].data();
+            check(vkCreateShaderModule(device_, &mi, nullptr, &present_shaders_[i]), "vkCreateShaderModule");
+        }
+    }
+    if (present_pipeline_) vkDestroyPipeline(device_, present_pipeline_, nullptr);
+    VkPipelineShaderStageCreateInfo stages[2]{};
+    for (int i = 0; i < 2; ++i) {
+        stages[i].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+        stages[i].stage = i ? VK_SHADER_STAGE_FRAGMENT_BIT : VK_SHADER_STAGE_VERTEX_BIT;
+        stages[i].module = present_shaders_[i];
+        stages[i].pName = "main";
+    }
+    const VkVertexInputBindingDescription binding{0, 16, VK_VERTEX_INPUT_RATE_VERTEX};
+    const VkVertexInputAttributeDescription attribute{0, 0, VK_FORMAT_R32G32B32A32_SFLOAT, 0};
+    VkPipelineVertexInputStateCreateInfo vi{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+    vi.vertexBindingDescriptionCount = 1;
+    vi.pVertexBindingDescriptions = &binding;
+    vi.vertexAttributeDescriptionCount = 1;
+    vi.pVertexAttributeDescriptions = &attribute;
+    VkPipelineInputAssemblyStateCreateInfo ia{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
+    ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    VkPipelineViewportStateCreateInfo vp{VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
+    vp.viewportCount = vp.scissorCount = 1;
+    VkPipelineRasterizationStateCreateInfo rs{VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
+    rs.polygonMode = VK_POLYGON_MODE_FILL;
+    rs.lineWidth = 1.0f;
+    VkPipelineMultisampleStateCreateInfo ms{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
+    ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+    VkPipelineDepthStencilStateCreateInfo ds{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
+    VkPipelineColorBlendAttachmentState att{};
+    att.colorWriteMask = 0xF;
+    VkPipelineColorBlendStateCreateInfo cb{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
+    cb.attachmentCount = 1;
+    cb.pAttachments = &att;
+    const VkDynamicState dynamic[] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
+    VkPipelineDynamicStateCreateInfo dyn{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
+    dyn.dynamicStateCount = 2;
+    dyn.pDynamicStates = dynamic;
+    VkPipelineRenderingCreateInfo ri{VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO};
+    ri.colorAttachmentCount = 1;
+    ri.pColorAttachmentFormats = &swap_format_;
+    VkGraphicsPipelineCreateInfo info{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
+    info.pNext = &ri;
+    info.stageCount = 2;
+    info.pStages = stages;
+    info.pVertexInputState = &vi;
+    info.pInputAssemblyState = &ia;
+    info.pViewportState = &vp;
+    info.pRasterizationState = &rs;
+    info.pMultisampleState = &ms;
+    info.pDepthStencilState = &ds;
+    info.pColorBlendState = &cb;
+    info.pDynamicState = &dyn;
+    info.layout = present_layout_;
+    check(vkCreateGraphicsPipelines(device_, VK_NULL_HANDLE, 1, &info, nullptr, &present_pipeline_), "vkCreateGraphicsPipelines");
+    present_format_ = swap_format_;
+    return present_pipeline_;
+}
+
+// The frame into the window's image `index` at (dx, dy, dw × dh), black
+// around it, through the gamma ramp (the identity until the title sets one).
+void VulkanRenderer::present_through_pass(Target& frame, uint32_t index, int32_t dx, int32_t dy, uint64_t dw, uint64_t dh) {
+    if (!gamma_set_) {
+        uint8_t identity[3][256];
+        for (int k = 0; k < 3; ++k)
+            for (int i = 0; i < 256; ++i) identity[k][i] = uint8_t(i);
+        set_gamma_ramp(identity);
+    }
+    const VkPipeline pl = present_pipeline();
+    // The vertices first: a full ring submits, which must come before the window's image is touched.
+    const float tri[12] = {-1, -1, 0, 0, 3, -1, 2, 0, -1, 3, 0, 2};
+    const VkDeviceSize at = ring_alloc(sizeof tri, 16, tri);
+    record();
+    transition(frame, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    const VkImage image = swap_images_[index];
+    auto barrier = [&](VkImageLayout from, VkImageLayout to, VkPipelineStageFlags2 src, VkAccessFlags2 src_access,
+                       VkPipelineStageFlags2 dst, VkAccessFlags2 dst_access) {
+        VkImageMemoryBarrier2 b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};
+        b.srcStageMask = src;
+        b.srcAccessMask = src_access;
+        b.dstStageMask = dst;
+        b.dstAccessMask = dst_access;
+        b.oldLayout = from;
+        b.newLayout = to;
+        b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        b.image = image;
+        b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        VkDependencyInfo dep{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+        dep.imageMemoryBarrierCount = 1;
+        dep.pImageMemoryBarriers = &b;
+        vkCmdPipelineBarrier2(cmd_, &dep);
+    };
+    barrier(VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, 0,
+            VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
+
+    VkDescriptorSetAllocateInfo ai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+    ai.descriptorPool = descriptor_pool_;
+    ai.descriptorSetCount = 1;
+    ai.pSetLayouts = &present_set_layout_;
+    VkDescriptorSet set = VK_NULL_HANDLE;
+    check(vkAllocateDescriptorSets(device_, &ai, &set), "vkAllocateDescriptorSets");
+    SamplerDesc linear, nearest;
+    linear.u = linear.v = nearest.u = nearest.v = Address::Clamp;
+    nearest.mag = nearest.min = Filter::Nearest;
+    const VkDescriptorImageInfo images[2] = {{sampler(linear), frame.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
+                                             {sampler(nearest), textures_.at(gamma_texture_).view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL}};
+    VkWriteDescriptorSet writes[2]{};
+    for (uint32_t i = 0; i < 2; ++i) {
+        writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[i].dstSet = set;
+        writes[i].dstBinding = i;
+        writes[i].descriptorCount = 1;
+        writes[i].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        writes[i].pImageInfo = &images[i];
+    }
+    vkUpdateDescriptorSets(device_, 2, writes, 0, nullptr);
+
+    VkRenderingAttachmentInfo color{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
+    color.imageView = swap_views_[index];
+    color.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    color.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+    color.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    color.clearValue.color = VkClearColorValue{};
+    VkRenderingInfo info{VK_STRUCTURE_TYPE_RENDERING_INFO};
+    info.renderArea = {{0, 0}, swap_extent_};
+    info.layerCount = 1;
+    info.colorAttachmentCount = 1;
+    info.pColorAttachments = &color;
+    vkCmdBeginRendering(cmd_, &info);
+    vkCmdBindPipeline(cmd_, VK_PIPELINE_BIND_POINT_GRAPHICS, pl);
+    vkCmdBindDescriptorSets(cmd_, VK_PIPELINE_BIND_POINT_GRAPHICS, present_layout_, 0, 1, &set, 0, nullptr);
+    vkCmdBindVertexBuffers(cmd_, 0, 1, &ring_, &at);
+    const VkViewport viewport{float(dx), float(dy), float(dw), float(dh), 0, 1};
+    vkCmdSetViewport(cmd_, 0, 1, &viewport);
+    const VkRect2D scissor{{dx, dy}, {uint32_t(dw), uint32_t(dh)}};
+    vkCmdSetScissor(cmd_, 0, 1, &scissor);
+    vkCmdDraw(cmd_, 3, 1, 0, 0);
+    vkCmdEndRendering(cmd_);
+    barrier(VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+            VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT, VK_PIPELINE_STAGE_2_NONE, 0);
+    submit(acquired_, rendered_[index]);
+
+    VkPresentInfoKHR pi{VK_STRUCTURE_TYPE_PRESENT_INFO_KHR};
+    pi.waitSemaphoreCount = 1;
+    pi.pWaitSemaphores = &rendered_[index];
+    pi.swapchainCount = 1;
+    pi.pSwapchains = &swapchain_;
+    pi.pImageIndices = &index;
+    const VkResult shown = vkQueuePresentKHR(queue_, &pi);
+    if (shown == VK_ERROR_OUT_OF_DATE_KHR || shown == VK_SUBOPTIMAL_KHR) swap_stale_ = true;
+    else check(shown, "vkQueuePresentKHR");
+}
+
+// A staging buffer with `data`, freed after the submission.
+VkBuffer VulkanRenderer::staging_buffer(const void* data, VkDeviceSize bytes) {
+    VkBuffer staging = VK_NULL_HANDLE;
+    VkDeviceMemory memory = VK_NULL_HANDLE;
+    VkBufferCreateInfo bi{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+    bi.size = std::max<VkDeviceSize>(bytes, 4);
+    bi.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+    check(vkCreateBuffer(device_, &bi, nullptr, &staging), "vkCreateBuffer");
+    VkMemoryRequirements req{};
+    vkGetBufferMemoryRequirements(device_, staging, &req);
+    VkMemoryAllocateInfo alloc{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+    alloc.allocationSize = req.size;
+    alloc.memoryTypeIndex = memory_type(req.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    check(vkAllocateMemory(device_, &alloc, nullptr, &memory), "vkAllocateMemory");
+    check(vkBindBufferMemory(device_, staging, memory, 0), "vkBindBufferMemory");
+    void* mapped = nullptr;
+    check(vkMapMemory(device_, memory, 0, bi.size, 0, &mapped), "vkMapMemory");
+    std::memcpy(mapped, data, size_t(bytes));
+    vkUnmapMemory(device_, memory);
+    staging_.emplace_back(staging, memory);
+    return staging;
+}
+
+// The CPU's pixels into a frame buffer (RGBA in, the image's BGRA out).
+void VulkanRenderer::write_frame_buffer(uint32_t index, const Image& im) {
+    Target& t = color_.at(index);
+    if (im.width != t.width || im.height != t.height) return;
+    std::vector<uint8_t> bgra(im.rgba.size());
+    for (size_t i = 0; i < im.rgba.size(); i += 4) {
+        bgra[i] = im.rgba[i + 2];
+        bgra[i + 1] = im.rgba[i + 1];
+        bgra[i + 2] = im.rgba[i];
+        bgra[i + 3] = im.rgba[i + 3];
+    }
+    const VkBuffer staging = staging_buffer(bgra.data(), bgra.size());
+    const bool was_open = pass_open_;
+    end_pass();
+    record();
+    transition(t, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+    VkBufferImageCopy r{};
+    r.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    r.imageExtent = {t.width, t.height, 1};
+    vkCmdCopyBufferToImage(cmd_, staging, t.image, t.layout, 1, &r);
+    if (was_open) begin_pass();
+}
+
 Image VulkanRenderer::read(Target& t) {
     const VkDeviceSize bytes = VkDeviceSize(config_.width) * config_.height * 4;
     if (!readback_) {
@@ -908,6 +1270,7 @@ Image VulkanRenderer::read(Target& t) {
     region.imageExtent = {config_.width, config_.height, 1};
     vkCmdCopyImageToBuffer(cmd_, t.image, t.layout, readback_, 1, &region);
     submit();
+    wait_idle();
 
     Image out;
     out.width = config_.width;
@@ -929,7 +1292,7 @@ Image VulkanRenderer::read(Target& t) {
 
 // ---------------------------------------------------------------- drawing
 constexpr uint32_t kSamplers = 4;
-constexpr VkDeviceSize kRingBytes = 64ull << 20;
+constexpr VkDeviceSize kRingBytes = 32ull << 20;  // a slot's (kSlots of them)
 
 void VulkanRenderer::create_draw_objects() {
     VkDescriptorSetLayoutBinding b[2 + kSamplers]{};
@@ -961,27 +1324,61 @@ void VulkanRenderer::create_draw_objects() {
     dp.maxSets = sets;
     dp.poolSizeCount = 2;
     dp.pPoolSizes = sizes;
-    check(vkCreateDescriptorPool(device_, &dp, nullptr, &descriptor_pool_), "vkCreateDescriptorPool");
+    for (Slot& slot : slots_) check(vkCreateDescriptorPool(device_, &dp, nullptr, &slot.pool), "vkCreateDescriptorPool");
 
     VkPhysicalDeviceProperties props{};
     vkGetPhysicalDeviceProperties(gpu_, &props);
     uniform_align_ = std::max<VkDeviceSize>(16, props.limits.minUniformBufferOffsetAlignment);
     ring_size_ = kRingBytes;
-    VkBufferCreateInfo bi{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
-    bi.size = ring_size_;
-    bi.usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT;
-    bi.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-    check(vkCreateBuffer(device_, &bi, nullptr, &ring_), "vkCreateBuffer");
-    VkMemoryRequirements req{};
-    vkGetBufferMemoryRequirements(device_, ring_, &req);
-    VkMemoryAllocateInfo alloc{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
-    alloc.allocationSize = req.size;
-    alloc.memoryTypeIndex = memory_type(req.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-    check(vkAllocateMemory(device_, &alloc, nullptr, &ring_memory_), "vkAllocateMemory");
-    check(vkBindBufferMemory(device_, ring_, ring_memory_, 0), "vkBindBufferMemory");
-    void* mapped = nullptr;
-    check(vkMapMemory(device_, ring_memory_, 0, ring_size_, 0, &mapped), "vkMapMemory");
-    ring_mapped_ = static_cast<uint8_t*>(mapped);
+    for (Slot& slot : slots_) {
+        VkBufferCreateInfo bi{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+        bi.size = ring_size_;
+        bi.usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT;
+        bi.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+        check(vkCreateBuffer(device_, &bi, nullptr, &slot.ring), "vkCreateBuffer");
+        VkMemoryRequirements req{};
+        vkGetBufferMemoryRequirements(device_, slot.ring, &req);
+        VkMemoryAllocateInfo alloc{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+        alloc.allocationSize = req.size;
+        alloc.memoryTypeIndex = memory_type(req.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+        check(vkAllocateMemory(device_, &alloc, nullptr, &slot.ring_memory), "vkAllocateMemory");
+        check(vkBindBufferMemory(device_, slot.ring, slot.ring_memory, 0), "vkBindBufferMemory");
+        void* mapped = nullptr;
+        check(vkMapMemory(device_, slot.ring_memory, 0, ring_size_, 0, &mapped), "vkMapMemory");
+        slot.ring_mapped = static_cast<uint8_t*>(mapped);
+    }
+    use_slot(0);
+}
+
+void VulkanRenderer::use_slot(uint32_t i) {
+    slot_ = i;
+    Slot& sl = slots_[i];
+    cmd_ = sl.cmd, fence_ = sl.fence, descriptor_pool_ = sl.pool;
+    ring_ = sl.ring, ring_memory_ = sl.ring_memory, ring_mapped_ = sl.ring_mapped;
+    acquired_ = sl.acquired;
+    ring_used_ = 0;
+}
+
+void VulkanRenderer::retire(uint32_t i) {
+    Slot& sl = slots_[i];
+    if (sl.pending) {
+        check(vkWaitForFences(device_, 1, &sl.fence, VK_TRUE, UINT64_MAX), "vkWaitForFences");
+        check(vkResetFences(device_, 1, &sl.fence), "vkResetFences");
+        sl.pending = false;
+        vkResetDescriptorPool(device_, sl.pool, 0);
+    }
+    for (Texture& t : sl.dead) {
+        vkDestroyImageView(device_, t.view, nullptr);
+        vkDestroyImage(device_, t.image, nullptr);
+        vkFreeMemory(device_, t.memory, nullptr);
+    }
+    sl.dead.clear();
+    for (auto& [b, m] : sl.staging) vkDestroyBuffer(device_, b, nullptr), vkFreeMemory(device_, m, nullptr);
+    sl.staging.clear();
+}
+
+void VulkanRenderer::wait_idle() {
+    for (uint32_t i = 0; i < kSlots; ++i) retire(i);
 }
 
 // Space in the ring for this submission; when it's full, the work so far is

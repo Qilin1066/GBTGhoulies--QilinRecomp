@@ -30,6 +30,7 @@
 #include <vector>
 
 #include "host.hpp"
+#include "sched.hpp"
 #include "strf.hpp"
 
 namespace qilin::host {
@@ -377,6 +378,7 @@ void nt_open_file(rt::Context& c) {
 
 // NTSTATUS NtClose(HANDLE) (187)
 void nt_close(rt::Context& c) {
+    if (sched::close_handle(arg(c, 0))) return ret(c, kSuccess, 4);  // a kernel object's (sched.cpp)
     auto it = handles().find(arg(c, 0));
     if (it == handles().end()) {
         ret(c, kInvalidHandle, 4);

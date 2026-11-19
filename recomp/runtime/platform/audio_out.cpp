@@ -22,6 +22,12 @@ bool AudioOut::start(uint32_t rate, uint32_t channels) {
         std::printf("qilin_run: no sound (SDL: %s)\n", SDL_GetError());
         return false;
     }
+    // 0 channels: the device's own layout, 5.1 where it has six or more
+    // speakers (the Xbox's own mix), else stereo.
+    if (channels == 0) {
+        SDL_AudioSpec dev{};
+        channels = SDL_GetAudioDeviceFormat(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &dev, nullptr) && dev.channels >= 6 ? 6 : 2;
+    }
     SDL_AudioSpec spec{};
     spec.format = SDL_AUDIO_F32;
     spec.channels = int(channels);

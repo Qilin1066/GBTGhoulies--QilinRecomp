@@ -135,6 +135,16 @@ public:
     // or the back buffer as drawn so far.
     virtual Image read_front_buffer() = 0;
     virtual Image read_back_buffer() = 0;
+    // Frame buffer `index` (0 … back_buffers, as back_index and front_index
+    // number them), read back or written from the CPU: on the Xbox they're
+    // memory the title can lock and write. show_front shows the front
+    // buffer again after such a write.
+    virtual Image read_frame_buffer(uint32_t index) = 0;
+    virtual void write_frame_buffer(uint32_t index, const Image& image) = 0;
+    virtual void show_front() = 0;
+    // The display's gamma ramp (D3D's SetGammaRamp): red, green and blue
+    // tables every frame shown goes through on its way to the window.
+    virtual void set_gamma_ramp(const uint8_t ramp[3][256]) = 0;
 
     // Textures: made from decoded texels (texture.hpp), named by a non-zero id.
     virtual uint32_t create_texture(const TextureData& data) = 0;

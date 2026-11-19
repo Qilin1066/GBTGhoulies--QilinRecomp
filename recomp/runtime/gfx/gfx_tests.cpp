@@ -116,6 +116,61 @@ mad oPos.xyz, oPos.xyzz, r1.x, c-37.xyzz
                 std::fwrite(spv.data(), 4, spv.size(), f);
                 std::fclose(f);
             }
+        // Every texture mode the runtime models, in the arrangements the NV2A
+        // allows: bump maps and dependent reads, the dot-product lookups with
+        // each dot mapping, and DOT_ZW's depth.
+        {
+            auto modes = [](std::initializer_list<uint32_t> m) {
+                uint32_t v = 0, i = 0;
+                for (uint32_t x : m) v |= x << (5 * i++);
+                return v;
+            };
+            struct Case { uint32_t modes, inputs, dims[4]; };
+            const Case cases[] = {
+                {modes({1, 7, 15, 16}), 1u << 16 | 2u << 20, {2, 2, 2, 2}},   // PROJECT2D, BUMPENVMAP_LUM, DPNDNT_AR, DPNDNT_GB
+                {modes({1, 6, 0, 0}), 0, {2, 2, 0, 0}},                       // BUMPENVMAP
+                {modes({1, 17, 9, 0}), 0, {2, 0, 2, 0}},                      // DOTPRODUCT, DOT_ST
+                {modes({1, 17, 17, 14}), 0, {2, 0, 0, 6}},                    // ... DOT_STR_CUBE
+                {modes({1, 17, 17, 13}), 0, {2, 0, 0, 3}},                    // ... DOT_STR_3D
+                {modes({1, 17, 11, 12}), 0, {2, 0, 6, 6}},                    // DOT_RFLCT_DIFF, DOT_RFLCT_SPEC
+                {modes({1, 17, 10, 0}), 0, {2, 0, 0, 0}},                     // DOT_ZW at stage 2
+            };
+            int n = 0;
+            for (const Case& k : cases) {
+                for (uint32_t map = 0; map < 8; ++map) {
+                    gfx::nv2a::CombinerSetup m = cs;
+                    m.texture_modes = k.modes, m.input_texture = k.inputs, m.dot_mapping = map | map << 4 | map << 8;
+                    std::copy_n(k.dims, 4, m.texture_dims);
+                    const char* why = gfx::nv2a::combiners_unsupported(m);
+                    if (why) std::fprintf(stderr, "case %d: %s\n", n, why);
+                    CHECK(why == nullptr);
+                    const auto code = gfx::nv2a::combiners(m);
+                    CHECK(code.size() > 5);
+                    if (const char* dir = std::getenv("QILIN_SPV_DIR"))
+                        if (std::FILE* f = std::fopen((std::string(dir) + "/test_ps_mode" + std::to_string(n) + "_" + std::to_string(map) + ".spv").c_str(), "wb")) {
+                            std::fwrite(code.data(), 4, code.size(), f);
+                            std::fclose(f);
+                        }
+                }
+                ++n;
+            }
+            // And what the hardware can't do is named.
+            gfx::nv2a::CombinerSetup bad = cs;
+            bad.texture_modes = modes({6, 0, 0, 0});  // a bump map at stage 0
+            CHECK(gfx::nv2a::combiners_unsupported(bad) != nullptr);
+            bad.texture_modes = modes({1, 9, 0, 0});  // DOT_ST without DOTPRODUCT before it
+            CHECK(gfx::nv2a::combiners_unsupported(bad) != nullptr);
+        }
+        // The same as a point sprite, with linear fog: other code, the same checks.
+        cs.point_sprite = 1;
+        cs.fog_mode = 0x2601;
+        const auto sprite = gfx::nv2a::combiners(cs);
+        CHECK(sprite.size() > 5 && sprite != spv && cs.hash() != gfx::nv2a::CombinerSetup{}.hash());
+        if (const char* dir = std::getenv("QILIN_SPV_DIR"))
+            if (std::FILE* f = std::fopen((std::string(dir) + "/test_ps_sprite.spv").c_str(), "wb")) {
+                std::fwrite(sprite.data(), 4, sprite.size(), f);
+                std::fclose(f);
+            }
     }
     // Swizzling: a 4x4 texture interleaves x and y bits, x first.
     CHECK(gfx::swizzle_offset(1, 0, 0, 4, 4, 1) == 1 && gfx::swizzle_offset(0, 1, 0, 4, 4, 1) == 2 &&

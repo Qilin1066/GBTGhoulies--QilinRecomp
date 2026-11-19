@@ -21,6 +21,7 @@
 
 #include "regions.hpp"
 #include "host.hpp"
+#include "sched.hpp"
 #include "xbe.hpp"
 #include "audio.hpp"
 #include "audio_out.hpp"
@@ -136,6 +137,7 @@ int main(int argc, char** argv) {
     host::D3dConfig d3d;
     std::string dump_audio;
     bool headless = false, fullscreen = false, mute = false;
+    uint32_t audio_channels = 0;  // the device's own
     uint32_t ram_mb = host::kRetailRamMb;
     for (int k = 1; k < argc; ++k) {
         const std::string_view a = argv[k];
@@ -159,6 +161,12 @@ int main(int argc, char** argv) {
             headless = true;
         } else if (a == "--mute") {
             mute = true;
+        } else if (a == "--audio-channels" && k + 1 < argc) {
+            audio_channels = uint32_t(std::strtoul(argv[++k], nullptr, 10));
+            if (audio_channels != 2 && audio_channels != 6) {
+                std::fprintf(stderr, "qilin_run: --audio-channels takes 2 or 6\n");
+                return 2;
+            }
         } else if (a == "--fullscreen") {
             fullscreen = true;
         } else if (a == "--gpu" && k + 1 < argc) {
@@ -172,7 +180,7 @@ int main(int argc, char** argv) {
     }
     if (!path) {
         std::fprintf(stderr,
-                     "usage: qilin_run [--ram-mb N] [--game-dir DIR] [--data-dir DIR] [--dump-frames DIR] [--dump-audio FILE.wav] [--frames N] [--gpu N] [--headless] [--fullscreen] [--mute] <default.xbe>\n"
+                     "usage: qilin_run [--ram-mb N] [--game-dir DIR] [--data-dir DIR] [--dump-frames DIR] [--dump-audio FILE.wav] [--frames N] [--gpu N] [--headless] [--fullscreen] [--mute] [--audio-channels 2|6] <default.xbe>\n"
                      "  --ram-mb N       guest RAM in MB (%u by default, as the retail Xbox)\n"
                      "  --game-dir DIR   the extracted disc (default: default.xbe's directory)\n"
                      "  --data-dir DIR   the hard disk: saves and caches (default: %s)\n"
@@ -182,7 +190,8 @@ int main(int argc, char** argv) {
                      "  --gpu N          the Vulkan device to use, by index (default: the best one)\n"
                      "  --headless       no window (frames are still drawn, for --dump-frames)\n"
                      "  --fullscreen     start fullscreen (F11 or Alt+Enter switches)\n"
-                     "  --mute           no sound output (--headless implies it; --dump-audio still writes)\n",
+                     "  --mute           no sound output (--headless implies it; --dump-audio still writes)\n"
+                     "  --audio-channels 2 or 6 (5.1); by default 5.1 where the sound device has six or more speakers\n",
                      host::kRetailRamMb, default_data_dir().string().c_str());
         return 2;
     }
@@ -287,8 +296,9 @@ int main(int argc, char** argv) {
     std::unique_ptr<platform::AudioOut> sound;
     if (!headless && !mute) {
         sound = std::make_unique<platform::AudioOut>();
-        if (!sound->start(audio::kOutputRate, 2)) sound.reset();
+        if (!sound->start(audio::kOutputRate, audio_channels)) sound.reset();
     }
+    host::set_audio_surround(sound && sound->channels() == 6);
     host::register_dsound(dump_audio, sound.get());
     host::register_kernel();
     const std::filesystem::path disc = game_dir ? std::filesystem::path(game_dir) : std::filesystem::path(path).parent_path();
@@ -302,6 +312,7 @@ int main(int argc, char** argv) {
     // StackBase, and starts the stack under it.
     const uint32_t tls = tls_size(m);
     host::init_main_thread(c, mm.kpcr(), mm.kthread(), mm.stack_top(), host::MemoryMap::kStackSize, tls);
+    host::sched::init_main(c, mm.kthread(), host::call_guest);  // the scheduler, with this as the main thread
     if (tls) init_tls(c, mm.stack_top() - tls);
     c.fpcw = 0x027F;
     c.esp = (mm.stack_top() - tls) & ~15u;

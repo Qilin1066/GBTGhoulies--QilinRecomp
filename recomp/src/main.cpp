@@ -72,7 +72,10 @@ constexpr Range kXact{0x1BABA0, 0x1C57D0};   // the XACTENG section
 constexpr Range kXgrph{0x185440, 0x1A59D8};  // the XGRPH section: XGraphics (resource headers, swizzling, maths)
 constexpr Range kD3dx{0x184600, 0x185440};   // the D3DX section: D3DX's maths helpers
 constexpr Range kBink{0x1A59E0, 0x1BABA0};   // RAD's Bink video: the BINK section and its blitters (BINK32 … BINK32M)
-constexpr Range kLibraries[] = {kXapi, kCrt, kXact, kXgrph, kD3dx, kBink};
+// The WMADEC section: the WMA decoder XACT calls for WMA wave-bank entries,
+// pure computation over buffers (lifted as the other decoders are).
+constexpr Range kWmadec{0x1E3D20, 0x1FCD9C};
+constexpr Range kLibraries[] = {kXapi, kCrt, kXact, kXgrph, kD3dx, kBink, kWmadec};
 
 // DirectSound is replaced natively (it drives the APU), except these pure
 // helpers XACT calls, which compute without touching the hardware and are

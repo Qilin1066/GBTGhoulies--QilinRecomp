@@ -268,6 +268,20 @@ int main() {
               "aa4ae5e15272d00e95705637ce8a3b55ed402112");
     }
 
+    // The MMX helpers WMADEC's lifted code uses: arithmetic shifts (past the
+    // width, the sign everywhere), saturating packs, pmaddwd.
+    {
+        namespace mmx = rt::mmx;
+        CHECK(mmx::sar<int16_t>(0x8000'7FFF'FFFE'0004ull, 1) == 0xC000'3FFF'FFFF'0002ull);
+        CHECK(mmx::sar<int16_t>(0x8000'7FFF'0001'F000ull, 15) == 0xFFFF'0000'0000'FFFFull);
+        CHECK(mmx::sar<int16_t>(0x8000'7FFF'0001'F000ull, 40) == 0xFFFF'0000'0000'FFFFull);
+        CHECK(mmx::sar<int32_t>(0x8000'0000'0000'0010ull, 4) == 0xF800'0000'0000'0001ull);
+        CHECK(mmx::packssdw(0xFFFF'8000'0001'0000ull, 0x0000'0005'FFFF'FFFFull) == 0x0005'FFFF'8000'7FFFull);
+        CHECK(mmx::packuswb(0x0100'FFFF'007F'0080ull, 0) == 0x00000000'FF00'7F80ull);
+        CHECK(mmx::pmaddwd(0x0002'0003'FFFF'0004ull, 0x0005'0006'0007'0008ull) == (uint64_t(2 * 5 + 3 * 6) << 32 | uint32_t(-7 + 32)));
+        CHECK(mmx::add<uint32_t>(0xFFFF'FFFF'0000'0001ull, 0x0000'0001'0000'0001ull) == 0x0000'0000'0000'0002ull);
+    }
+
     if (failures) std::fprintf(stderr, "%d check(s) failed\n", failures);
     else std::printf("all host tests passed\n");
     return failures != 0;

@@ -1,6 +1,6 @@
 # Runtime: status (roadmap step 3)
 
-Last updated 2026-11-19 (v0.29.0: the first fight won, the mansion explored; v0.28.0: Chapter 1's first fight plays; v0.27.0: virtual memory in its own address space, as on the Xbox; v0.24.0: controllers, the kernel's SHA-1 and HMAC, the game reaches its menus and saves; v0.17.0: the game creates its shaders and stops at its first transform; v0.16.0: guest RAM mapped at the kernel's windows too; D3D's resource code lifted; the game creates its textures and stops at its first vertex shader. v0.15.0: audio starts, `audio.md`; the renderer and Direct3D are in `graphics.md`).
+Last updated 2026-11-19 (v0.30.0: guest threads on host threads, with the kernel's scheduling, waits, timers and DPCs; v0.29.0: the first fight won, the mansion explored; v0.28.0: Chapter 1's first fight plays; v0.27.0: virtual memory in its own address space, as on the Xbox; v0.24.0: controllers, the kernel's SHA-1 and HMAC, the game reaches its menus and saves; v0.17.0: the game creates its shaders and stops at its first transform; v0.16.0: guest RAM mapped at the kernel's windows too; D3D's resource code lifted; the game creates its textures and stops at its first vertex shader. v0.15.0: audio starts, `audio.md`; the renderer and Direct3D are in `graphics.md`).
 
 The runtime is everything the lifted game code needs that isn't lifted: guest memory, the Xbox kernel, D3D, DirectSound/XACT and the other XDK libraries. All of it is replaced natively (HLE); none of it is emulated.
 
@@ -79,11 +79,11 @@ Replacements read stdcall arguments with `host::arg(c, i)` and return with `host
 
 | Kernel function | Implementation |
 |---|---|
-| `RtlInitializeCriticalSection`, `RtlEnterCriticalSection`, `RtlLeaveCriticalSection`, `RtlTryEnterCriticalSection` | The kernel's algorithm on the guest's `RTL_CRITICAL_SECTION` (event, `LockCount`, `RecursionCount`, `OwningThread`). A wait for another thread stops the runtime, which has one thread so far |
+| `RtlInitializeCriticalSection`, `RtlEnterCriticalSection`, `RtlLeaveCriticalSection`, `RtlTryEnterCriticalSection` | The kernel's algorithm on the guest's `RTL_CRITICAL_SECTION` (event, `LockCount`, `RecursionCount`, `OwningThread`); a contended one waits on its event (Threads, below) |
 | `NtAllocateVirtualMemory`, `NtFreeVirtualMemory`, `NtQueryVirtualMemory` | Virtual memory above, by address: the virtual memory above RAM, or RAM for a fixed address in its range |
 | `MmAllocateContiguousMemory[Ex]`, `MmFreeContiguousMemory`, `MmPersistContiguousMemory` | Contiguous allocations above; persisting is a no-op |
 | `MmQueryStatistics` | Pages of RAM, available pages after the image, stack, kernel area, contiguous memory and committed virtual memory |
-| `KeInitializeDpc`, `KeInitializeTimerEx`, `KeSetTimer[Ex]`, `KeCancelTimer` | The guest objects are initialised as the kernel does. Timers are recorded with their due time and DPC; firing them waits for the scheduler. XAPI's first timer is its six-hour auto power-off |
+| `KeInitializeDpc`, `KeInitializeTimerEx`, `KeSetTimer[Ex]`, `KeCancelTimer` | The guest objects are initialised as the kernel does; timers fire on the scheduler's clock, signalling the timer and queueing its DPC, periodic ones again. XAPI's first timer is its six-hour auto power-off |
 | `ExQueryNonVolatileSetting` | A North American retail console with factory settings: English, 60 Hz, NTSC-M, region 1. An unmodelled setting stops the runtime |
 | `RtlNtStatusToDosError` | The NT table for the statuses the runtime and the file system return; any other status stops the runtime |
 | `HalRegisterShutdownNotification` | Accepted; the routines never run |
@@ -92,7 +92,7 @@ Replacements read stdcall arguments with `host::arg(c, i)` and return with `host
 | `XeLoadSection`, `XeUnloadSection` | XBE sections above |
 | `RtlRaiseException` | Stops the runtime with the exception code |
 | `XcSHAInit`, `XcSHAUpdate`, `XcSHAFinal`, `XcHMAC` (`kernel_crypto.cpp`) | SHA-1 and HMAC-SHA1, which XAPI signs saved games with. The SHA context is the caller's memory (XAPI's 116 bytes): the hash words, the length and the partial block. The signature key XAPI derives its keys from (`XboxSignatureKey`, set up from a console's EEPROM) is the kernel data area's zeros: the same on every machine, so saves move between installs, and a console's own saves don't verify (the game calls them damaged) |
-| `KfRaiseIrql`, `KfLowerIrql` (fastcall), `KeRaiseIrqlToDpcLevel` | The KPCR's IRQL byte, which XAPI reads directly. With one processor and no interrupts yet, raising it only records the level; lowering it with a raise, or raising it with a lower, stops the runtime (a bug check on the Xbox) |
+| `KfRaiseIrql`, `KfLowerIrql` (fastcall), `KeRaiseIrqlToDpcLevel` | The KPCR's IRQL byte, which XAPI reads directly. At DISPATCH_LEVEL and above the running thread isn't preempted; lowering below it takes a preemption that came due meanwhile. Lowering it with a raise, or raising it with a lower, stops the runtime (a bug check on the Xbox) |
 
 **The file system** (`recomp/runtime/host/kernel_io.cpp`) is the kernel's object namespace and I/O manager over host directories:
 
@@ -119,13 +119,29 @@ Names are matched case-insensitively, as on FATX and the disc's XDVDFS (an exact
 
 **Cache partitions.** XAPI gives each title one of the three cache partitions, recorded in the configuration area, and formats it the first time: it writes a FATX volume header, FAT and root directory as raw sectors. The runtime takes the header as the format: it empties the partition's folder and keeps the header (`partitionN.fatx`), whose cluster size the volume reports from then on. This title asks for 64 KB clusters on its Z: drive (XBE init flags), and XAPI refuses to mount a volume whose cluster size differs. Raw writes to a partition that aren't part of a format, and raw reads of one, stop the runtime.
 
+**Threads** (v0.30.0, `recomp/runtime/host/sched.cpp`). Each guest thread is a host thread, with the Xbox's single processor: one runs at a time, the one holding the processor, and the others wait on the scheduler for it. Lifted code runs without any lock; the scheduler's one mutex is taken only to wait, signal, yield or switch. The kernel's rules decide who runs: priorities 0-31 (a thread's base priority, 8, plus its increment, saturating), the highest ready thread first, round robin within a priority on a 20 ms quantum, a thread woken by an event given the processor when it outranks the running one. Preemption happens where the code can take it: every backward branch and call in lifted code checks one atomic flag (`QILIN_TICK`, a relaxed load), which the clock sets when the running thread's quantum is over or a higher-priority thread is ready. A clock thread keeps time: `KeTickCount` every millisecond, waits' timeouts, timers, quantum ends, and DPCs, which run at DISPATCH_LEVEL on their own context and 64 KB guest stack when no guest thread runs (or as the running thread lowers its IRQL). Each switch saves and restores the KPCR's fields that belong to a thread (the exception list, stack base and limit, `CurrentThread`, the IRQL), so `fs:` reads what the running thread's would. Dispatcher objects stay in guest memory in the kernel's layout (the header's type and signal state decide a wait), as XAPI and the game read them; who waits on what is kept in the scheduler.
+
+| Kernel function | Implementation |
+|---|---|
+| `PsCreateSystemThreadEx`, `PsTerminateSystemThread` | A KTHREAD and ETHREAD in the kernel's pool, the stack and TLS as XAPI's `CreateThread` asks (`0x14BB4D` starts it), suspended or not; exit unwinds the host thread and signals the thread object |
+| `NtCreateEvent`, `NtSetEvent`, `KeSetEvent`, `NtCreateMutant`, `NtReleaseMutant` | Notification and synchronization events, mutants with owner and recursion |
+| `KeWaitForSingleObject`, `NtWaitForSingleObject[Ex]`, `NtWaitForMultipleObjectsEx` | Events, mutants, semaphores, threads and timers; wait-any and wait-all; relative and absolute timeouts; a zero timeout polls |
+| `KeDelayExecutionThread`, `NtYieldExecution` | Sleeps on the clock; a yield hands the processor to a ready thread of the same priority |
+| `KeSetBasePriorityThread`, `NtSuspendThread`, `NtResumeThread` | As the kernel |
+| `KeInsertQueueDpc`, `KeRemoveQueueDpc` | The DPC queue the clock thread runs |
+| `ObReferenceObjectByHandle`, `ObfDereferenceObject`, `NtClose` | Handles to threads, events, mutants and timers |
+| `ExAllocatePoolWithTag`, `ExFreePool`, `ExQueryPoolBlockSize` | The kernel's pool, in guest memory |
+| `KeSaveFloatingPointState`, `KeRestoreFloatingPointState`, `KeStallExecutionProcessor`, `KeBugCheck` | Accepted; a stall waits; a bug check stops the runtime |
+
+In the runs so far the game starts no threads of its own (`qilin_run` prints each one that starts); the scheduler times its main thread, its waits and timers, and is ready for the threads later scenes may start. On the host, besides the guest threads, the audio mixer has its own thread (`audio.md`) and the GPU runs one submission behind the CPU (`graphics.md`).
+
 **XInput** (`recomp/runtime/host/xinput.cpp`): the controller ports over SDL3's gamepads, the keyboard as controller 1 (v0.24.0). See `input.md`.
 
 **Direct3D** (`recomp/runtime/host/d3d.cpp`) over the Vulkan renderer: the device, its frame buffers, clears and swaps at the display's vblank. See `graphics.md`.
 
 **DirectSound** (`recomp/runtime/host/dsound.cpp`) over the software mixer, beneath the lifted XACT. See `audio.md`.
 
-**Where it is now** (v0.29.0): the game runs its attract sequence, takes START, turns the book's pages, shows its save-slot menu, takes a name on its on-screen keyboard and saves (signed, as XAPI signs saves), loads the save, plays Chapter 1's story pages and movie, and loads the first level (Chapter 1, scene 2): Cooper in the mansion hall against the imps, with health, hits and the book's page turn when he's beaten, then the level again. Since v0.29.0 the fight can be won (Baines's congratulations, then the next scene's movie), Cooper picks up chairs to fight with, and walks the mansion: the hall, under the stairs, up the grand staircase and the landing above, in ten-minute runs with nothing stopping. It asks for disc files one at a time (they're staged from the disc as asked), and the runtime stops at each function it doesn't provide yet. Earlier, start-up writes the title's save metadata and images to `partition1/UDATA/4d530053/`, gets cache partition 5 formatted with 64 KB clusters and mounted as Z:, and checks that `D:\loctext\english` exists. With a disc file missing, the game shows its disc-error screen, as the console does: it loads `dirtydisk_bitmap` and draws the message into the front buffer (`LockRect`); the runtime doesn't show CPU writes to a frame buffer yet, so the screen stays as it was.
+**Where it is now** (v0.29.0): the game runs its attract sequence, takes START, turns the book's pages, shows its save-slot menu, takes a name on its on-screen keyboard and saves (signed, as XAPI signs saves), loads the save, plays Chapter 1's story pages and movie, and loads the first level (Chapter 1, scene 2): Cooper in the mansion hall against the imps, with health, hits and the book's page turn when he's beaten, then the level again. Since v0.29.0 the fight can be won (Baines's congratulations, then the next scene's movie), Cooper picks up chairs to fight with, and walks the mansion: the hall, under the stairs, up the grand staircase and the landing above, in ten-minute runs with nothing stopping. It asks for disc files one at a time (they're staged from the disc as asked), and the runtime stops at each function it doesn't provide yet. Earlier, start-up writes the title's save metadata and images to `partition1/UDATA/4d530053/`, gets cache partition 5 formatted with 64 KB clusters and mounted as Z:, and checks that `D:\loctext\english` exists. With a disc file missing, the game shows its disc-error screen, as the console does: it loads `dirtydisk_bitmap` and draws the message into the front buffer (`LockRect`), which the window shows since v0.30.0 (`graphics.md`). Since v0.30.0 its waits and timers run on the scheduler, its 3D sounds play positioned with the reverb, and it plays the same runs.
 
 ## Tests
 
@@ -133,7 +149,6 @@ Names are matched case-insensitively, as on FATX and the disc's XDVDFS (an exact
 
 ## Next
 
-1. **Through Chapter 1:** playing on into its later scenes, implementing what they stop at; the fixed-function lighting and fog as they come (`graphics.md`).
-2. **Surround sound** and the audio still to come (`audio.md`): WMA, the I3DL2 reverb, envelopes, LFOs, filters, 3D.
-3. **The scheduler:** guest threads (`PsCreateSystemThreadEx`), waits, events, timers and DPCs. Until then a second thread stops the runtime.
-4. **Keep running `qilin_run`** and implement each function it stops at.
+1. **Through Chapter 1:** playing on into its later scenes, implementing what they stop at (`graphics.md`).
+2. **Checking against the console:** the HRTF's scale, the reverb's levels, point sprites' coordinates (`audio.md`, `graphics.md`).
+3. **Keep running `qilin_run`** and implement each function it stops at: `D3DDevice_Release`, `D3DResource_IsBusy` and a few unlifted code addresses near Bink's (`0x165F96` to `0x16DF5A`) are called by lifted code and not yet reached.

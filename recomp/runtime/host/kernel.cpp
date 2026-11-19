@@ -12,6 +12,7 @@
 #include <string_view>
 
 #include "host.hpp"
+#include "sched.hpp"
 #include "strf.hpp"
 
 namespace qilin::host {
@@ -38,14 +39,6 @@ void init_event(const rt::Context& c, uint32_t ev, uint8_t type, bool signalled)
     st(c, ev + 12, ev + 8);
 }
 
-// A wait or wake-up between threads. The runtime has one thread so far, so
-// this can only mean a lock held across a missing thread, or a deadlock.
-[[noreturn]] void needs_threads(uint32_t ordinal, const char* what) {
-    static std::string why;
-    why = strf("%s: needs another thread, and the runtime has only the main thread so far", what);
-    rt::trap(kernel_addr(ordinal), why.c_str());
-}
-
 // VOID RtlInitializeCriticalSection(PRTL_CRITICAL_SECTION) (291)
 void rtl_initialize_critical_section(rt::Context& c) {
     const uint32_t cs = arg(c, 0);
@@ -62,8 +55,13 @@ void rtl_enter_critical_section(rt::Context& c) {
     const uint32_t lock = ld(c, cs + kCsLock) + 1;
     st(c, cs + kCsLock, lock);
     if (lock != 0) {  // already held
-        if (ld(c, cs + kCsOwner) != me) needs_threads(277, "RtlEnterCriticalSection on a lock another thread holds");
-        st(c, cs + kCsRecursion, ld(c, cs + kCsRecursion) + 1);
+        if (ld(c, cs + kCsOwner) == me) {
+            st(c, cs + kCsRecursion, ld(c, cs + kCsRecursion) + 1);
+            return ret(c, c.eax, 4);
+        }
+        sched::wait_object(cs);  // the section's event, which the owner sets when it leaves
+        st(c, cs + kCsOwner, me);
+        st(c, cs + kCsRecursion, 1);
     } else {
         st(c, cs + kCsOwner, me);
         st(c, cs + kCsRecursion, 1);
@@ -80,7 +78,7 @@ void rtl_leave_critical_section(rt::Context& c) {
     st(c, cs + kCsLock, lock);
     if (rec == 0) {
         st(c, cs + kCsOwner, 0);
-        if (int32_t(lock) >= 0) needs_threads(294, "RtlLeaveCriticalSection with waiters");
+        if (int32_t(lock) >= 0) sched::set_event(cs);  // a waiter takes it
     }
     ret(c, c.eax, 4);
 }
@@ -291,7 +289,11 @@ struct Setting {
     uint32_t index, value;
     const char* what;
 };
-constexpr Setting kSettings[] = {
+// The audio setting (XC_AUDIO_FLAGS): stereo, or surround with Dolby
+// Digital (2 | 0x10000) when the sound device takes 5.1, so the game and
+// DirectSound's 3D calculator pan to the back speakers (set_audio_surround).
+uint32_t g_audio_flags = 0;
+Setting kSettings[] = {
     {0x002, 0, "time zone bias"},        {0x007, 1, "language: English"},
     {0x008, 0x00400000, "video: 60 Hz"}, {0x009, 0, "audio: stereo"},
     {0x00A, 0, "parental control, games"}, {0x00B, 0, "parental control password"},
@@ -302,6 +304,7 @@ constexpr Setting kSettings[] = {
 void ex_query_non_volatile_setting(rt::Context& c) {
     const uint32_t index = arg(c, 0), ptype = arg(c, 1), value = arg(c, 2), len = arg(c, 3), plen = arg(c, 4);
     const auto it = std::ranges::find(kSettings, index, &Setting::index);
+    if (index == 0x009 && it != std::end(kSettings)) it->value = g_audio_flags;
     if (it == std::end(kSettings)) {
         static std::string why;
         why = strf("ExQueryNonVolatileSetting: setting %#x isn't modelled yet", index);
@@ -344,48 +347,14 @@ void rtl_nt_status_to_dos_error(rt::Context& c) {
 }
 
 // ---------------------------------------------------------------- timers
-// Timers are recorded with their due time (100 ns units on the interrupt
-// clock, which starts with the runtime) and DPC. Firing them belongs to the
-// scheduler, which isn't there yet; until then a due timer is reported when
-// the runtime stops. XAPI's first one is its six-hour auto power-off.
-struct Timer {
-    uint64_t due;      // interrupt time, 100 ns
-    uint32_t period;   // ms, 0 for one-shot
-    uint32_t dpc;
-};
-std::map<uint32_t, Timer>& timers() {
-    static std::map<uint32_t, Timer> t;
-    return t;
-}
-uint64_t interrupt_time() {  // 100 ns since the runtime started
-    static const auto start = std::chrono::steady_clock::now();
-    return uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count() / 100);
-}
 // BOOLEAN KeSetTimerEx(PKTIMER, LARGE_INTEGER DueTime, LONG Period, PKDPC) (150);
-// KeSetTimer (149) is the same with no period. A negative due time is relative.
-uint32_t set_timer(rt::Context& c, uint32_t t, uint32_t lo, uint32_t hi, uint32_t period, uint32_t dpc) {
-    const int64_t due = int64_t(uint64_t(hi) << 32 | lo);
-    const uint64_t now = interrupt_time();
-    const uint64_t at = due < 0 ? now + uint64_t(-due) : uint64_t(due);  // absolute times: treated as the interrupt clock's
-    const bool was = timers().erase(t) != 0;
-    timers()[t] = Timer{at, period, dpc};
-    rt::st8(mem(c), t + 3, 1, 0);  // Header.Inserted
-    st(c, t + 4, 0);               // SignalState: not yet
-    st(c, t + 0x10, uint32_t(at));
-    st(c, t + 0x14, uint32_t(at >> 32));
-    st(c, t + 0x20, dpc);
-    st(c, t + 0x24, period);
-    return was ? 1 : 0;
-}
-void ke_set_timer(rt::Context& c) { ret(c, set_timer(c, arg(c, 0), arg(c, 1), arg(c, 2), 0, arg(c, 3)), 16); }
-void ke_set_timer_ex(rt::Context& c) { ret(c, set_timer(c, arg(c, 0), arg(c, 1), arg(c, 2), arg(c, 3), arg(c, 4)), 20); }
+// KeSetTimer (149) is the same with no period. A negative due time is
+// relative. They fire on the scheduler's clock (sched.cpp).
+int64_t due_of(rt::Context& c) { return int64_t(uint64_t(arg(c, 2)) << 32 | arg(c, 1)); }
+void ke_set_timer(rt::Context& c) { ret(c, sched::set_timer(c, arg(c, 0), due_of(c), 0, arg(c, 3)), 16); }
+void ke_set_timer_ex(rt::Context& c) { ret(c, sched::set_timer(c, arg(c, 0), due_of(c), arg(c, 3), arg(c, 4)), 20); }
 // BOOLEAN KeCancelTimer(PKTIMER) (97)
-void ke_cancel_timer(rt::Context& c) {
-    const uint32_t t = arg(c, 0);
-    const bool was = timers().erase(t) != 0;
-    rt::st8(mem(c), t + 3, 0, 0);
-    ret(c, was ? 1u : 0u, 4);
-}
+void ke_cancel_timer(rt::Context& c) { ret(c, sched::cancel_timer(c, arg(c, 0)) ? 1u : 0u, 4); }
 
 struct KernelFn {
     const char* name;
@@ -541,8 +510,8 @@ void xe_unload_section(rt::Context& c) {
 
 // ---------------------------------------------------------------- IRQL
 // The current IRQL is the KPCR's Irql byte (+0x24), which XAPI reads
-// directly. With one processor and no interrupts yet, raising it only
-// records the level: nothing preempts the running code either way.
+// directly. At DISPATCH_LEVEL and above nothing preempts the running code
+// and DPCs wait; lowering it below runs what waited (sched.cpp).
 constexpr uint8_t kDispatchLevel = 2;
 uint8_t irql(const rt::Context& c) { return rt::ld8(mem(c), c.fs_base + 0x24, 0); }
 void set_irql(const rt::Context& c, uint8_t v) { rt::st8(mem(c), c.fs_base + 0x24, v, 0); }
@@ -560,6 +529,7 @@ void kf_lower_irql(rt::Context& c) {
     if (to > irql(c)) rt::trap(0, "KfLowerIrql: raising the IRQL (a bug check on the Xbox)");
     set_irql(c, to);
     ret(c, c.eax, 0);
+    if (to < kDispatchLevel && rt::g_preempt.load(std::memory_order_relaxed)) rt::preempt();
 }
 // KIRQL KeRaiseIrqlToDpcLevel(VOID) (129)
 void ke_raise_irql_to_dpc_level(rt::Context& c) {
@@ -613,6 +583,7 @@ const KernelExport* kernel_export(std::string_view name) {
 
 void init_kernel_data(rt::Context& c, uint32_t ordinal, uint32_t addr) {
     const rt::Mem m = mem(c);
+    sched::set_data_export(ordinal, addr);
     switch (ordinal) {
         case 326: {  // XeImageFileName: an ANSI_STRING naming the running XBE, the string after it
             static constexpr char kName[] = "\\Device\\CdRom0\\default.xbe";
@@ -638,6 +609,8 @@ void preload_section(rt::Context& c, uint32_t header) {
     shared_pages(c, header, +1);
 }
 
+void set_audio_surround(bool surround) { g_audio_flags = surround ? 0x00010002u : 0u; }
+
 void register_kernel() {
     for (const KernelFn& k : kKernel) {
         const KernelExport* e = kernel_export(k.name);
@@ -648,6 +621,7 @@ void register_kernel() {
         register_hle(kernel_addr(e->ordinal), e->name, k.fn);
     }
     register_kernel_crypto();
+    sched::register_kernel_sched();
 }
 
 // ---------------------------------------------------------------- KPCR

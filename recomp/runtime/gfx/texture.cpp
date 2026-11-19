@@ -10,7 +10,7 @@ namespace qilin::gfx {
 
 namespace {
 
-enum class Kind : uint8_t { Unsupported, Argb8, Xrgb8, Rgb565, Argb1555, Xrgb1555, Argb4444, L8, Al8, A8, A8l8, Abgr8, Bgra8, Rgba8, Rgba5551, Rgba4444, L16, Dxt1, Dxt3, Dxt5 };
+enum class Kind : uint8_t { Unsupported, Argb8, Xrgb8, Rgb565, Argb1555, Xrgb1555, Argb4444, L8, Al8, A8, A8l8, Abgr8, Bgra8, Rgba8, Rgba5551, Rgba4444, L16, Dxt1, Dxt3, Dxt5, P8, G8b8, R8b8, R6g5b5 };
 
 struct FormatInfo {
     Kind kind;
@@ -29,6 +29,7 @@ FormatInfo format_info(uint32_t code) {
         case 0x05: return {Kind::Rgb565, 16, false};
         case 0x06: return {Kind::Argb8, 32, false};
         case 0x07: return {Kind::Xrgb8, 32, false};
+        case 0x0B: return {Kind::P8, 8, false};  // palettized: an index into the stage's palette
         case 0x0C: return {Kind::Dxt1, 4, false};
         case 0x0E: return {Kind::Dxt3, 8, false};
         case 0x0F: return {Kind::Dxt5, 8, false};
@@ -44,6 +45,14 @@ FormatInfo format_info(uint32_t code) {
         case 0x1E: return {Kind::Xrgb8, 32, true};
         case 0x1F: return {Kind::A8, 8, true};
         case 0x20: return {Kind::A8l8, 16, true};
+        // The bump-map formats (V8U8, L6V5U5), read as the GPU's G8B8 and
+        // R6G5B5, and R8B8.
+        case 0x16: return {Kind::R8b8, 16, true};
+        case 0x17: return {Kind::G8b8, 16, true};
+        case 0x27: return {Kind::R6g5b5, 16, false};
+        case 0x28: return {Kind::G8b8, 16, false};
+        case 0x29: return {Kind::R8b8, 16, false};
+        case 0x37: return {Kind::R6g5b5, 16, true};
         case 0x32: return {Kind::L16, 16, false};
         case 0x35: return {Kind::L16, 16, true};
         case 0x38: return {Kind::Rgba5551, 16, false};
@@ -81,6 +90,19 @@ void texel(Kind k, const uint8_t* p, uint8_t* o) {
         case Kind::A8: o[0] = o[1] = o[2] = 0, o[3] = p[0]; break;
         case Kind::A8l8: o[0] = o[1] = o[2] = p[0], o[3] = p[1]; break;
         case Kind::L16: o[0] = o[1] = o[2] = p[1], o[3] = 255; break;
+        case Kind::P8: o[0] = p[0], o[1] = o[2] = o[3] = 0; break;  // the index, looked up after (decode_texture)
+        // Two channels in a 16-bit texel, the high byte first by name; the
+        // channels a format lacks read 1 (the bump maps' signed bytes stay
+        // as they are, for the texture modes to read as two's complement).
+        case Kind::G8b8: o[0] = 255, o[1] = p[1], o[2] = p[0], o[3] = 255; break;
+        case Kind::R8b8: o[0] = p[1], o[1] = 255, o[2] = p[0], o[3] = 255; break;
+        case Kind::R6g5b5: {
+            // L6V5U5: an unsigned 6-bit luminance; V and U signed 5-bit, as
+            // signed bytes of the same value.
+            auto s5 = [](uint32_t v) { const int x = int(v & 31) - (v & 16 ? 32 : 0); return uint8_t(int8_t(std::clamp(x * 127 / 15, -128, 127))); };
+            o[0] = expand(h >> 10 & 63, 6), o[1] = s5(h >> 5), o[2] = s5(h), o[3] = 255;
+            break;
+        }
         default: o[0] = o[1] = o[2] = o[3] = 0; break;
     }
 }
@@ -161,6 +183,7 @@ bool texture_shape(uint32_t format, uint32_t size, TextureShape* out, std::strin
     s.linear = info.linear;
     s.compressed = info.kind == Kind::Dxt1 || info.kind == Kind::Dxt3 || info.kind == Kind::Dxt5;
     s.bits_per_texel = info.bits;
+    s.palettized = info.kind == Kind::P8;
     if (s.linear) {
         s.width = (size & 0xFFF) + 1;
         s.height = (size >> 12 & 0xFFF) + 1;
@@ -193,7 +216,7 @@ bool texture_shape(uint32_t format, uint32_t size, TextureShape* out, std::strin
     return true;
 }
 
-TextureData decode_texture(const TextureShape& s, const uint8_t* data) {
+TextureData decode_texture(const TextureShape& s, const uint8_t* data, const uint8_t* palette) {
     const FormatInfo info = format_info(s.color_format);
     TextureData t;
     t.width = s.width, t.height = s.height, t.depth = s.depth, t.levels = s.levels, t.faces = s.cube ? 6 : 1, t.linear = s.linear;
@@ -232,6 +255,12 @@ TextureData decode_texture(const TextureShape& s, const uint8_t* data) {
                             texel(info.kind, src + size_t(swizzle_offset(x, y, z, w, h, d)) * bpp, dst + ((size_t(z) * h + y) * w + x) * 4);
                 src += size_t(w) * h * d * bpp;
             }
+        }
+    }
+    if (info.kind == Kind::P8) {  // the palette's A8R8G8B8 entries (B, G, R, A in memory)
+        for (size_t i = 0; i < t.rgba.size(); i += 4) {
+            const uint8_t* e = palette ? palette + size_t(t.rgba[i]) * 4 : nullptr;
+            t.rgba[i] = e ? e[2] : 0, t.rgba[i + 1] = e ? e[1] : 0, t.rgba[i + 2] = e ? e[0] : 0, t.rgba[i + 3] = e ? e[3] : 0;
         }
     }
     return t;

@@ -29,14 +29,16 @@ struct TextureShape {
     uint32_t width = 0, height = 0, depth = 1, levels = 1, pitch = 0;
     bool cube = false, linear = false, compressed = false;
     uint32_t bits_per_texel = 0;  // 4 for DXT1, 8 for DXT3/5
+    bool palettized = false;      // P8: indices into the stage's palette
     size_t bytes = 0;             // all levels and faces, as stored in guest memory
 };
 
 // Reads the header words; false (with the reason) for a format not supported yet.
 bool texture_shape(uint32_t format, uint32_t size, TextureShape* out, std::string* why);
 
-// Decodes the texels at `data` (bytes from that address on) to RGBA8.
-TextureData decode_texture(const TextureShape& shape, const uint8_t* data);
+// Decodes the texels at `data` (bytes from that address on) to RGBA8; a
+// palettized texture (palettized) through `palette`, 256 A8R8G8B8 entries.
+TextureData decode_texture(const TextureShape& shape, const uint8_t* data, const uint8_t* palette = nullptr);
 
 // The Morton (swizzled) offset of texel (x, y, z) in a power-of-two texture.
 uint32_t swizzle_offset(uint32_t x, uint32_t y, uint32_t z, uint32_t width, uint32_t height, uint32_t depth);

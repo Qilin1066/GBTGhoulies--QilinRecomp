@@ -509,6 +509,23 @@ void FnEmitter::emit(const Insn& i, uint8_t live_out) {
                              write(i, s, w, "a")));
             return;
         }
+        case ZYDIS_MNEMONIC_XADD: {
+            // xadd d, s: d = d + s and s = the old d, flags as add. (One
+            // guest processor runs at a time, so lock adds nothing.)
+            const int w = width(i, d);
+            const uint32_t sg = sign_of(w);
+            line("{");
+            line(std::format("uint32_t a = {}, b = {};", read(i, d, w), read(i, s, w)));
+            line(std::format("[[maybe_unused]] uint32_t r = {};", masked("a + b", w)));
+            if (need & CF) line("cf = r < a;");
+            if (need & OF) line(std::format("of = ((a ^ r) & (b ^ r) & 0x{:X}u) != 0;", sg));
+            if (need & AF) line("af = ((a ^ b ^ r) & 0x10u) != 0;");
+            emit_szp(need, w);
+            line(write(i, s, w, "a"));
+            line(write(i, d, w, "r"));
+            line("}");
+            return;
+        }
         case ZYDIS_MNEMONIC_ADD: case ZYDIS_MNEMONIC_SUB: case ZYDIS_MNEMONIC_CMP: case ZYDIS_MNEMONIC_ADC:
         case ZYDIS_MNEMONIC_SBB: case ZYDIS_MNEMONIC_AND: case ZYDIS_MNEMONIC_OR: case ZYDIS_MNEMONIC_XOR:
         case ZYDIS_MNEMONIC_TEST: {
@@ -971,6 +988,10 @@ void FnEmitter::emit(const Insn& i, uint8_t live_out) {
         case ZYDIS_MNEMONIC_PAND: case ZYDIS_MNEMONIC_PANDN:
         case ZYDIS_MNEMONIC_PSLLW: case ZYDIS_MNEMONIC_PSLLD: case ZYDIS_MNEMONIC_PSLLQ:
         case ZYDIS_MNEMONIC_PSRLW: case ZYDIS_MNEMONIC_PSRLD: case ZYDIS_MNEMONIC_PSRLQ:
+        case ZYDIS_MNEMONIC_PSRAW: case ZYDIS_MNEMONIC_PSRAD:
+        case ZYDIS_MNEMONIC_PADDD: case ZYDIS_MNEMONIC_PSUBD: case ZYDIS_MNEMONIC_PSUBW: case ZYDIS_MNEMONIC_PSUBSW:
+        case ZYDIS_MNEMONIC_PACKSSDW: case ZYDIS_MNEMONIC_PACKSSWB: case ZYDIS_MNEMONIC_PACKUSWB: case ZYDIS_MNEMONIC_PMADDWD:
+        case ZYDIS_MNEMONIC_PADDB: case ZYDIS_MNEMONIC_PSUBB:
         case ZYDIS_MNEMONIC_PUNPCKLBW: case ZYDIS_MNEMONIC_PUNPCKHBW: case ZYDIS_MNEMONIC_PUNPCKLDQ: case ZYDIS_MNEMONIC_PUNPCKHDQ: {
             const bool dm = d.kind == Operand::Kind::Reg && mm_index(d.reg) >= 0;
             const bool sm = s.kind == Operand::Kind::Reg && mm_index(s.reg) >= 0;
@@ -1009,6 +1030,18 @@ void FnEmitter::emit(const Insn& i, uint8_t live_out) {
                 case ZYDIS_MNEMONIC_PSRLW: e = std::format("rt::mmx::shr<uint16_t>({}, {})", a, src); break;
                 case ZYDIS_MNEMONIC_PSRLD: e = std::format("rt::mmx::shr<uint32_t>({}, {})", a, src); break;
                 case ZYDIS_MNEMONIC_PSRLQ: e = std::format("rt::mmx::shr<uint64_t>({}, {})", a, src); break;
+                case ZYDIS_MNEMONIC_PSRAW: e = std::format("rt::mmx::sar<int16_t>({}, {})", a, src); break;
+                case ZYDIS_MNEMONIC_PADDD: e = std::format("rt::mmx::add<uint32_t>({}, {})", a, src); break;
+                case ZYDIS_MNEMONIC_PADDB: e = std::format("rt::mmx::add<uint8_t>({}, {})", a, src); break;
+                case ZYDIS_MNEMONIC_PSUBD: e = std::format("rt::mmx::sub<uint32_t>({}, {})", a, src); break;
+                case ZYDIS_MNEMONIC_PSUBW: e = std::format("rt::mmx::sub<uint16_t>({}, {})", a, src); break;
+                case ZYDIS_MNEMONIC_PSUBB: e = std::format("rt::mmx::sub<uint8_t>({}, {})", a, src); break;
+                case ZYDIS_MNEMONIC_PSUBSW: e = std::format("rt::mmx::psubsw({}, {})", a, src); break;
+                case ZYDIS_MNEMONIC_PACKSSDW: e = std::format("rt::mmx::packssdw({}, {})", a, src); break;
+                case ZYDIS_MNEMONIC_PACKSSWB: e = std::format("rt::mmx::packsswb({}, {})", a, src); break;
+                case ZYDIS_MNEMONIC_PACKUSWB: e = std::format("rt::mmx::packuswb({}, {})", a, src); break;
+                case ZYDIS_MNEMONIC_PMADDWD: e = std::format("rt::mmx::pmaddwd({}, {})", a, src); break;
+                case ZYDIS_MNEMONIC_PSRAD: e = std::format("rt::mmx::sar<int32_t>({}, {})", a, src); break;
                 case ZYDIS_MNEMONIC_PUNPCKLBW: e = std::format("rt::mmx::unpack<uint8_t>({}, {}, false)", a, src); break;
                 case ZYDIS_MNEMONIC_PUNPCKHBW: e = std::format("rt::mmx::unpack<uint8_t>({}, {}, true)", a, src); break;
                 case ZYDIS_MNEMONIC_PUNPCKLDQ: e = std::format("rt::mmx::unpack<uint32_t>({}, {}, false)", a, src); break;
@@ -1146,6 +1179,61 @@ void FnEmitter::emit(const Insn& i, uint8_t live_out) {
         case ZYDIS_MNEMONIC_CVTSI2SS:
             line(std::format("xmm{}.u[0] = rt::u32(float(int32_t({})));", xmm_dst(i, d), read(i, s, 32)));
             return;
+        case ZYDIS_MNEMONIC_CVTPS2PI: case ZYDIS_MNEMONIC_CVTTPS2PI: {
+            // Two floats (xmm lanes 0-1, or 64 bits of memory) to two int32 in an MMX register.
+            const int r = d.kind == Operand::Kind::Reg ? mm_index(d.reg) : -1;
+            if (r < 0) unsupported(i, "expected an MMX destination");
+            mark_fx(FTOP);
+            mark_fx(FTAG);
+            line("ftop = 0u; ftag = 0xFFu;");
+            std::string lo, hi;
+            if (s.kind == Operand::Kind::Reg) {
+                const int x = xmm_index(s.reg);
+                if (x < 0) unsupported(i, "expected an xmm source");
+                use_xmm(x);
+                lo = std::format("xmm{}.u[0]", x), hi = std::format("xmm{}.u[1]", x);
+            } else if (s.kind == Operand::Kind::Mem) {
+                lo = std::format("rt::ld32(m, {}, 0x{:X}u)", addr(i, s), i.addr);
+                hi = std::format("rt::ld32(m, {} + 4u, 0x{:X}u)", addr(i, s), i.addr);
+            } else {
+                unsupported(i, "SSE operand");
+            }
+            const char* f = M == ZYDIS_MNEMONIC_CVTTPS2PI ? "cvtt_f32_i32" : "cvt_f32_i32";
+            line(std::format("c.mm[{}] = uint64_t(rt::{}(rt::f32({}))) | (uint64_t(rt::{}(rt::f32({}))) << 32);", r, f, lo, f, hi));
+            return;
+        }
+        case ZYDIS_MNEMONIC_PSHUFW: {
+            // Each 16-bit lane of the destination from the source lane the immediate's 2-bit field names.
+            const int r = d.kind == Operand::Kind::Reg ? mm_index(d.reg) : -1;
+            if (r < 0) unsupported(i, "expected an MMX destination");
+            const Operand& im = i.op[2];
+            if (im.kind != Operand::Kind::Imm) unsupported(i, "pshufw without an immediate");
+            std::string src;
+            if (s.kind == Operand::Kind::Reg && mm_index(s.reg) >= 0) src = std::format("c.mm[{}]", mm_index(s.reg));
+            else if (s.kind == Operand::Kind::Mem) src = std::format("rt::ld64(m, {}, 0x{:X}u)", addr(i, s), i.addr);
+            else unsupported(i, "MMX source operand");
+            mark_fx(FTOP);
+            mark_fx(FTAG);
+            line("ftop = 0u; ftag = 0xFFu;");
+            const uint32_t sel = uint32_t(im.imm) & 0xFF;
+            line(std::format("{{ const uint64_t v_ = {}; c.mm[{}] = ((v_ >> {}) & 0xFFFFu) | (((v_ >> {}) & 0xFFFFu) << 16) | (((v_ >> {}) & 0xFFFFu) << 32) | (((v_ >> {}) & 0xFFFFu) << 48); }}",
+                             src, r, 16 * (sel & 3), 16 * (sel >> 2 & 3), 16 * (sel >> 4 & 3), 16 * (sel >> 6 & 3)));
+            return;
+        }
+        case ZYDIS_MNEMONIC_CVTPI2PS: {
+            // Two int32 (an MMX register or 64 bits of memory) to floats in xmm lanes 0-1.
+            const int x = xmm_dst(i, d);
+            std::string src;
+            if (s.kind == Operand::Kind::Reg && mm_index(s.reg) >= 0) src = std::format("c.mm[{}]", mm_index(s.reg));
+            else if (s.kind == Operand::Kind::Mem) src = std::format("rt::ld64(m, {}, 0x{:X}u)", addr(i, s), i.addr);
+            else unsupported(i, "MMX source operand");
+            line(std::format("{{ const uint64_t v_ = {}; xmm{}.u[0] = rt::u32(float(int32_t(uint32_t(v_)))); xmm{}.u[1] = rt::u32(float(int32_t(uint32_t(v_ >> 32)))); }}",
+                             src, x, x));
+            mark_fx(FTOP);
+            mark_fx(FTAG);
+            line("ftop = 0u; ftag = 0xFFu;");
+            return;
+        }
         case ZYDIS_MNEMONIC_CVTTSS2SI: case ZYDIS_MNEMONIC_CVTSS2SI:
             if (width(i, d) != 32) unsupported(i, "unexpected destination");
             line(write(i, d, 32, std::format("rt::{}(rt::f32({}))", M == ZYDIS_MNEMONIC_CVTTSS2SI ? "cvtt_f32_i32" : "cvt_f32_i32",

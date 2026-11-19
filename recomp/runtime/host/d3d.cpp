@@ -38,6 +38,7 @@
 #include "texture.hpp"
 #include "vsh.hpp"
 #include "host.hpp"
+#include "sched.hpp"
 #include "window.hpp"
 #include "strf.hpp"
 
@@ -84,6 +85,14 @@ struct Device {
     D3dConfig config;
     uint32_t width = 0, height = 0, interval = 1;
     std::vector<uint32_t> frame_buffers;  // guest surfaces; frame_buffers[i] is the renderer's buffer i
+    // Frame buffers the CPU locked (cpu_frames.cpp below): the renderer's
+    // buffer index and the hash of guest memory as the image was copied there.
+    struct CpuFrame {
+        uint32_t index;
+        uint64_t hash;
+    };
+    std::vector<CpuFrame> cpu_frames;
+    std::chrono::steady_clock::time_point cpu_frames_checked;
     uint32_t depth = 0;                   // guest surface, or 0
     uint32_t vblank_callback = 0, vblank_data = 0;
     uint32_t vblanks = 0, swaps = 0;
@@ -389,7 +398,17 @@ void get_render_target2(rt::Context& c) {
 // VOID D3D_BlockOnResource(D3DResource*): waits until the GPU is done with
 // the resource, before the CPU writes it. The renderer copies what it draws
 // from guest memory when it draws, so the GPU never holds guest memory.
-void block_on_resource(rt::Context& c) { ret(c, c.eax, 4); }
+// A frame buffer is the exception: the CPU locks it to read or write
+// pixels (the disc-error screen draws its message into the front buffer),
+// so its image is copied into guest memory first (cpu_frame_to_guest).
+void cpu_frame_to_guest(rt::Context& c, Device& d, uint32_t index);
+void flush_cpu_frames(rt::Context& c, Device& d);
+void block_on_resource(rt::Context& c) {
+    if (g_device)
+        for (uint32_t i = 0; i < g_device->frame_buffers.size(); ++i)
+            if (g_device->frame_buffers[i] == arg(c, 0)) cpu_frame_to_guest(c, *g_device, i);
+    ret(c, c.eax, 4);
+}
 
 // BYTE* D3DVertexBuffer_Lock2(D3DVertexBuffer*, DWORD Flags): the data's
 // address in the contiguous-memory window, as the original returns it. (The
@@ -449,6 +468,7 @@ void set_gamma_ramp(rt::Context& c) {
     const uint32_t ramp = arg(c, 1);
     for (uint32_t k = 0; k < 3; ++k)
         for (uint32_t i = 0; i < 256; ++i) d.gamma[k][i] = rt::ld8(mem(c), ramp + k * 256 + i, 0);
+    d.renderer->set_gamma_ramp(d.gamma);  // the window shows frames through it too
     ret(c, c.eax, 8);
 }
 
@@ -495,7 +515,7 @@ void clear(rt::Context& c) {
 // The window's events; closing it stops the runtime.
 void pump_window(const Device& d) {
     platform::Window* w = d.config.window;
-    if (!w) return;
+    if (!w || !host::sched::on_main_thread()) return;  // SDL's events belong to the first thread (macOS)
     w->pump(d.config.input);
     if (w->quit_requested()) {
         std::fflush(stderr);
@@ -512,6 +532,8 @@ void swap(rt::Context& c) {
     const uint32_t flags = arg(c, 0);
     if (flags & ~4u) unmodelled("D3DDevice_Swap", strf("flags %#x", flags));  // D3DSWAP_FINISH (4) only waits
     const uint32_t old_back = d.frame_buffers[d.renderer->back_index()];
+    if (!d.cpu_frames.empty()) flush_cpu_frames(c, d);
+    d.cpu_frames.clear();  // a lock lasts until the next Swap
     d.renderer->present();
     ++d.swaps;
     // A render target that was the back buffer becomes the new one (the
@@ -525,8 +547,9 @@ void swap(rt::Context& c) {
     }
     // Wait for the vblank the interval asks for, counted from the last swap's.
     const uint32_t target = std::max(d.vblanks + d.interval, vblanks_elapsed(d) + 1);
-    std::this_thread::sleep_until(d.epoch + std::chrono::duration_cast<std::chrono::steady_clock::duration>(
-                                                std::chrono::duration<double>(double(target) / kVblankHz)));
+    // The thread blocks until then, as on the console: other guest threads run.
+    host::sched::sleep_until(d.epoch + std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+                                           std::chrono::duration<double>(double(target) / kVblankHz)));
     mirror_device(c, d);
     run_vblanks(c, d, target, true);
     deliver_frame(d);
@@ -975,21 +998,34 @@ enum Rs : uint32_t {
 // A texture stage's texture, decoded and uploaded once (and again when its
 // texels change; they're compared once a frame).
 const Device::CachedTexture* target_texture(rt::Context& c, Device& d, uint32_t tex);
-const Device::CachedTexture* stage_texture(rt::Context& c, Device& d, const char* fn, uint32_t tex) {
+// A palettized (P8) texture reads the stage's palette, which the device
+// keeps at +0xF88 (SetPalette is inline: the game stores it there): 256
+// A8R8G8B8 entries at most (D3DPalette's size code: 256 >> code), part of
+// what the cached texture is made from.
+const Device::CachedTexture* stage_texture(rt::Context& c, Device& d, const char* fn, uint32_t tex, uint32_t stage) {
     if (const Device::CachedTexture* t = target_texture(c, d, tex)) return t;
     const uint32_t format = ld(c, tex + 12), size = ld(c, tex + 16), data = ld(c, tex + 4);
     gfx::TextureShape shape;
     std::string why;
     if (!gfx::texture_shape(format, size, &shape, &why)) unmodelled(fn, why);
     if (size_t(data) + shape.bytes > c.mem_size) unmodelled(fn, strf("a texture past the end of memory (%08X)", data));
-    const uint64_t key = uint64_t(data) << 32 ^ uint64_t(format) * 0x9E3779B1u ^ size;
+    uint8_t palette[256 * 4] = {};
+    uint64_t palette_hash = 0;
+    if (shape.palettized) {
+        const uint32_t pal = ld(c, kDeviceStorage + 0xF88 + 4 * stage);
+        if (!pal) unmodelled(fn, strf("a palettized texture on stage %u with no palette", stage));
+        const uint32_t entries = 256u >> ((ld(c, pal) >> 30) & 3), pdata = ld(c, pal + 4);
+        std::memcpy(palette, c.mem + pdata, entries * 4);
+        palette_hash = hash_bytes(palette, sizeof palette) | 1;
+    }
+    const uint64_t key = (uint64_t(data) << 32 ^ uint64_t(format) * 0x9E3779B1u ^ size) + palette_hash * 31;
     Device::CachedTexture& e = d.textures[key];
     if (e.id && e.checked == d.swaps) return &e;
     const uint8_t* texels = c.mem + data;
-    const uint64_t h = hash_bytes(texels, shape.bytes);
+    const uint64_t h = hash_bytes(texels, shape.bytes) ^ palette_hash;
     if (!e.id || e.content != h) {
         if (e.id) d.renderer->destroy_texture(e.id);
-        const gfx::TextureData t = gfx::decode_texture(shape, texels);
+        const gfx::TextureData t = gfx::decode_texture(shape, texels, shape.palettized ? palette : nullptr);
         e.id = d.renderer->create_texture(t);
         e.content = h;
         e.dims = t.dims(), e.linear = t.linear, e.width = t.width, e.height = t.height, e.depth = t.depth;
@@ -1044,11 +1080,58 @@ void viewport_constants(rt::Context& c, float scale[4], float offset[4]) {
 uint64_t hash_bytes(const uint8_t* p, size_t n, uint64_t h);
 std::pair<uint32_t, uint32_t> surface_size(const rt::Context& c, uint32_t surf);
 
+// ---------------------------------------------------------------- CPU frames
+// The Xbox's frame buffers are memory like any surface's: a title can lock
+// one and read or write its pixels. Here the pixels are the renderer's
+// images, so a lock (D3D_BlockOnResource) copies the image into guest
+// memory, as the CPU would find it, and keeps a hash of it. Before the next
+// draw or clear, at Swap, and while the title waits without drawing (the
+// idle hook, at most every 16 ms), guest memory that changed is copied back
+// into the image, and a changed front buffer is shown again. A frame buffer
+// is watched until the Swap after its lock.
+uint32_t surface_pitch(const rt::Context& c, uint32_t surf) { return ((ld(c, surf + 16) >> 24) + 1) * 64; }
+uint64_t cpu_frame_hash(const rt::Context& c, const Device& d, uint32_t index) {
+    const uint32_t surf = d.frame_buffers[index], data = ld(c, surf + 4), pitch = surface_pitch(c, surf);
+    return hash_bytes(c.mem + data, size_t(pitch) * d.height);
+}
+void cpu_frame_to_guest(rt::Context& c, Device& d, uint32_t index) {
+    const gfx::Image im = d.renderer->read_frame_buffer(index);
+    const uint32_t surf = d.frame_buffers[index], data = ld(c, surf + 4), pitch = surface_pitch(c, surf);
+    for (uint32_t y = 0; y < im.height; ++y)
+        for (uint32_t x = 0; x < im.width; ++x) {
+            const uint8_t* p = &im.rgba[(size_t(y) * im.width + x) * 4];
+            uint8_t* q = c.mem + data + size_t(y) * pitch + size_t(x) * 4;
+            q[0] = p[2], q[1] = p[1], q[2] = p[0], q[3] = p[3];  // B, G, R, A in memory
+        }
+    const uint64_t h = cpu_frame_hash(c, d, index);
+    for (auto& f : d.cpu_frames)
+        if (f.index == index) return void(f.hash = h);
+    d.cpu_frames.push_back({index, h});
+}
+void flush_cpu_frames(rt::Context& c, Device& d) {
+    for (auto& f : d.cpu_frames) {
+        const uint64_t h = cpu_frame_hash(c, d, f.index);
+        if (h == f.hash) continue;
+        f.hash = h;
+        const uint32_t surf = d.frame_buffers[f.index], data = ld(c, surf + 4), pitch = surface_pitch(c, surf);
+        gfx::Image im{d.width, d.height, std::vector<uint8_t>(size_t(d.width) * d.height * 4)};
+        for (uint32_t y = 0; y < d.height; ++y)
+            for (uint32_t x = 0; x < d.width; ++x) {
+                const uint8_t* q = c.mem + data + size_t(y) * pitch + size_t(x) * 4;
+                uint8_t* p = &im.rgba[(size_t(y) * d.width + x) * 4];
+                p[0] = q[2], p[1] = q[1], p[2] = q[0], p[3] = q[3];
+            }
+        d.renderer->write_frame_buffer(f.index, im);
+        if (f.index == d.renderer->front_index()) d.renderer->show_front();
+    }
+}
+
 // Points the renderer at the device's render target before a draw or clear,
 // and returns its size: the back buffer, or a texture's surface (made a
 // render target the first time). Drawing into the front buffer and other
 // formats stop the runtime.
 std::pair<uint32_t, uint32_t> apply_target(rt::Context& c, Device& d, const char* fn) {
+    if (!d.cpu_frames.empty()) flush_cpu_frames(c, d);
     const uint32_t target = ld(c, kDeviceStorage + kDevRenderTarget), depth = ld(c, kDeviceStorage + kDevDepth);
     if (target == d.frame_buffers[d.renderer->back_index()]) {
         d.renderer->set_render_target(0, gfx::Renderer::kDeviceDepth);
@@ -1130,8 +1213,17 @@ const Device::CachedTexture* target_texture(rt::Context& c, Device& d, uint32_t 
 // own passthrough program instead (passthrough_constants).
 constexpr uint32_t kDevTransforms = 0xC50;          // the device's matrices, 64 bytes each
 constexpr uint32_t kTextureStateTable = 0x181970;  // D3D__TextureState: 32 dwords per stage
-constexpr uint32_t kRsFogEnable = 92, kRsLighting = 102, kRsVertexBlend = 137;
+constexpr uint32_t kRsFogEnable = 92, kRsFogTableMode = 93, kRsFogStart = 94, kRsFogEnd = 95, kRsFogDensity = 96, kRsRangeFogEnable = 97,
+                   kRsLighting = 102, kRsVertexBlend = 137;
+// The point states (D3DRS_POINTSIZE on, from 0x181D40): size, minimum,
+// sprites, scaling, the attenuation's A, B and C, maximum.
+constexpr uint32_t kRsPointSize = 116, kRsPointSizeMin = 117, kRsPointSpriteEnable = 118, kRsPointScaleEnable = 119,
+                   kRsPointScaleA = 120, kRsPointScaleB = 121, kRsPointScaleC = 122, kRsPointSizeMax = 123;
 constexpr uint32_t kTsTextureTransformFlags = 21, kTsTexCoordIndex = 28;
+// The bump-environment states, in the order D3D pushes them to the GPU's
+// matrix (method 0x1B28 on: entry k from state 22 + k), then the luminance
+// scale and offset (0x1B38, 0x1B3C).
+constexpr uint32_t kTsBumpEnvMat00 = 22, kTsBumpEnvLScale = 26, kTsBumpEnvLOffset = 27;
 constexpr uint32_t kTsView = 0, kTsProjection = 1, kTsWorld = 6;
 
 struct FixedFunction {
@@ -1139,7 +1231,7 @@ struct FixedFunction {
     uint64_t key = 0;
 };
 
-FixedFunction fixed_function_program(rt::Context& c, const char* fn) {
+FixedFunction fixed_function_program(rt::Context& c, const char* fn, bool points) {
     using namespace gfx::vsh;
     const uint32_t fvf = ld(c, kDeviceStorage + kDevVertexShader + 4);
     auto rs = [&](uint32_t i) { return ld(c, kRenderStateTable + 4 * i); };
@@ -1150,15 +1242,21 @@ FixedFunction fixed_function_program(rt::Context& c, const char* fn) {
     if (fvf & ~0xFFFF0FE2u) unmodelled(fn, strf("FVF %#x", fvf));
     if (rs(kRsLighting)) unmodelled(fn, "fixed-function lighting (D3DRS_LIGHTING)");
     if (rs(kRsVertexBlend)) unmodelled(fn, "vertex blending (D3DRS_VERTEXBLEND)");
-    if (rs(kRsFogEnable)) unmodelled(fn, "fog with the fixed-function pipeline");
     for (uint32_t n = 0; n < texcount; ++n) {
         if (ts(n, kTsTexCoordIndex) != n) unmodelled(fn, strf("stage %u's texture coordinates from set %#x", n, ts(n, kTsTexCoordIndex)));
         if (ts(n, kTsTextureTransformFlags)) unmodelled(fn, strf("a texture transform on stage %u", n));
         if (((fvf >> (16 + 2 * n)) & 3) == 3) unmodelled(fn, strf("FVF %#x: one-component texture coordinates", fvf));
     }
 
+    // The fog coordinate, as the original sets the fog unit's source: the
+    // specular alpha without a table mode, else eye-space z (planar), or the
+    // distance to the eye with D3DRS_RANGEFOGENABLE (radial); the model-view
+    // transform's columns in c4-c7 (fixed_function_constants).
+    const uint32_t fog_gen = rs(kRsFogEnable) ? (rs(kRsFogTableMode) == 0 ? 0u : rs(kRsRangeFogEnable) ? 1u : 2u) : 3u;
+
     FixedFunction f;
-    f.key = 0xF1F0000000000000ull | uint64_t(fvf);
+    const bool point_scale = points && rs(kRsPointScaleEnable);
+    f.key = 0xF1F0000000000000ull | uint64_t(fvf) | uint64_t(fog_gen) << 32 | uint64_t(points) << 36 | uint64_t(point_scale) << 37;
     auto input = [](uint8_t i) { Operand o; o.kind = Src::Input; o.index = i; return o; };
     auto temp = [](uint8_t i) { Operand o; o.kind = Src::Temp; o.index = i; return o; };
     auto konst = [] { Operand o; o.kind = Src::Const; return o; };
@@ -1193,6 +1291,98 @@ FixedFunction fixed_function_program(rt::Context& c, const char* fn) {
     };
     mov(kD0, 3);  // the vertices' colours, or the registers' (absent_colour_registers)
     mov(kD1, 4);
+    if (fog_gen == 0) {  // mov oFog.x, v4.w
+        Instruction in;
+        in.mac = Mac::Mov, in.a = input(4);
+        for (auto& s : in.a.swizzle) s = 3;
+        out(in, kFog, 8);
+        f.program.code.push_back(in);
+    } else if (fog_gen != 3) {
+        for (uint8_t row = 0; row < 3; ++row) {  // dp4 r2.<row>, v0, c<4 + row>: the eye-space position
+            Instruction in;
+            in.mac = Mac::Dp4, in.a = input(0), in.b = konst(), in.constant = uint8_t(4 + row);
+            in.temp = 2, in.mac_temp_mask = uint8_t(8 >> row);
+            f.program.code.push_back(in);
+        }
+        Instruction in;
+        if (fog_gen == 2) {  // mov oFog.x, r2.z
+            in.mac = Mac::Mov, in.a = temp(2);
+            for (auto& s : in.a.swizzle) s = 2;
+        } else {  // dp3 r3.x, r2, r2 + rsq r1.x, r3.x, then mul oFog.x, r3.x, r1.x
+            Instruction d;
+            d.mac = Mac::Dp3, d.a = temp(2), d.b = temp(2);
+            d.temp = 3, d.mac_temp_mask = 8;
+            f.program.code.push_back(d);
+            Instruction r;
+            r.ilu = Ilu::Rsq, r.c = temp(3), r.temp = 1;  // the ILU alone: writes the instruction's temporary
+            for (auto& s : r.c.swizzle) s = 0;
+            r.ilu_temp_mask = 8;
+            f.program.code.push_back(r);
+            in.mac = Mac::Mul, in.a = temp(3), in.b = temp(1);
+            for (auto& s : in.a.swizzle) s = 0;
+            for (auto& s : in.b.swizzle) s = 0;
+        }
+        out(in, kFog, 8);
+        f.program.code.push_back(in);
+    }
+    if (points) {
+        // The point size (point_constants): D3DRS_POINTSIZE in pixels, or
+        // with D3DRS_POINTSCALEENABLE the viewport height × the size ×
+        // 1/sqrt(A + B·d + C·d²), d the distance to the eye; either way
+        // clamped to D3DRS_POINTSIZE_MIN and _MAX, as the NV2A's point
+        // parameters (LazySetPointParams, 0x1783E0) have it.
+        Operand size = konst();
+        for (auto& s : size.swizzle) s = 0;
+        if (point_scale) {
+            for (uint8_t row = 0; row < 3; ++row) {  // dp4 r2.<row>, v0, c<4 + row>
+                Instruction in;
+                in.mac = Mac::Dp4, in.a = input(0), in.b = konst(), in.constant = uint8_t(4 + row);
+                in.temp = 2, in.mac_temp_mask = uint8_t(8 >> row);
+                f.program.code.push_back(in);
+            }
+            Instruction d2;  // dp3 r3.x, r2, r2
+            d2.mac = Mac::Dp3, d2.a = temp(2), d2.b = temp(2), d2.temp = 3, d2.mac_temp_mask = 8;
+            f.program.code.push_back(d2);
+            Instruction inv;  // rsq r1.x, r3.x
+            inv.ilu = Ilu::Rsq, inv.c = temp(3), inv.temp = 1, inv.ilu_temp_mask = 8;
+            for (auto& s : inv.c.swizzle) s = 0;
+            f.program.code.push_back(inv);
+            Instruction dist;  // mul r3.y, r3.x, r1.x: d
+            dist.mac = Mac::Mul, dist.a = temp(3), dist.b = temp(1), dist.temp = 3, dist.mac_temp_mask = 4;
+            for (auto& s : dist.a.swizzle) s = 0;
+            for (auto& s : dist.b.swizzle) s = 0;
+            f.program.code.push_back(dist);
+            Instruction mov0;  // mov r3.z, c9.w (0)
+            mov0.mac = Mac::Mov, mov0.a = konst(), mov0.constant = 9, mov0.temp = 3, mov0.mac_temp_mask = 2;
+            for (auto& s : mov0.a.swizzle) s = 3;
+            f.program.code.push_back(mov0);
+            Instruction att;  // dph r4.x, r3.xyz, c8: C·d² + B·d + A
+            att.mac = Mac::Dph, att.a = temp(3), att.b = konst(), att.constant = 8, att.temp = 4, att.mac_temp_mask = 8;
+            f.program.code.push_back(att);
+            Instruction root;  // rsq r1.y, r4.x
+            root.ilu = Ilu::Rsq, root.c = temp(4), root.temp = 1, root.ilu_temp_mask = 4;
+            for (auto& s : root.c.swizzle) s = 0;
+            f.program.code.push_back(root);
+            Instruction scaled;  // mul r4.y, r1.y, c9.x
+            scaled.mac = Mac::Mul, scaled.a = temp(1), scaled.b = konst(), scaled.constant = 9, scaled.temp = 4, scaled.mac_temp_mask = 4;
+            for (auto& s : scaled.a.swizzle) s = 1;
+            for (auto& s : scaled.b.swizzle) s = 0;
+            f.program.code.push_back(scaled);
+            size = temp(4);
+            for (auto& s : size.swizzle) s = 1;
+        }
+        Instruction lo;  // max r4.z, size, c9.y
+        lo.mac = Mac::Max, lo.a = size, lo.b = konst(), lo.constant = 9, lo.temp = 4, lo.mac_temp_mask = 2;
+        for (auto& s : lo.b.swizzle) s = 1;
+        if (!point_scale) lo.a = lo.b, lo.a.swizzle[0] = lo.a.swizzle[1] = lo.a.swizzle[2] = lo.a.swizzle[3] = 0;
+        f.program.code.push_back(lo);
+        Instruction hi;  // min oPts.x, r4.z, c9.z
+        hi.mac = Mac::Min, hi.a = temp(4), hi.b = konst(), hi.constant = 9;
+        for (auto& s : hi.a.swizzle) s = 2;
+        for (auto& s : hi.b.swizzle) s = 2;
+        out(hi, kPts, 8);
+        f.program.code.push_back(hi);
+    }
     for (uint8_t n = 0; n < texcount; ++n) mov(uint8_t(kT0 + n), uint8_t(9 + n));
     f.program.code.back().final = true;
     f.program.header = 0x2078u | uint32_t(f.program.code.size()) << 16;
@@ -1205,8 +1395,6 @@ FixedFunction fixed_function_program(rt::Context& c, const char* fn) {
 // times the device's 0x940 for w-buffering, else 1); the screen-space
 // offset, less half a pixel where the device's flag 0x8000 and render state
 // 152 ask for it.
-constexpr uint32_t kRsFogTableMode = 93;
-
 void passthrough_constants(rt::Context& c, Device& d) {
     const uint32_t dev = kDeviceStorage;
     auto f = [&](uint32_t a) { return std::bit_cast<float>(ld(c, a)); };
@@ -1235,7 +1423,33 @@ void composite_constants(const rt::Context& c, float* out) {
         for (int j = 0; j < 4; ++j)
             for (int k = 0; k < 4; ++k) wvp[i][j] += wv[i][k] * p[k][j];
     for (int col = 0; col < 4; ++col)
-        for (int row = 0; row < 4; ++row) out[col * 4 + row] = wvp[row][col];
+        for (int row = 0; row < 4; ++row) out[col * 4 + row] = wvp[row][col], out[16 + col * 4 + row] = wv[row][col];
+}
+
+// The fog unit, as the original's flush (0x178AC0) sets it from the render
+// states: the mode (0 when fog is off) and the two parameters, linear with
+// (1, 1) on the vertices' own fog value without a table mode; linear from
+// D3DRS_FOGSTART and FOGEND (1 / (end − start), 8192 when they're equal);
+// exp and exp2 from D3DRS_FOGDENSITY times the constants in the image.
+struct FogUnit {
+    uint32_t mode = 0;
+    float p0 = 0, p1 = 0;
+};
+FogUnit fog_unit(const rt::Context& c) {
+    auto rs = [&](uint32_t i) { return ld(c, kRenderStateTable + 4 * i); };
+    auto rf = [&](uint32_t i) { return std::bit_cast<float>(rs(i)); };
+    auto img = [&](uint32_t a) { return std::bit_cast<float>(ld(c, a)); };
+    if (!rs(kRsFogEnable)) return {};
+    switch (rs(kRsFogTableMode)) {
+        case 0: return {0x2601, 1.0f, 1.0f};
+        case 3: {
+            const float start = rf(kRsFogStart), end = rf(kRsFogEnd);
+            const float scale = start == end ? img(0x180144) : 1.0f / (end - start);
+            return {0x2601, end * scale + 1.0f, -scale};
+        }
+        case 1: return {0x800, 1.5f, rf(kRsFogDensity) * img(0x203734)};
+        default: return {0x801, 1.5f, rf(kRsFogDensity) * img(0x203730)};
+    }
 }
 
 // ---------------------------------------------------------------- the fixed-function pixel pipeline
@@ -1252,8 +1466,6 @@ constexpr uint32_t kOne = 0x20;  // the zero register, inverted: 1
 void fixed_function_combiners(rt::Context& c, const char* fn, gfx::nv2a::CombinerSetup& cs, std::vector<float>& fsu) {
     auto rs = [&](uint32_t i) { return ld(c, kRenderStateTable + 4 * i); };
     auto ts = [&](uint32_t stage, uint32_t i) { return ld(c, kTextureStateTable + 4 * (32 * stage + i)); };
-    if (rs(kRsFogEnable)) unmodelled(fn, "fog with the fixed-function pixel pipeline");
-    if (rs(kRsSpecularEnable)) unmodelled(fn, "the specular colour added in the fixed-function pixel pipeline (D3DRS_SPECULARENABLE)");
     cs = {};
     uint32_t stages = 0, modes = 0;
     for (uint32_t stage = 0; stage < 4; ++stage) {
@@ -1312,6 +1524,13 @@ void fixed_function_combiners(rt::Context& c, const char* fn, gfx::nv2a::Combine
     }
     cs.combiner_count = stages | 0x1000u;  // each stage its own C0 (all the texture factor)
     cs.texture_modes = modes;
+    // The final combiner, as the original's fog flush (0x178AC0) sets it:
+    // with fog, rgb = fog.a × r0 + (1 − fog.a) × fog colour; without, r0;
+    // r0 + the specular colour (V1R0_SUM) in place of r0 with
+    // D3DRS_SPECULARENABLE; alpha r0's, the sum clamped.
+    const bool specular = rs(kRsSpecularEnable) != 0;
+    cs.final_abcd = rs(kRsFogEnable) ? 0x130C0300u | (specular ? 0x20000u : 0u) : (specular ? 0x0Eu : 0x0Cu);
+    cs.final_efgh = 0x1C80u;
     for (uint32_t i = 0; i < 8; ++i) color_to_float(rs(kRsTextureFactor), &fsu[(gfx::nv2a::kFsC0 + i) * 4]);
 }
 
@@ -1357,7 +1576,7 @@ void issue_draw(rt::Context& c, Device& d, const char* fn, uint32_t prim, Vertic
         }
         passthrough_constants(c, d);
     } else if (fixed_function) {
-        FixedFunction f = fixed_function_program(c, fn);
+        FixedFunction f = fixed_function_program(c, fn, prim == 1);
         vs_key = f.key ^ (uint64_t(v.mask) << 40);
         prog = std::move(f.program);
     } else {
@@ -1405,13 +1624,31 @@ void issue_draw(rt::Context& c, Device& d, const char* fn, uint32_t prim, Vertic
         fixed_function_combiners(c, fn, cs, fsu);
         cs.alpha_func = rs(kRsAlphaTestEnable) ? rs(kRsAlphaFunc) : 0;
     }
+    const FogUnit fog = fog_unit(c);
+    cs.fog_mode = fog.mode;
+    cs.point_sprite = prim == 1 && rs(kRsPointSpriteEnable);
+    fsu[gfx::nv2a::kFsFogParams * 4 + 0] = fog.p0;
+    fsu[gfx::nv2a::kFsFogParams * 4 + 1] = fog.p1;
     for (uint32_t stage = 0; stage < 4; ++stage) {
         fsu[(gfx::nv2a::kFsTexScale + stage) * 4 + 0] = fsu[(gfx::nv2a::kFsTexScale + stage) * 4 + 1] = 1;
         fsu[(gfx::nv2a::kFsTexScale + stage) * 4 + 2] = 1;
         const uint32_t mode = cs.texture_modes >> (5 * stage) & 0x1F;
         const uint32_t tex = ld(c, dev + 0xF78 + 4 * stage);
-        if (!tex || !(mode == 1 || mode == 2 || mode == 3)) continue;
-        const Device::CachedTexture* t = stage_texture(c, d, fn, tex);
+        // The bump-environment matrix and luminance terms, from the table
+        // entries of the stage D3D pushed them for: the stage itself under a
+        // pixel shader, else the one before (SetTextureState_BumpEnv, 0x1719D0).
+        if (stage && (mode == 6 || mode == 7)) {
+            const uint32_t from = fixed_pixels ? stage - 1 : stage;
+            auto tsf = [&](uint32_t i) { return std::bit_cast<float>(ld(c, kTextureStateTable + 4 * (32 * from + i))); };
+            for (uint32_t k = 0; k < 4; ++k) fsu[(gfx::nv2a::kFsBumpMat + stage) * 4 + k] = tsf(kTsBumpEnvMat00 + k);
+            fsu[(gfx::nv2a::kFsBumpLum + stage) * 4 + 0] = tsf(kTsBumpEnvLScale);
+            fsu[(gfx::nv2a::kFsBumpLum + stage) * 4 + 1] = tsf(kTsBumpEnvLOffset);
+        }
+        // Every mode that samples its stage's texture: the projected ones,
+        // the bump maps, the dependent reads and the dot-product lookups.
+        constexpr uint32_t kSamples = 1u << 1 | 1u << 2 | 1u << 3 | 1u << 6 | 1u << 7 | 1u << 9 | 1u << 11 | 1u << 12 | 1u << 13 | 1u << 14 | 1u << 15 | 1u << 16;
+        if (!tex || !(kSamples >> mode & 1)) continue;
+        const Device::CachedTexture* t = stage_texture(c, d, fn, tex, stage);
         cs.texture_dims[stage] = uint8_t(t->dims);
         cmd.textures[stage] = t->id;
         cmd.samplers[stage] = stage_sampler(c, fn, stage, *t, std::max(1u, ld(c, tex + 12) >> 16 & 0xF));
@@ -1451,11 +1688,26 @@ void issue_draw(rt::Context& c, Device& d, const char* fn, uint32_t prim, Vertic
         // program's screen-space step only divides by w.
         for (int col = 0; col < 4; ++col)
             for (int row = 0; row < 4; ++row) vsu[size_t(col) * 4 + size_t(row)] = d.composite[row * 4 + col];
+        for (int col = 0; col < 4; ++col)
+            for (int row = 0; row < 4; ++row) vsu[16 + size_t(col) * 4 + size_t(row)] = d.model_view[row * 4 + col];
         const float one[4] = {1, 1, 1, 0}, zero[4] = {};
         std::copy_n(one, 4, &vsu[58 * 4]);
         std::copy_n(zero, 4, &vsu[59 * 4]);
     } else if (fixed_function) {
-        composite_constants(c, vsu.data());  // c0-c3 (the program's own constants aren't used)
+        composite_constants(c, vsu.data());  // c0-c3, and the model view in c4-c7 (the program's own constants aren't used)
+    }
+    if (prim == 1) {
+        // The point size's constants (fixed_function_program): c8 the
+        // attenuation (C, B, 0, A), c9 (viewport height × size, or the size,
+        // minimum, maximum, 0); the screen uniform's w the size for programs
+        // that don't write oPts.
+        auto rf = [&](uint32_t i) { return std::bit_cast<float>(rs(i)); };
+        const float vh = float(ld(c, dev + kDevViewport + 12));
+        const float scale = rs(kRsPointScaleEnable) ? vh : 1.0f;
+        const float c8[4] = {rf(kRsPointScaleC), rf(kRsPointScaleB), 0.0f, rf(kRsPointScaleA)};
+        const float c9[4] = {scale * rf(kRsPointSize), rf(kRsPointSizeMin), std::min(rf(kRsPointSizeMax), 63.875f), 0.0f};
+        if (fixed_function) std::copy_n(c8, 4, &vsu[8 * 4]), std::copy_n(c9, 4, &vsu[9 * 4]);
+        vsu[gfx::nv2a::kVsScreen * 4 + 3] = rf(kRsPointSize);
     }
     const float zscale = std::bit_cast<float>(ld(c, dev + 0x944));
     vsu[gfx::nv2a::kVsScreen * 4 + 0] = 2.0f / float(target_w);
@@ -2479,8 +2731,16 @@ const D3dConfig& d3d_config() { return config_storage(); }
 
 void register_d3d(const D3dConfig& config) {
     config_storage() = config;
-    add_idle_hook([](rt::Context&) {
-        if (g_device) pump_window(*g_device);
+    add_idle_hook([](rt::Context& c) {
+        if (!g_device) return;
+        Device& d = *g_device;
+        pump_window(d);
+        // Pixels the title writes into a frame buffer while it waits (no draws, no Swap).
+        const auto now = std::chrono::steady_clock::now();
+        if (!d.cpu_frames.empty() && now - d.cpu_frames_checked >= std::chrono::milliseconds(16)) {
+            d.cpu_frames_checked = now;
+            flush_cpu_frames(c, d);
+        }
     });
     for (const D3dFn& f : kD3d) {
         const XdkSymbol* s = xdk_symbol(f.name);

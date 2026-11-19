@@ -184,6 +184,16 @@ std::vector<uint32_t> vertex_program(const vsh::Program& program, uint32_t input
     b.store(position, clip);
     s.interface.push_back(position);
 
+    // The point size, in pixels: the program's oPts.x where it writes it,
+    // else D3DRS_POINTSIZE (the screen uniform's w); at least a pixel and
+    // at most the hardware's 63.875 (the 6.3 size field D3D clamps to 0x1FF).
+    bool writes_size = false;
+    for (const auto& in : program.code) writes_size |= in.out_mask && !in.out_is_const && in.out_address == vsh::kPts;
+    const Id size_in = writes_size ? s.x(s.outputs[vsh::kPts]) : b.extract(s.f, screen, 3);
+    const Id point_size = b.builtin_var(spv::Storage::Output, s.f, spv::builtin::PointSize);
+    b.store(point_size, b.ext(glsl::FClamp, s.f, {size_in, b.c_float(1), b.c_float(63.875f)}));
+    s.interface.push_back(point_size);
+
     // Colours are clamped to [0, 1], as the hardware does.
     const Id zero = b.c_vec({0, 0, 0, 0}), one = b.c_vec({1, 1, 1, 1});
     auto out = [&](uint32_t location, Id value) {

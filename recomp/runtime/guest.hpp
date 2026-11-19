@@ -22,6 +22,8 @@
 #include <bit>
 #include <cmath>
 #include <cstddef>
+#include <atomic>
+#include <type_traits>
 #include <cstdint>
 #include <cstring>
 
@@ -144,6 +146,51 @@ inline uint64_t shr(uint64_t a, uint64_t n) {
     if (n >= sizeof(L) * 8) return 0;
     return lanes<L>(a, 0, [n](L x, L) { return L(x >> n); });
 }
+template <typename L>
+inline uint64_t add(uint64_t a, uint64_t b) { return lanes<L>(a, b, [](L x, L y) { return L(x + y); }); }
+template <typename L>
+inline uint64_t sub(uint64_t a, uint64_t b) { return lanes<L>(a, b, [](L x, L y) { return L(x - y); }); }
+inline uint64_t psubsw(uint64_t a, uint64_t b) {
+    return lanes<uint16_t>(a, b, [](uint16_t x, uint16_t y) {
+        const int32_t v = int32_t(int16_t(x)) - int32_t(int16_t(y));
+        return uint16_t(int16_t(v < -32768 ? -32768 : v > 32767 ? 32767 : v));
+    });
+}
+// Packs with saturation: a's lanes to the low half, b's to the high.
+inline uint64_t packssdw(uint64_t a, uint64_t b) {
+    auto sat = [](uint32_t v) { const int32_t x = int32_t(v); return uint64_t(uint16_t(int16_t(x < -32768 ? -32768 : x > 32767 ? 32767 : x))); };
+    return sat(uint32_t(a)) | sat(uint32_t(a >> 32)) << 16 | sat(uint32_t(b)) << 32 | sat(uint32_t(b >> 32)) << 48;
+}
+inline uint64_t packsswb(uint64_t a, uint64_t b) {
+    uint64_t r = 0;
+    for (int k = 0; k < 8; ++k) {
+        const int32_t x = int16_t(uint16_t((k < 4 ? a : b) >> (16 * (k & 3))));
+        r |= uint64_t(uint8_t(int8_t(x < -128 ? -128 : x > 127 ? 127 : x))) << (8 * k);
+    }
+    return r;
+}
+inline uint64_t packuswb(uint64_t a, uint64_t b) {
+    uint64_t r = 0;
+    for (int k = 0; k < 8; ++k) {
+        const int32_t x = int16_t(uint16_t((k < 4 ? a : b) >> (16 * (k & 3))));
+        r |= uint64_t(uint8_t(x < 0 ? 0 : x > 255 ? 255 : x)) << (8 * k);
+    }
+    return r;
+}
+// pmaddwd: each pair of signed 16-bit products summed into a 32-bit lane.
+inline uint64_t pmaddwd(uint64_t a, uint64_t b) {
+    auto w = [](uint64_t v, int k) { return int32_t(int16_t(uint16_t(v >> (16 * k)))); };
+    const uint32_t lo = uint32_t(w(a, 0) * w(b, 0) + w(a, 1) * w(b, 1));
+    const uint32_t hi = uint32_t(w(a, 2) * w(b, 2) + w(a, 3) * w(b, 3));
+    return uint64_t(lo) | uint64_t(hi) << 32;
+}
+// Arithmetic shifts: past the lane's width, every bit the sign.
+template <typename L>
+inline uint64_t sar(uint64_t a, uint64_t n) {
+    using U = std::make_unsigned_t<L>;
+    const int k = n >= sizeof(L) * 8 ? int(sizeof(L) * 8 - 1) : int(n);
+    return lanes<U>(a, 0, [k](U x, U) { return U(L(x) >> k); });
+}
 // Unpacks: the low (or high) halves of a and b, interleaved a, b, a, b.
 template <typename L>
 inline uint64_t unpack(uint64_t a, uint64_t b, bool high) {
@@ -163,6 +210,16 @@ inline uint64_t unpack(uint64_t a, uint64_t b, bool high) {
 void trace_write(uint32_t addr, uint32_t size);
 #endif
 
+// Preemption (host/sched.cpp): set when another guest thread should run or
+// a DPC is queued; lifted code checks it at its backward branches.
+inline std::atomic<bool> g_preempt{false};
+void preempt();
+#define QILIN_PREEMPT_POINT()                                                   \
+    do {                                                                        \
+        if (::qilin::rt::g_preempt.load(std::memory_order_relaxed)) [[unlikely]] \
+            ::qilin::rt::preempt();                                             \
+    } while (0)
+
 #if defined(QILIN_TEST_HOOKS)
 void enter_frame(uint32_t fn, uint32_t entry_esp);
 void leave_frame();
@@ -175,11 +232,15 @@ struct Frame {
 void tick();
 void tail_call();
 #define QILIN_FRAME(fn, esp) const ::qilin::rt::Frame qilin_frame_(fn, esp)
-#define QILIN_TICK() ::qilin::rt::tick()
+#define QILIN_TICK()         \
+    do {                     \
+        ::qilin::rt::tick(); \
+        QILIN_PREEMPT_POINT(); \
+    } while (0)
 #define QILIN_TAIL() ::qilin::rt::tail_call()
 #else
 #define QILIN_FRAME(fn, esp) ((void)0)
-#define QILIN_TICK() ((void)0)
+#define QILIN_TICK() QILIN_PREEMPT_POINT()
 #define QILIN_TAIL() ((void)0)
 #endif
 
