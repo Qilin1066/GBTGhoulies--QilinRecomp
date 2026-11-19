@@ -179,6 +179,14 @@ public:
     // of its size): its texels as the guest's memory has them.
     virtual Image read_render_target(uint32_t id) = 0;
     virtual void write_render_target(uint32_t id, const Image& image) = 0;
+    // Rectangles of a frame buffer (by index, as back_index and front_index
+    // number them) copied into a render target, unscaled, on the GPU: after
+    // what was drawn into the frame buffer, before what's drawn after. Each
+    // rectangle must lie inside both.
+    struct CopyRegion {
+        uint32_t sx = 0, sy = 0, width = 0, height = 0, dx = 0, dy = 0;
+    };
+    virtual void copy_frame_to_target(uint32_t frame_index, uint32_t target_id, const std::vector<CopyRegion>& regions) = 0;
 
     // Validation messages of error severity so far (0 without the layers).
     virtual uint32_t validation_errors() const = 0;

@@ -114,6 +114,7 @@ public:
     void destroy_texture(uint32_t id) override;
     void draw(const DrawCmd& cmd) override;
     uint32_t create_render_target(uint32_t width, uint32_t height) override;
+    void copy_frame_to_target(uint32_t frame_index, uint32_t target_id, const std::vector<CopyRegion>& regions) override;
     uint32_t create_depth_target(uint32_t width, uint32_t height) override;
     void set_render_target(uint32_t id, uint32_t depth) override;
     Image read_front_buffer() override { return read(color_[front_]); }
@@ -1811,6 +1812,32 @@ void VulkanRenderer::destroy_texture(uint32_t id) {
 
 // A texture to draw into: B8G8R8A8 as the frame buffers, cleared to zero,
 // then readable (draws sample it) until it's drawn into.
+void VulkanRenderer::copy_frame_to_target(uint32_t frame_index, uint32_t target_id, const std::vector<CopyRegion>& regions) {
+    auto it = render_targets_.find(target_id);
+    if (frame_index >= color_.size() || it == render_targets_.end() || regions.empty()) return;
+    Target& from = color_[frame_index];
+    Target& to = it->second;
+    if (target_id == current_rt_) end_pass(), current_rt_ = 0;  // not drawn into while it's copied into
+    end_pass();
+    record();
+    transition(from, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+    transition(to, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+    std::vector<VkImageCopy> copies;
+    for (const CopyRegion& r : regions) {
+        if (!r.width || !r.height || r.sx + r.width > from.width || r.sy + r.height > from.height || r.dx + r.width > to.width ||
+            r.dy + r.height > to.height)
+            continue;
+        VkImageCopy c{};
+        c.srcSubresource = c.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        c.srcOffset = {int32_t(r.sx), int32_t(r.sy), 0};
+        c.dstOffset = {int32_t(r.dx), int32_t(r.dy), 0};
+        c.extent = {r.width, r.height, 1};
+        copies.push_back(c);
+    }
+    if (!copies.empty()) vkCmdCopyImage(cmd_, from.image, from.layout, to.image, to.layout, uint32_t(copies.size()), copies.data());
+    transition(to, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+}
+
 uint32_t VulkanRenderer::create_render_target(uint32_t width, uint32_t height) {
     Target t = create_target(VK_FORMAT_B8G8R8A8_UNORM,
                              VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |

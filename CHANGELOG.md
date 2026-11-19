@@ -11,6 +11,11 @@ Each release is a git tag (`vX.Y.Z`) with a matching GitHub release. The version
 
 ## [Unreleased]
 
+## [0.33.3] - 2026-11-19
+
+### Fixed
+- **Page turns and the pause screen no longer stall**: `CopyRects` from a frame buffer into a one-level texture (the screen a page turns from, copied every frame of the turn) is an image copy on the GPU into the texture's renderer image, sampled from there. Before, each copy waited for the GPU to finish, read the 640×480 frame back and wrote it into guest memory pixel by pixel, every frame. A run through the title screen's page turn now reads nothing back. A CPU lock of such a texture hands its texels back to guest memory first.
+
 ## [0.33.2] - 2026-11-19
 
 ### Fixed

@@ -413,8 +413,14 @@ void get_render_target2(rt::Context& c) {
 // so its image is copied into guest memory first (cpu_frame_to_guest).
 void cpu_frame_to_guest(rt::Context& c, Device& d, uint32_t index);
 void flush_cpu_frames(rt::Context& c, Device& d);
+void hand_back_target(rt::Context& c, Device& d, uint32_t data);
+Device::TargetTexture& texture_target(rt::Context& c, Device& d, uint32_t data, uint32_t w, uint32_t h, uint32_t fmt, uint32_t pitch);
+
 void block_on_resource(rt::Context& c) {
     if (g_device) ++g_device->memory_epoch;
+    // A texture the GPU drew or copied into: its texels come back to guest
+    // memory before the CPU touches them (a lock or a destroy reaches here).
+    if (g_device) hand_back_target(c, *g_device, ld(c, arg(c, 0) + 4));
     if (g_device)
         for (uint32_t i = 0; i < g_device->frame_buffers.size(); ++i)
             if (g_device->frame_buffers[i] == arg(c, 0)) cpu_frame_to_guest(c, *g_device, i);
@@ -645,15 +651,54 @@ uint32_t pixel_offset(const SurfacePixels& p, uint32_t x, uint32_t y) {
 void copy_rects(rt::Context& c) {
     static constexpr const char* fn = "D3DDevice_CopyRects";
     Device& d = device(fn);
-    ++d.memory_epoch;  // the destination's memory changes
     const uint32_t src = arg(c, 0), rects = arg(c, 1), count = arg(c, 2), dst = arg(c, 3), points = arg(c, 4);
     const SurfacePixels from = surface_pixels(c, d, fn, src), to = surface_pixels(c, d, fn, dst);
     if (to.frame_buffer >= 0) unmodelled(fn, "a copy into a frame buffer");
+    if (count == 0 && rects) unmodelled(fn, "a rectangle list with no rectangles");
+    // The rectangles: source (left, top, right, bottom) and where each goes.
+    struct Move {
+        int32_t l, t, r, b, x, y;
+    };
+    std::vector<Move> moves;
+    for (uint32_t k = 0; k < (rects ? count : 1); ++k) {
+        Move mv{0, 0, int32_t(from.width), int32_t(from.height), 0, 0};
+        if (rects) {
+            mv.l = int32_t(ld(c, rects + 16 * k)), mv.t = int32_t(ld(c, rects + 16 * k + 4));
+            mv.r = int32_t(ld(c, rects + 16 * k + 8)), mv.b = int32_t(ld(c, rects + 16 * k + 12));
+        }
+        mv.x = mv.l, mv.y = mv.t;
+        if (points) mv.x = int32_t(ld(c, points + 8 * k)), mv.y = int32_t(ld(c, points + 8 * k + 4));
+        if (mv.l < 0 || mv.t < 0 || mv.r > int32_t(from.width) || mv.b > int32_t(from.height) || mv.l > mv.r || mv.t > mv.b || mv.x < 0 ||
+            mv.y < 0 || mv.x + (mv.r - mv.l) > int32_t(to.width) || mv.y + (mv.b - mv.t) > int32_t(to.height))
+            unmodelled(fn, strf("a rectangle (%d,%d)-(%d,%d) to (%d,%d) outside a surface (%ux%u to %ux%u)", mv.l, mv.t, mv.r, mv.b, mv.x, mv.y,
+                                from.width, from.height, to.width, to.height));
+        moves.push_back(mv);
+    }
+    // The frame into a texture (the page turns and the pause screen, every
+    // frame they run): on the GPU, from the frame buffer's image into the
+    // texture's, which is then sampled as a texture the GPU drew into. No
+    // waiting for the GPU and nothing through guest memory; a CPU lock of
+    // the texture hands it back (block_on_resource). A texture of more than
+    // one level goes the CPU's way: only its first level would be the image.
+    const uint32_t parent = ld(c, dst + 0x14);
+    const uint32_t parent_levels = parent ? std::max(1u, ld(c, parent + 12) >> 16 & 0xF) : 1;
+    const uint32_t frame = uint32_t(from.frame_buffer);
+    if (from.frame_buffer >= 0 && parent_levels == 1 && (frame == d.renderer->back_index() || frame == d.renderer->front_index())) {
+        if (!d.cpu_frames.empty()) flush_cpu_frames(c, d);
+        const uint32_t dst_fmt = (ld(c, dst + 12) >> 8) & 0xFF;
+        Device::TargetTexture& t = texture_target(c, d, to.data, to.width, to.height, dst_fmt, to.pitch);
+        std::vector<gfx::Renderer::CopyRegion> regions;
+        for (const Move& mv : moves)
+            regions.push_back({uint32_t(mv.l), uint32_t(mv.t), uint32_t(mv.r - mv.l), uint32_t(mv.b - mv.t), uint32_t(mv.x), uint32_t(mv.y)});
+        d.renderer->copy_frame_to_target(frame, t.texture.id, regions);
+        ret(c, 0, 20);
+        return;
+    }
+    ++d.memory_epoch;  // the destination's memory changes
     // Textures the GPU drew into come back to guest memory first, so the
     // copy reads and writes what the console's memory would hold.
     hand_back_target(c, d, from.data);
     hand_back_target(c, d, to.data);
-    if (count == 0 && rects) unmodelled(fn, "a rectangle list with no rectangles");
 
     std::vector<uint32_t> source;  // only for a frame buffer
     if (from.frame_buffer >= 0) {
@@ -671,28 +716,10 @@ void copy_rects(rt::Context& c) {
     auto read = [&](uint32_t x, uint32_t y) {
         return from.frame_buffer >= 0 ? source[size_t(y) * from.width + x] : rt::ld32(m, from.data + pixel_offset(from, x, y), 0);
     };
-    const uint32_t n = rects ? count : 1;
-    for (uint32_t r = 0; r < n; ++r) {
-        int32_t l = 0, t = 0, rr = int32_t(from.width), b = int32_t(from.height);
-        if (rects) {
-            l = int32_t(ld(c, rects + 16 * r));
-            t = int32_t(ld(c, rects + 16 * r + 4));
-            rr = int32_t(ld(c, rects + 16 * r + 8));
-            b = int32_t(ld(c, rects + 16 * r + 12));
-        }
-        int32_t px = l, py = t;
-        if (points) {
-            px = int32_t(ld(c, points + 8 * r));
-            py = int32_t(ld(c, points + 8 * r + 4));
-        }
-        if (l < 0 || t < 0 || rr > int32_t(from.width) || b > int32_t(from.height) || l > rr || t > b || px < 0 || py < 0 ||
-            px + (rr - l) > int32_t(to.width) || py + (b - t) > int32_t(to.height))
-            unmodelled(fn, strf("a rectangle (%d,%d)-(%d,%d) to (%d,%d) outside a surface (%ux%u to %ux%u)", l, t, rr, b, px, py,
-                                from.width, from.height, to.width, to.height));
-        for (int32_t y = t; y < b; ++y)
-            for (int32_t x = l; x < rr; ++x)
-                rt::st32(m, to.data + pixel_offset(to, uint32_t(px + x - l), uint32_t(py + y - t)), read(uint32_t(x), uint32_t(y)), 0);
-    }
+    for (const Move& mv : moves)
+        for (int32_t y = mv.t; y < mv.b; ++y)
+            for (int32_t x = mv.l; x < mv.r; ++x)
+                rt::st32(m, to.data + pixel_offset(to, uint32_t(mv.x + x - mv.l), uint32_t(mv.y + y - mv.t)), read(uint32_t(x), uint32_t(y)), 0);
     ret(c, 0, 20);
 }
 
@@ -1267,6 +1294,34 @@ void hand_back_target(rt::Context& c, Device& d, uint32_t data) {
     d.targets.erase(it);
 }
 
+// The renderer's image for a texture's texels at `data` that the GPU draws
+// or copies into (by the guest address of its texels), made the first
+// time, and starting from (or taking again) what the guest's memory holds
+// when the CPU has written it since: on the Xbox the GPU writes over the
+// texture's memory.
+Device::TargetTexture& texture_target(rt::Context& c, Device& d, uint32_t data, uint32_t w, uint32_t h, uint32_t fmt, uint32_t pitch) {
+    Device::TargetTexture& t = d.targets[data];
+    const bool compare = !t.texture.id || t.checked_swap != d.swaps || t.checked_epoch != d.memory_epoch;
+    const uint64_t guest = compare ? hash_bytes(c.mem + data, size_t(w) * h * 4, 0x9E3779B97F4A7C15ull) : t.guest;
+    const bool linear = fmt == kFmtLinA8R8G8B8 || fmt == kFmtLinX8R8G8B8;
+    if (!t.texture.id || t.texture.width != w || t.texture.height != h || t.format != fmt) {
+        if (t.texture.id) d.renderer->destroy_texture(t.texture.id);
+        t.texture = {};
+        t.texture.id = d.renderer->create_render_target(w, h);
+        t.texture.width = w, t.texture.height = h, t.texture.dims = 2;
+        t.texture.linear = linear;
+        t.format = fmt;
+        t.pitch = pitch;
+        t.guest = ~guest;  // so its image starts as the memory's texels (below)
+    }
+    // The texels the image starts from, or that the CPU wrote since the GPU
+    // last drew: on the Xbox the GPU draws over the texture's memory.
+    if (t.guest != guest) d.renderer->write_render_target(t.texture.id, guest_image(c, data, w, h, linear, pitch));
+    t.guest = guest;
+    t.checked_swap = d.swaps, t.checked_epoch = d.memory_epoch;
+    return t;
+}
+
 std::pair<uint32_t, uint32_t> apply_target(rt::Context& c, Device& d, const char* fn) {
     if (!d.cpu_frames.empty()) flush_cpu_frames(c, d);
     const uint32_t target = ld(c, kDeviceStorage + kDevRenderTarget), depth = ld(c, kDeviceStorage + kDevDepth);
@@ -1305,26 +1360,9 @@ std::pair<uint32_t, uint32_t> apply_target(rt::Context& c, Device& d, const char
     }
     const uint32_t data = ld(c, target + 4);
     if (size_t(data) + size_t(w) * h * 4 > c.mem_size) unmodelled(fn, strf("a render target past the end of memory (%08X)", data));
-    Device::TargetTexture& t = d.targets[data];
-    const bool compare = !t.texture.id || t.checked_swap != d.swaps || t.checked_epoch != d.memory_epoch;
-    const uint64_t guest = compare ? hash_bytes(c.mem + data, size_t(w) * h * 4, 0x9E3779B97F4A7C15ull) : t.guest;
     const bool linear = fmt == kFmtLinA8R8G8B8 || fmt == kFmtLinX8R8G8B8;
     const uint32_t pitch = linear ? ((ld(c, target + 16) >> 24) + 1) * 64 : w * 4;
-    if (!t.texture.id || t.texture.width != w || t.texture.height != h || t.format != fmt) {
-        if (t.texture.id) d.renderer->destroy_texture(t.texture.id);
-        t.texture = {};
-        t.texture.id = d.renderer->create_render_target(w, h);
-        t.texture.width = w, t.texture.height = h, t.texture.dims = 2;
-        t.texture.linear = linear;
-        t.format = fmt;
-        t.pitch = pitch;
-        t.guest = ~guest;  // so its image starts as the memory's texels (below)
-    }
-    // The texels the image starts from, or that the CPU wrote since the GPU
-    // last drew: on the Xbox the GPU draws over the texture's memory.
-    if (t.guest != guest) d.renderer->write_render_target(t.texture.id, guest_image(c, data, w, h, linear, pitch));
-    t.guest = guest;
-    t.checked_swap = d.swaps, t.checked_epoch = d.memory_epoch;
+    Device::TargetTexture& t = texture_target(c, d, data, w, h, fmt, pitch);
     d.renderer->set_render_target(t.texture.id, depth_id);
     return {w, h};
 }
