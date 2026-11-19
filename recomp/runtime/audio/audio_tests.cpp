@@ -23,10 +23,13 @@ bool near(float a, float b, float eps = 1e-4f) { return std::fabs(a - b) <= eps;
 
 int main() {
     std::vector<uint8_t> mem(0x10000, 0);
-    // A voice's front left and right bins for n frames, interleaved.
+    // A voice's front left and right bins for n frames, interleaved. Its
+    // gains settled first (an empty block), so a new voice's fade-in and a
+    // changed volume's ramp (tested on their own below) don't show.
     auto stereo = [&](audio::Voice& v, uint32_t n) {
         audio::Bins b;
         b.clear(n);
+        v.mix(mem.data(), mem.size(), b, 0);
         v.mix(mem.data(), mem.size(), b, n);
         std::vector<float> o(std::max<size_t>(16, 2 * size_t(n)), 0.0f);
         for (uint32_t i = 0; i < n; ++i) o[2 * i] = b.bin(audio::kFrontLeft)[i], o[2 * i + 1] = b.bin(audio::kFrontRight)[i];
@@ -72,7 +75,9 @@ int main() {
     out.assign(16, 0.0f);
     v.play(false);
     out = stereo(v, 3);
-    CHECK(near(out[0], 0.5f) && near(out[2], 0.0f) && near(out[4], -0.5f));  // halfway between samples 0 and 1
+    // Halfway between samples 0 and 1: the 8-point Lagrange weights at ½,
+    // (−5, 49, −245, 1225, 1225, −245, 49, −5) / 2048, over 0, 0, 0, ½, −½, ¼, 0, 0.
+    CHECK(near(out[0], 0.5f) && near(out[2], -245.0f / 2048 * 0.25f, 1e-6f) && near(out[4], -0.5f));
 
     // Mix bins: a voice sent only to the front right is silent on the left.
     f.rate = 48000;
@@ -208,27 +213,103 @@ int main() {
         CHECK(peak < 0.005f);
     }
 
-    // A 3D voice: per-bin offsets (the back bins 20 dB down here), the
-    // head-related filter's left taps into the left-side bins, right into
-    // the right, and the Doppler pitch offset.
+    // A 3D voice as DirectSound routes one (bins XtlkFL, XtlkBL, XtlkFR,
+    // XtlkBR, centre, I3DL2, LFE): the left ear on routes 0-1, the right on
+    // 2-3, each through its taps as written (0x40 is 1/16, 0x7F 31/32);
+    // the I3DL2 filters' direct path on the others but 5, the room path on 5;
+    // per-bin offsets (the back left 20 dB down here). An impulse through
+    // a = 0x2000 (direct) gives 0.875, then × 0.125 a sample; a = 0xC000
+    // (room) 0.25, then × 0.75 (the console's own figures).
     {
+        const int16_t imp[4] = {16384, 0, 0, 0};
+        std::memcpy(mem.data() + 0x200, imp, sizeof imp);
         audio::Voice d;
         d.set_format(audio::Format{});
-        d.set_data(0x100, sizeof pcm);
-        d.mix_bins = {{audio::kXtlkFrontLeft, 0}, {audio::kXtlkFrontRight, 0}, {audio::kXtlkBackLeft, 0}, {audio::kI3dl2, 0}};
+        d.set_data(0x200, sizeof imp);
+        d.mix_bins = {{audio::kXtlkFrontLeft, 0}, {audio::kXtlkBackLeft, 0}, {audio::kXtlkFrontRight, 0}, {audio::kXtlkBackRight, 0},
+                      {audio::kFrontCenter, 0}, {audio::kI3dl2, 0}, {audio::kLowFrequency, 0}};
         d.three_d.active = true;
         d.three_d.hrtf = true;
-        d.three_d.taps[0][0] = 64;  // left: an eighth (taps count 1/512), at once
-        d.three_d.taps[1][2] = 127; // right: louder, two frames later
+        d.three_d.taps[0][0] = 0x40;  // left: 1/16, at once
+        d.three_d.taps[1][2] = 0x7F;  // right: 31/32, two samples later
+        d.three_d.fcb_set = true;
+        d.three_d.fcb = 0xC000u << 16 | 0x2000u;
         d.three_d.bin_offset[audio::kXtlkBackLeft] = -2000;
         d.play(false);
         audio::Bins b;
         b.clear(4);
+        d.mix(mem.data(), mem.size(), b, 0);  // settled: no fade-in
         d.mix(mem.data(), mem.size(), b, 4);
-        CHECK(near(b.bin(audio::kXtlkFrontLeft)[0], 0.0625f, 1e-3f));
-        CHECK(near(b.bin(audio::kXtlkFrontRight)[0], 0.0f) && near(b.bin(audio::kXtlkFrontRight)[2], 0.5f * 127 / 512, 1e-3f));
-        CHECK(near(b.bin(audio::kXtlkBackLeft)[0], 0.00625f, 1e-4f));
-        CHECK(near(b.bin(audio::kI3dl2)[0], 0.5f) && near(b.bin(audio::kI3dl2)[1], -0.5f));  // the send is the dry signal
+        const float direct0 = 0.5f * 0.875f, direct1 = direct0 * 0.125f;
+        CHECK(near(b.bin(audio::kFrontCenter)[0], direct0, 1e-5f) && near(b.bin(audio::kFrontCenter)[1], direct1, 1e-5f));
+        CHECK(near(b.bin(audio::kI3dl2)[0], 0.125f, 1e-5f) && near(b.bin(audio::kI3dl2)[1], 0.09375f, 1e-5f));
+        CHECK(near(b.bin(audio::kLowFrequency)[0], direct0, 1e-5f));  // route 6: the direct path
+        CHECK(near(b.bin(audio::kXtlkFrontLeft)[0], direct0 / 16, 1e-5f) && near(b.bin(audio::kXtlkFrontLeft)[1], direct1 / 16, 1e-5f));
+        CHECK(near(b.bin(audio::kXtlkBackLeft)[0], direct0 / 16 * 0.1f, 2e-4f));
+        CHECK(near(b.bin(audio::kXtlkFrontRight)[0], 0.0f) && near(b.bin(audio::kXtlkFrontRight)[2], direct0 * 31 / 32, 1e-5f));
+        CHECK(near(b.bin(audio::kXtlkBackRight)[2], direct0 * 31 / 32, 1e-5f));
+    }
+
+    // The hardware's own numbers. Taps: sign and magnitude, 3-bit exponent,
+    // 4-bit mantissa. Attenuation: 0 unity; past 48 dB a straight line to
+    // silence at 63 dB (0xF00 12/16384, 0xF80 4, 0xFB0 1, 0xFC0 0).
+    CHECK(audio::hrtf_tap(0x01) == 1.0f / 2048 && audio::hrtf_tap(0x20) == 1.0f / 64 && audio::hrtf_tap(0x40) == 1.0f / 16);
+    CHECK(audio::hrtf_tap(0x7F) == 31.0f / 32 && audio::hrtf_tap(0x81) == -1.0f / 2048 && audio::hrtf_tap(0xC0) == -1.0f / 16);
+    CHECK(audio::attenuation_gain(0) == 16384 && audio::attenuation_gain(0xF00) == 12 && audio::attenuation_gain(0xF80) == 4);
+    CHECK(audio::attenuation_gain(0xFB0) == 1 && audio::attenuation_gain(0xFC0) == 0 && audio::attenuation_gain(0xFFF) == 0);
+    CHECK(audio::attenuation_gain(6 * 64) == 2052 * 4);  // 6 dB: floor(4095 · 10^(−6/20)) = 2052
+
+    // A new voice fades in from silence over its first 32 samples (the
+    // console: 0, ¼, ½, ¾ and 31/32 of the way at samples 0, 8, 16, 24, 31);
+    // a changed volume moves the same way, from the last block's gain.
+    {
+        std::vector<int16_t> dc(256, 16384);
+        std::memcpy(mem.data() + 0x5000, dc.data(), dc.size() * 2);
+        audio::Voice r;
+        r.set_format(audio::Format{});
+        r.set_data(0x5000, uint32_t(dc.size() * 2));
+        r.play(true);
+        audio::Bins b;
+        b.clear(40);
+        r.mix(mem.data(), mem.size(), b, 40);
+        const float* l = b.bin(audio::kFrontLeft);
+        CHECK(l[0] == 0.0f && near(l[8], 0.125f) && near(l[16], 0.25f) && near(l[24], 0.375f) && near(l[31], 0.5f * 31 / 32) && near(l[32], 0.5f));
+        r.volume = -10000;
+        b.clear(40);
+        r.mix(mem.data(), mem.size(), b, 40);
+        CHECK(near(l[0], 0.5f) && near(b.bin(audio::kFrontLeft)[16], 0.25f) && b.bin(audio::kFrontLeft)[32] == 0.0f);
+    }
+
+    // The parametric EQ (mode 2, mono: FCB): the state-variable filter as a
+    // peaking EQ, y = x + G·q·band. DC passes as it is; a tone at the
+    // centre frequency comes out (1 + G) times as loud (G = gain / 8192: 1 here).
+    {
+        std::vector<int16_t> tone(4800);
+        for (size_t i = 0; i < tone.size(); ++i) tone[i] = int16_t(std::lround(8192.0 * std::sin(2.0 * 3.14159265358979 * 1000.0 * double(i) / 48000.0)));
+        std::memcpy(mem.data() + 0x6000, tone.data(), tone.size() * 2);
+        std::vector<int16_t> dc(1024, 8192);
+        std::memcpy(mem.data() + 0x9000, dc.data(), dc.size() * 2);
+        audio::Filter flt;
+        flt.mode = 2;
+        flt.q = 2;  // q = 1/4
+        flt.coefficients[2] = uint32_t(uint16_t(int16_t(std::lround(4096.0 * std::log2(2.0 * std::sin(3.14159265358979 * 1000.0 / 48000.0))))));
+        flt.coefficients[3] = 8192;
+        audio::Voice t;
+        t.set_format(audio::Format{});
+        t.set_data(0x6000, uint32_t(tone.size() * 2));
+        t.set_filter(flt);
+        t.play(true);
+        auto o = stereo(t, 4800);
+        float peak = 0;
+        for (uint32_t i = 2400; i < 4800; ++i) peak = std::max(peak, std::fabs(o[2 * i]));
+        CHECK(near(peak, 0.5f, 0.03f));  // 0.25 doubled
+        audio::Voice z;
+        z.set_format(audio::Format{});
+        z.set_data(0x9000, uint32_t(dc.size() * 2));
+        z.set_filter(flt);
+        z.play(true);
+        o = stereo(z, 1024);
+        CHECK(near(o[2 * 1023], 0.25f, 1e-3f));
     }
 
     // The reverb: off at the room's minimum; on, an impulse into the I3DL2

@@ -57,6 +57,20 @@ struct Bins {
 // dB/100 (millibels) to a linear gain; kVolumeMin and below is silence.
 float gain(int32_t millibels);
 
+// The APU's attenuation (1/64 dB units, 12 bits) as the gain it applies,
+// in 1/16384 (measured on a retail console, xemu pull request 3105):
+// straight lines between whole decibels through a table of
+// round(4095 · 10^(−k/20)) rounded down (in 1/4096), and from 48 dB a
+// straight line to 0 at 63 dB, 0xFC0 and above silent; 0 is unity.
+uint32_t attenuation_gain(uint32_t attenuation);
+// A route's attenuation from millibels, as DirectSound converts them.
+uint32_t attenuation_for(int64_t millibels);
+
+// A head-related filter tap as the hardware reads it: sign and magnitude,
+// a 3-bit exponent and a 4-bit mantissa, (16 + m) · 2^(e − 1) / 2048, or
+// m / 2048 with exponent 0 (0x40 is 1/16, 0x7F 31/32). Applied as written.
+float hrtf_tap(uint8_t t);
+
 // The amplitude envelope (DSENVELOPEDESC with DSEG_AMPLITUDE): delay,
 // attack, hold, decay and release in units of 512 frames (the APU's
 // envelope counter: 16 ticks of its 1500 Hz clock), sustain as 0-255. The
@@ -67,14 +81,29 @@ struct Envelope {
     uint32_t mode = 0, delay = 0, attack = 0, hold = 0, decay = 0, release = 0, sustain = 255;
 };
 
-// The voice filter (DSFILTERDESC): mode 0 bypass, 1 DLS2 low-pass, 2
-// parametric EQ, 3 both; the EQ's Q; two coefficients a channel, as the
-// hardware takes them. The DLS2 cutoff is 4096·log2(2·sin(π·f/48000)) as a signed
-// 16-bit value; its resonance is Q = 10^(−R/20), R in dB to 22.5, as a
-// 16-bit fraction.
+// The voice filter (DSFILTERDESC: dwMode, dwQCoefficient, adwCoefficients),
+// which DirectSound (CMcpxVoiceClient's SetFilter, 0x1CC93A) packs into
+// the voice's registers: FCA = coefficient 1 << 16 | coefficient 0, FCB =
+// 3 << 16 | 2, the mode into MISC bits 17:16 and Q (& 7) into 20:18. The
+// hardware's filters are a state-variable filter used as the DLS2
+// low-pass (FC0 its frequency, FC1 its damping) or as a peaking EQ (bits
+// 15:0 the frequency, 31:16 the signed gain), and for 3D voices a pair of
+// one-pole I3DL2 filters (Voice::process says which, by mode and voice).
 struct Filter {
     uint32_t mode = 0, q = 0;
     uint32_t coefficients[4] = {};
+    uint32_t fca() const { return coefficients[1] << 16 | (coefficients[0] & 0xFFFF); }
+    uint32_t fcb() const { return coefficients[3] << 16 | (coefficients[2] & 0xFFFF); }
+};
+
+// The filters' state-variable core as the hardware runs it, at 48 kHz:
+// each step (low, high, band) rounded to 1/16 of a 24-bit sample, halves up.
+struct Svf {
+    double low = 0, band = 0;
+    // The frequency coefficient from a 16-bit FC: 2^(FC/4096) to a 1024th
+    // of an octave, then to 1/65536, at most 0xFFFF/65536.
+    static double frequency(uint32_t fc);
+    double step(double x, double f, double damping);  // returns the high-pass; low and band updated
 };
 
 // A 3D voice's processing (DirectSound's 3D voice data, as the original
@@ -85,8 +114,13 @@ struct Voice3d {
     int32_t bin_offset[kMixBinCount] = {};  // millibels, added to each bin's volume
     int32_t pitch_offset = 0;
     bool hrtf = false;
-    int8_t taps[2][31] = {};  // left, right
-    int32_t itd = 0;          // frames the far ear lags
+    uint8_t taps[2][31] = {};  // left, right: the hardware's minifloats (hrtf_tap)
+    int32_t itd = 0;           // frames the far ear lags
+    // The I3DL2 filters' coefficients (DS3DVOICEDATA's, bit 7), the voice's
+    // FCB in place of SetFilter's: the direct path's in bits 15:0, the
+    // room's in 31:16.
+    bool fcb_set = false;
+    uint32_t fcb = 0;
 };
 
 // The pitch value that plays a sample rate at its own speed.
@@ -182,13 +216,28 @@ private:
     uint64_t stage_frames_ = 0;  // frames into the stage
     float level_ = 1.0f, release_from_ = 1.0f;
     Filter filter_;
-    float filter_state_[2][2] = {};  // per channel: the DLS2 filter's last two outputs
+    Svf dls2_[2], peq_[2];          // per channel
+    double i3dl2_[2] = {};          // a 3D voice's direct and room one-pole states
+    std::vector<float> room_;       // process(): a 3D voice's room path (routes 5 and 7)
+    std::vector<float> route_gain_; // mix(): each route's gain at the end of the last block
+    bool fresh_ = true;             // a new voice fades in over its first frame
     std::vector<float> scratch_;     // process(): channel rows
     std::vector<float> hrtf_history_;  // the last 30 + itd frames of a 3D voice's signal, for its filter
     float hrtf_energy_[2] = {};
     std::vector<float> hrtf_out_;      // process(): the left and right ears' rows
 
     void decode_frame(const uint8_t* mem, size_t mem_size, uint64_t frame, float* lr);
+    // The last frames decoded, by index (direct-mapped): the resampler
+    // reads 8 around each position, and a stream's are still wanted after
+    // their packet has been retired. A buffer's are forgotten each block
+    // (the game may rewrite its data), a stream's when it restarts.
+    struct RecentFrame {
+        uint64_t frame = UINT64_MAX;
+        float lr[2] = {};
+    };
+    std::array<RecentFrame, 16> recent_;
+    void recent_frame(const uint8_t* mem, size_t mem_size, uint64_t frame, float* lr);
+    void forget_recent() { for (RecentFrame& r : recent_) r.frame = UINT64_MAX; }
     uint64_t region_end() const;
 
     Format format_;

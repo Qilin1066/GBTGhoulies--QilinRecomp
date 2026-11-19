@@ -457,7 +457,6 @@ BUFFER_SETTER(set_filter, 8, {
     f.mode = ld(c, p), f.q = ld(c, p + 4);
     for (uint32_t k = 0; k < 4; ++k) f.coefficients[k] = ld(c, p + 8 + 4 * k);
     if (f.mode > 3) unmodelled("SetFilter", strf("filter mode %u", f.mode));
-    if (f.mode >= 2) notice_once("the voice filter's parametric EQ");
     b.voice.set_filter(f);
 })
 BUFFER_SETTER(use_3d_voice_data, 8, {
@@ -485,7 +484,7 @@ void set_3d_voice_data(rt::Context& c) {
     const uint32_t flags = ld(c, p);
     // The head-related filter, when the angles change.
     bool hrtf = false;
-    int8_t taps[2][31] = {};
+    uint8_t taps[2][31] = {};
     int32_t itd = 0;
     if (flags & 0x40) {
         const uint32_t lookup = ld(c, kHrtfLookup);
@@ -502,8 +501,8 @@ void set_3d_voice_data(rt::Context& c) {
         const uint32_t left = ld(c, out), right = ld(c, out + 4);
         c.esp = esp;
         for (uint32_t k = 0; k < 31; ++k) {
-            taps[0][k] = int8_t(rt::ld8(mem(c), left + k, 0));
-            taps[1][k] = int8_t(rt::ld8(mem(c), right + k, 0));
+            taps[0][k] = rt::ld8(mem(c), left + k, 0);
+            taps[1][k] = rt::ld8(mem(c), right + k, 0);
         }
         // The delay: the first table's when the azimuth is past the split, else the second's, negated.
         const float split = std::bit_cast<float>(ld(c, kHrtfAzimuthSplit));
@@ -521,7 +520,13 @@ void set_3d_voice_data(rt::Context& c) {
         b.d3[0] = flags;
         b.has_3d = true;
     }
-    if (flags & 0x80) notice_once("the 3D voice data's filter (DS3DVOICEDATA bit 7)");
+    // The I3DL2 filters' coefficients: the voice's FCB from here on, as the
+    // original's SetFilter takes them from the 3D data (+0x30 bits 15:0,
+    // +0x34 bits 31:16).
+    if (flags & 0x80) {
+        b.voice.three_d.fcb = b.d3[13] << 16 | (b.d3[12] & 0xFFFF);
+        b.voice.three_d.fcb_set = true;
+    }
     if (hrtf) {
         audio::Voice3d& v = b.voice.three_d;
         std::memcpy(v.taps, taps, sizeof taps);

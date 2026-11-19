@@ -1,5 +1,6 @@
 // Voices: decoding PCM and Xbox ADPCM, resampling, gain and mix bins.
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -33,6 +34,48 @@ constexpr int8_t kIndexAdjust[8] = {-1, -1, -1, -1, 2, 4, 6, 8};
 float gain(int32_t millibels) {
     if (millibels <= kVolumeMin) return 0.0f;
     return float(std::pow(10.0, double(std::min(millibels, 0)) / 2000.0));
+}
+
+uint32_t attenuation_gain(uint32_t att) {
+    static const auto table = [] {
+        std::array<uint32_t, 49> t{};
+        for (uint32_t k = 0; k <= 48; ++k) t[k] = uint32_t(std::floor(4095.0 * std::pow(10.0, -double(k) / 20.0)));
+        return t;
+    }();
+    if (att == 0) return 16384;
+    if (att >= 0xFC0) return 0;
+    const uint32_t k = att / 64, frac = att % 64;
+    if (k >= 48) return table[48] * 4 * (0xFC0 - att) / (0xFC0 - 48 * 64);  // to 0 at 63 dB
+    const uint32_t a = k == 0 ? 16384 : table[k] * 4, b = table[k + 1] * 4;
+    return (a * (64 - frac) + b * frac) / 64;
+}
+
+uint32_t attenuation_for(int64_t millibels) {
+    if (millibels >= 0) return 0;
+    return uint32_t(std::min<int64_t>((-millibels) * 64 / 100, 0xFFF));
+}
+
+float hrtf_tap(uint8_t t) {
+    const uint32_t e = t >> 4 & 7, m = t & 15;
+    const float v = e ? float(16 + m) * float(1u << e) / 2.0f / 2048.0f : float(m) / 2048.0f;
+    return t & 0x80 ? -v : v;
+}
+
+namespace {
+// 1/16 of a 24-bit sample (full scale 1.0 = 2^23 units), halves up.
+inline double round_step(double x) { return std::floor(x * 134217728.0 + 0.5) / 134217728.0; }
+}  // namespace
+
+double Svf::frequency(uint32_t fc) {
+    const double octaves = std::round(double(int16_t(uint16_t(fc))) / 4.0) / 1024.0;
+    return std::min(65535.0, std::round(std::pow(2.0, octaves) * 65536.0)) / 65536.0;
+}
+
+double Svf::step(double x, double f, double damping) {
+    low = round_step(low + f * band);
+    const double high = round_step(x - low - damping * band);
+    band = round_step(f * high + band);
+    return high;
 }
 
 // IMA ADPCM with the Xbox's layout: per channel, a 4-byte header (the
@@ -104,7 +147,7 @@ void Voice::play(bool looping) {
     const bool was = playing_;
     if (!playing_ && (pos_ < double(play_start_) || pos_ >= double(region_end()))) pos_ = double(play_start_);
     playing_ = bytes_ != 0 || submix_;
-    if (playing_ && !was) start_envelope();
+    if (playing_ && !was) start_envelope(), fresh_ = true;
 }
 
 void Voice::stop() { playing_ = false; }
@@ -187,7 +230,10 @@ float Voice::envelope_step() {
 }
 
 void Voice::set_filter(const Filter& f) {
-    if (f.mode != filter_.mode) std::memset(filter_state_, 0, sizeof filter_state_);
+    if (f.mode != filter_.mode) {
+        for (Svf* v : {&dls2_[0], &dls2_[1], &peq_[0], &peq_[1]}) *v = Svf{};
+        i3dl2_[0] = i3dl2_[1] = 0;
+    }
     filter_ = f;
 }
 
@@ -236,26 +282,6 @@ void Voice::decode_frame(const uint8_t* mem, size_t mem_size, uint64_t frame, fl
 
 namespace {
 
-// The DLS2 low-pass, from the hardware's two coefficients: the cutoff
-// (4096·log2 of 2·sin(π·f/48000)) and the resonance (Q = 10^(−R/20) as a
-// 16-bit fraction, R up to 22.5 dB). A two-pole resonator, as the DLS2
-// specification has it: y = K·x − b1·y[−1] − b2·y[−2], b1 = −2r·cos θ,
-// b2 = r², K = 1 + b1 + b2 (unity at DC), the poles' radius r set by the
-// resonance's sharpness at the cutoff.
-struct Dls2 {
-    float b1, b2, k;
-};
-Dls2 dls2(uint32_t cutoff_code, uint32_t resonance_code) {
-    const double fc = std::min(2.0, std::pow(2.0, double(int16_t(uint16_t(cutoff_code))) / 4096.0));
-    const double theta = 2.0 * std::asin(fc / 2.0);  // 2π·f/48000
-    const double q = std::clamp(double(resonance_code & 0xFFFF) / 65535.0, 0.0749894, 1.0);
-    const double r_db = -20.0 * std::log10(q);
-    const double sharp = std::max(0.70710678, std::pow(10.0, r_db / 20.0));
-    const double r = std::clamp(1.0 - theta / (2.0 * sharp), 0.0, 0.9999);
-    const double b1 = -2.0 * r * std::cos(theta), b2 = r * r;
-    return {float(b1), float(b2), float(1.0 + b1 + b2)};
-}
-
 bool left_side(uint32_t bin) { return bin == kFrontLeft || bin == kBackLeft || bin == kXtlkFrontLeft || bin == kXtlkBackLeft; }
 bool right_side(uint32_t bin) { return bin == kFrontRight || bin == kBackRight || bin == kXtlkFrontRight || bin == kXtlkBackRight; }
 
@@ -278,26 +304,58 @@ bool Voice::process(const uint8_t* mem, size_t mem_size, uint32_t frames) {
         for (uint32_t c = 0; c < ch; ++c) scratch_[size_t(c) * frames + i] = inter[size_t(i) * ch + c] * g;
         if (!playing_ && stage_ == Stage::Off && eg_.mode) break;  // released to silence
     }
-    // The DLS2 filter (modes 1 and 3; a stereo voice's second channel takes
-    // the second pair of coefficients). The parametric EQ isn't applied.
-    if (filter_.mode == 1 || filter_.mode == 3) {
+    // The voice filter, as the hardware runs it by mode (measured on a
+    // retail console, xemu pull request 3105; Filter says where the words
+    // come from). Mono: 1 the DLS2 low-pass from FCA, 2 the parametric EQ
+    // from FCB, 3 both. Stereo: channel 0 from FCA, 1 from FCB (3 as 1; not
+    // measured). A 3D voice with a head-related filter: 1 the DLS2 or 2 the
+    // EQ from FCA, and in every mode the I3DL2 pair from FCB (DirectSound
+    // makes its mode 0 a 3), a direct path for routes 0-4 and 6 and a room
+    // path for 5 and 7. The state-variable filter's order of steps per
+    // sample (low, high, band: Chamberlin's) isn't in the measurements.
+    const bool hrtf3d = three_d.active && three_d.hrtf && ch == 1;
+    const uint32_t mode = hrtf3d && (filter_.mode & 3) == 0 ? 3 : filter_.mode & 3;
+    auto dls2 = [&](uint32_t c, uint32_t word) {
+        const double f = Svf::frequency(word & 0xFFFF), damping = double(word >> 16) / 32768.0;
+        float* row = &scratch_[size_t(c) * frames];
+        for (uint32_t i = 0; i < frames; ++i) dls2_[c].step(row[i], f, damping), row[i] = float(dls2_[c].low);
+    };
+    auto peq = [&](uint32_t c, uint32_t word) {
+        const double f = Svf::frequency(word & 0xFFFF), g = double(int16_t(uint16_t(word >> 16))) / 8192.0;
+        const double q = std::ldexp(1.0, -int(filter_.q & 7));
+        float* row = &scratch_[size_t(c) * frames];
+        for (uint32_t i = 0; i < frames; ++i) {
+            peq_[c].step(row[i], f, q);
+            row[i] = float(round_step(row[i] + g * q * peq_[c].band));
+        }
+    };
+    room_.clear();
+    if (hrtf3d) {
+        if (mode == 1) dls2(0, filter_.fca());
+        if (mode == 2) peq(0, filter_.fca());
+        const uint32_t fcb = three_d.fcb_set ? three_d.fcb : filter_.fcb();
+        const double direct = double(fcb & 0xFFFF) / 65536.0, room = double(fcb >> 16) / 65536.0;
+        room_.resize(frames);
+        float* row = &scratch_[0];
+        for (uint32_t i = 0; i < frames; ++i) {
+            i3dl2_[1] = round_step((1.0 - room) * row[i] + room * i3dl2_[1]);
+            i3dl2_[0] = round_step((1.0 - direct) * row[i] + direct * i3dl2_[0]);
+            room_[i] = float(i3dl2_[1]);
+            row[i] = float(i3dl2_[0]);
+        }
+    } else if (ch == 1) {
+        if (mode & 1) dls2(0, filter_.fca());
+        if (mode & 2) peq(0, filter_.fcb());
+    } else if (mode) {
         for (uint32_t c = 0; c < ch; ++c) {
-            const uint32_t pair = ch == 2 && filter_.mode == 1 ? c : 0;
-            const Dls2 f = dls2(filter_.coefficients[2 * pair], filter_.coefficients[2 * pair + 1]);
-            float* row = &scratch_[size_t(c) * frames];
-            float y1 = filter_state_[c][0], y2 = filter_state_[c][1];
-            for (uint32_t i = 0; i < frames; ++i) {
-                const float y = f.k * row[i] - f.b1 * y1 - f.b2 * y2;
-                y2 = y1, y1 = y, row[i] = y;
-            }
-            filter_state_[c][0] = y1, filter_state_[c][1] = y2;
+            const uint32_t word = c ? filter_.fcb() : filter_.fca();
+            if (mode == 2) peq(c, word);
+            else dls2(c, word);
         }
     }
-    // A 3D voice's head-related filter: 31 signed 8-bit taps a ear, the far
-    // ear (the quieter filter) delayed by the interaural delay. The taps
-    // count 1/512 each: the table's straight-ahead filter then passes about
-    // 0 dB around 1 kHz (as a filter for a source in front should), where
-    // 1/128 would make every 3D sound some 12 dB louder than its dry send.
+    // A 3D voice's head-related filter: 31 taps a ear, the hardware's
+    // minifloats applied as written (hrtf_tap), the far ear (the quieter
+    // filter) delayed by the interaural delay.
     if (three_d.active && three_d.hrtf && ch == 1) {
         const uint32_t itd = uint32_t(std::min(std::abs(three_d.itd), 63));
         const size_t hist = 30 + 63;
@@ -305,9 +363,9 @@ bool Voice::process(const uint8_t* mem, size_t mem_size, uint32_t frames) {
         std::vector<float> ext(hist + frames);
         std::copy(hrtf_history_.begin(), hrtf_history_.end(), ext.begin());
         std::copy(scratch_.begin(), scratch_.begin() + frames, ext.begin() + hist);
-        float energy[2] = {};
+        float taps[2][31], energy[2] = {};
         for (int e = 0; e < 2; ++e)
-            for (int k = 0; k < 31; ++k) energy[e] += float(three_d.taps[e][k]) * float(three_d.taps[e][k]);
+            for (int k = 0; k < 31; ++k) taps[e][k] = hrtf_tap(three_d.taps[e][k]), energy[e] += taps[e][k] * taps[e][k];
         const int far = energy[0] < energy[1] ? 0 : 1;
         hrtf_out_.assign(size_t(frames) * 2, 0.0f);
         for (int e = 0; e < 2; ++e) {
@@ -316,8 +374,8 @@ bool Voice::process(const uint8_t* mem, size_t mem_size, uint32_t frames) {
             for (uint32_t i = 0; i < frames; ++i) {
                 float acc = 0.0f;
                 const float* x = &ext[hist + i - delay];
-                for (int k = 0; k < 31; ++k) acc += float(three_d.taps[e][k]) * x[-k];
-                o[i] = acc * (1.0f / 512.0f);
+                for (int k = 0; k < 31; ++k) acc += taps[e][k] * x[-k];
+                o[i] = acc;
             }
         }
         std::copy(ext.end() - long(hist), ext.end(), hrtf_history_.begin());
@@ -328,26 +386,45 @@ bool Voice::process(const uint8_t* mem, size_t mem_size, uint32_t frames) {
 void Voice::mix(const uint8_t* mem, size_t mem_size, Bins& out, uint32_t frames, Voice* submix) {
     if (!process(mem, mem_size, frames)) return;
     if (submix) feed(submix, frames);
-    // Each bin the voice feeds, at the voice's volume plus the bin's (and a
-    // 3D voice's offset for it), as the APU's attenuation: 1/64 dB steps,
-    // 0xFFF (64 dB) and beyond silent.
+    // Each route: the bin it feeds at the voice's volume plus the route's
+    // (and a 3D voice's offset for its bin), through the APU's attenuation
+    // curve. A gain moves from the last block's in 32 steps over the first
+    // frame (32 samples), as the hardware ramps it, and a voice just
+    // started fades in from silence. A 3D voice with a head-related filter
+    // sends its left ear on routes 0-1, its right on 2-3, the rest of its
+    // signal on 4-7 (DirectSound orders its bins so: the crosstalk
+    // canceller's left inputs, then its right); the room path (I3DL2) on 5 and 7.
     const uint32_t ch = format_.channels;
     std::vector<MixBinVolume> bins = mix_bins;
     if (bins.empty()) bins = {{kFrontLeft, 0}, {kFrontRight, 0}};
     const bool hrtf = three_d.active && three_d.hrtf && ch == 1 && !hrtf_out_.empty();
+    const bool by_route = hrtf && bins.size() >= 4;
+    if (route_gain_.size() != bins.size()) route_gain_.assign(bins.size(), -1.0f);  // -1: no ramp (unless fresh)
     for (size_t k = 0; k < bins.size(); ++k) {
         const uint32_t bin = bins[k].bin;
         if (bin >= kMixBinCount) continue;
         const uint32_t c = ch == 1 ? 0 : uint32_t(k % ch);
         const int64_t mb = int64_t(volume) + bins[k].volume + (three_d.active ? three_d.bin_offset[bin] : 0);
-        if (mb >= 0 ? false : (-mb) * 64 / 100 >= 0xFFF) continue;
-        const float g = gain(int32_t(std::max<int64_t>(mb, kVolumeMin + 1)));
+        const float g = float(attenuation_gain(attenuation_for(mb))) / 16384.0f;
+        const float from = fresh_ ? 0.0f : route_gain_[k] < 0 ? g : route_gain_[k];
+        route_gain_[k] = g;
+        if (g == 0.0f && from == 0.0f) continue;
         const float* src = &scratch_[size_t(c) * frames];
-        if (hrtf && left_side(bin)) src = &hrtf_out_[0];
-        else if (hrtf && right_side(bin)) src = &hrtf_out_[frames];
+        if (by_route) {
+            if (k < 2) src = &hrtf_out_[0];
+            else if (k < 4) src = &hrtf_out_[frames];
+            else if ((k == 5 || k == 7) && !room_.empty()) src = room_.data();
+        } else if (hrtf && left_side(bin)) {
+            src = &hrtf_out_[0];
+        } else if (hrtf && right_side(bin)) {
+            src = &hrtf_out_[frames];
+        }
         float* dst = out.bin(bin);
-        for (uint32_t i = 0; i < frames; ++i) dst[i] += src[i] * g;
+        const uint32_t ramp = std::min<uint32_t>(frames, from == g ? 0 : 32);
+        for (uint32_t i = 0; i < ramp; ++i) dst[i] += src[i] * (from + (g - from) * float(i) / 32.0f);
+        for (uint32_t i = ramp; i < frames; ++i) dst[i] += src[i] * g;
     }
+    fresh_ = false;
 }
 
 void Voice::make_submix(uint32_t channels) {
@@ -366,7 +443,7 @@ void Voice::mix_into(const uint8_t* mem, size_t mem_size, Voice& submix, uint32_
 
 void Voice::feed(Voice* target, uint32_t frames) {
     Voice& submix = *target;
-    const float g = gain(volume);
+    const float g = float(attenuation_gain(attenuation_for(volume))) / 16384.0f;
     const uint32_t dst = submix.format_.channels, ch = format_.channels;
     if (submix.input_.size() < size_t(frames) * dst) submix.input_.resize(size_t(frames) * dst, 0.0f);
     for (uint32_t c = 0; c < ch; ++c) {
@@ -378,6 +455,45 @@ void Voice::feed(Voice* target, uint32_t frames) {
     }
 }
 
+namespace {
+// The hardware's resampler (measured on a retail console, xemu pull request
+// 3105): 8-point Lagrange interpolation over the frames at −3 … +4 around
+// the cursor, the weights rounded to 1/65536; the cursor 16.16 fixed point,
+// advancing 2^(pitch/4096) a sample.
+void lagrange8(double t, float w[8]) {
+    static constexpr double kDenominator[8] = {-5040, 720, -240, 144, -144, 240, -720, 5040};  // Π (j − k), k ≠ j, nodes −3 … 4
+    double prefix[9], suffix[9];
+    prefix[0] = 1, suffix[8] = 1;
+    for (int j = 0; j < 8; ++j) prefix[j + 1] = prefix[j] * (t - double(j - 3));
+    for (int j = 7; j >= 0; --j) suffix[j] = suffix[j + 1] * (t - double(j - 3));
+    for (int j = 0; j < 8; ++j) w[j] = float(std::round(prefix[j] * suffix[j + 1] / kDenominator[j] * 65536.0) / 65536.0);
+}
+double cursor_step(int32_t pitch) { return std::round(std::pow(2.0, double(pitch) / 4096.0) * 65536.0) / 65536.0; }
+// One output frame at frame f0 + t (t in [0, 1)): frame_at(n, lr) gives frame n.
+template <class FrameAt>
+void resample(uint64_t f0, double t, FrameAt&& frame_at, float s[2]) {
+    if (t == 0.0) return frame_at(int64_t(f0), s);
+    float w[8];
+    lagrange8(t, w);
+    s[0] = s[1] = 0;
+    for (int j = 0; j < 8; ++j) {
+        if (w[j] == 0.0f) continue;
+        float lr[2];
+        frame_at(int64_t(f0) + j - 3, lr);
+        s[0] += w[j] * lr[0], s[1] += w[j] * lr[1];
+    }
+}
+}  // namespace
+
+void Voice::recent_frame(const uint8_t* mem, size_t mem_size, uint64_t frame, float* lr) {
+    RecentFrame& r = recent_[frame & 15];
+    if (r.frame != frame) {
+        decode_frame(mem, mem_size, frame, r.lr);
+        r.frame = frame;
+    }
+    lr[0] = r.lr[0], lr[1] = r.lr[1];
+}
+
 void Voice::render(const uint8_t* mem, size_t mem_size, float* out, uint32_t dst, const float to[2][2], uint32_t frames) {
     const uint32_t ch = format_.channels;
     if (submix_) {  // its input, frame for frame
@@ -387,7 +503,8 @@ void Voice::render(const uint8_t* mem, size_t mem_size, float* out, uint32_t dst
         return;
     }
     if (stream_) return render_stream(mem, mem_size, out, dst, to, frames);
-    const double step = std::pow(2.0, double(pitch) / 4096.0);
+    forget_recent();
+    const double step = cursor_step(pitch);
     const uint64_t end = region_end();
     const uint64_t loop_start = looping_ ? std::max(loop_start_, play_start_) : 0;
     const uint64_t loop_end = looping_ ? (loop_len_ ? std::min(end, loop_start + loop_len_) : end) : end;
@@ -401,15 +518,16 @@ void Voice::render(const uint8_t* mem, size_t mem_size, float* out, uint32_t dst
             }
             pos_ = double(loop_start) + std::fmod(pos_ - double(loop_start), double(loop_end - loop_start));
         }
-        // Linear interpolation between this frame and the next (which wraps on a loop).
+        // The frames around the cursor: past the end a loop wraps, else
+        // silence; before the play region's start, silence.
+        auto frame_at = [&](int64_t n, float* lr) {
+            if (n >= int64_t(limit) && looping_) n = int64_t(loop_start) + (n - int64_t(loop_start)) % int64_t(loop_end - loop_start);
+            if (n < int64_t(play_start_) || n >= int64_t(limit)) lr[0] = lr[1] = 0;
+            else recent_frame(mem, mem_size, uint64_t(n), lr);
+        };
         const uint64_t f0 = uint64_t(pos_);
-        uint64_t f1 = f0 + 1;
-        if (f1 >= limit) f1 = looping_ ? loop_start : f0;
-        const float t = float(pos_ - double(f0));
-        float a[2], b[2];
-        decode_frame(mem, mem_size, f0, a);
-        decode_frame(mem, mem_size, f1, b);
-        const float s[2] = {a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t};
+        float s[2];
+        resample(f0, pos_ - double(f0), frame_at, s);
         for (uint32_t c = 0; c < ch; ++c)
             for (uint32_t d = 0; d < dst; ++d) out[dst * i + d] += s[c] * to[c][d];
         pos_ += step;
@@ -419,6 +537,7 @@ void Voice::render(const uint8_t* mem, size_t mem_size, float* out, uint32_t dst
 // ---------------------------------------------------------------- streaming
 void Voice::make_stream() {
     stream_ = true;
+    forget_recent();
     packets_.clear();
     completed_.clear();
     queued_end_ = 0;
@@ -431,7 +550,7 @@ void Voice::queue_packet(uint32_t guest_addr, uint32_t bytes, uint32_t id) {
     // A voice stopped (after a discontinuity, or never started) starts again
     // at the new packet: the frames since the last one are silence, not data;
     // its envelope starts again with it.
-    if (!playing_) pos_ = double(queued_end_), start_envelope();
+    if (!playing_) pos_ = double(queued_end_), start_envelope(), fresh_ = true;
     queued_end_ += frames;
     playing_ = true;
     discontinuity_ = false;
@@ -465,7 +584,11 @@ std::vector<Voice::Done> Voice::flush() {
 void Voice::render_stream(const uint8_t* mem, size_t mem_size, float* out, uint32_t dst, const float to[2][2], uint32_t frames) {
     if (paused_) return;
     const uint32_t ch = format_.channels;
-    const double step = std::pow(2.0, double(pitch) / 4096.0);
+    const double step = cursor_step(pitch);
+    auto frame_at = [&](int64_t n, float* lr) {
+        if (n < 0 || n >= int64_t(queued_end_)) lr[0] = lr[1] = 0;
+        else recent_frame(mem, mem_size, uint64_t(n), lr);
+    };
     for (uint32_t i = 0; i < frames; ++i) {
         retire_played();
         if (packets_.empty() || pos_ >= double(queued_end_)) {
@@ -474,12 +597,8 @@ void Voice::render_stream(const uint8_t* mem, size_t mem_size, float* out, uint3
             return;
         }
         const uint64_t f0 = uint64_t(pos_);
-        const uint64_t f1 = f0 + 1 < queued_end_ ? f0 + 1 : f0;
-        const float t = float(pos_ - double(f0));
-        float a[2], b[2];
-        decode_frame(mem, mem_size, f0, a);
-        decode_frame(mem, mem_size, f1, b);
-        const float s[2] = {a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t};
+        float s[2];
+        resample(f0, pos_ - double(f0), frame_at, s);
         for (uint32_t c = 0; c < ch; ++c)
             for (uint32_t d = 0; d < dst; ++d) out[dst * i + d] += s[c] * to[c][d];
         pos_ += step;

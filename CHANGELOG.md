@@ -11,6 +11,20 @@ Each release is a git tag (`vX.Y.Z`) with a matching GitHub release. The version
 
 ## [Unreleased]
 
+## [0.33.0] - 2026-11-19
+The voice processor as measured on a retail console (raddad772's measurements, xemu pull request 3105) wherever the engine has the same stage.
+
+### Added
+- **The parametric EQ** (filter modes 2 and 3), as the hardware runs it: the state-variable filter as a peaking EQ, y = x + G·q·band, from FCB (FCA on 3D voices; channel 0 FCA, 1 FCB on stereo ones).
+- **A 3D voice's I3DL2 filters**: two one-pole low-passes, the direct path (routes 0-4 and 6) and the room path (routes 5 and 7, the reverb send), with the 3D data's filter coefficients (DS3DVOICEDATA bit 7), until now ignored.
+- **Gain ramps**: a route's gain moves over 32 samples when it changes, and a voice fades in over its first 32, as the hardware does; no more steps in the signal when a volume changes.
+
+### Changed
+- **HRTF taps are the hardware's minifloats** (sign, 3-bit exponent, 4-bit mantissa; 0x40 is 1/16, 0x7F 31/32), applied as written, instead of two's complement × 1/512 (a scale chosen by ear). 3D sounds are about 8 dB quieter in play. The ears go to routes 0-1 (left) and 2-3 (right), as the hardware routes them.
+- **The DLS2 low-pass is the hardware's state-variable filter**: frequency 2^(FC/4096) to a 1024th of an octave, damping FC1/32768, each step rounded to 1/16 of a 24-bit sample. Where DirectSound puts each coefficient was read from its `SetFilter` (FCA = coefficients 1:0, FCB = 3:2, Q in MISC 20:18).
+- **Resampling is 8-point Lagrange** with weights rounded to 1/65536 and a 16.16 cursor, instead of linear interpolation: less dulling up to 12 kHz, less aliasing near 24 kHz.
+- **Volumes through the hardware's attenuation curve** (straight lines between whole decibels; 48-63 dB a straight line to silence).
+
 ## [0.32.0] - 2026-11-19
 DXT textures go to the GPU as they are; textures that change are rewritten in place.
 
