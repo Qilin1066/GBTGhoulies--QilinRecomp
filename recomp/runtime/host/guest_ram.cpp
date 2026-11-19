@@ -5,8 +5,13 @@
 // surface locks return). The game writes pixels and vertices through both,
 // so they are real views of the same pages, inside one 4 GB host
 // reservation: lifted code addresses guest memory as base + address with
-// nothing extra per access.
+// nothing extra per access. Above RAM, up to rt::kVirtualLimit, is the
+// title's virtual memory: host pages there are inaccessible until the
+// title commits them (commit_guest_pages), and RAM is charged for what's
+// committed, not for the address space (host.cpp's physical budget).
+#include <cerrno>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 
@@ -73,8 +78,24 @@ uint8_t* map(uint32_t ram, std::string* error) {
         }
     }
     CloseHandle(section);  // the views keep it
+    // The virtual memory: an ordinary reservation, committed page by page.
+    const SIZE_T vsize = SIZE_T(rt::kVirtualLimit) - ram;
+    if (!VirtualFree(base + ram, vsize, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER) ||
+        !alloc2(GetCurrentProcess(), base + ram, vsize, MEM_RESERVE | MEM_REPLACE_PLACEHOLDER, PAGE_NOACCESS, nullptr, 0)) {
+        *error = "can't reserve the guest's virtual memory (" + std::to_string(GetLastError()) + ")";
+        return nullptr;
+    }
     return base;
 }
+
+void host_commit(uint8_t* p, size_t n) {
+    if (!VirtualAlloc(p, n, MEM_COMMIT, PAGE_READWRITE)) {
+        std::fprintf(stderr, "qilin_run: can't commit %zu bytes of guest virtual memory (%lu)\n", n, GetLastError());
+        std::abort();
+    }
+}
+void host_free(uint8_t* p, size_t n) { VirtualFree(p, n, MEM_DECOMMIT); }
+size_t host_page() { return 0x1000; }
 #else
 uint8_t* map(uint32_t ram, std::string* error) {
     int fd = -1;
@@ -106,9 +127,25 @@ uint8_t* map(uint32_t ram, std::string* error) {
         }
     }
     close(fd);  // the mappings keep it
-    return base;
+    return base;  // the virtual memory is the reservation's own pages: no access until committed
+}
+
+size_t host_page() {
+    static const size_t page = size_t(sysconf(_SC_PAGESIZE));
+    return page;
+}
+void host_commit(uint8_t* p, size_t n) {
+    if (mprotect(p, n, PROT_READ | PROT_WRITE) != 0) {
+        std::fprintf(stderr, "qilin_run: can't commit %zu bytes of guest virtual memory: %s\n", n, std::strerror(errno));
+        std::abort();
+    }
+}
+void host_free(uint8_t* p, size_t n) {  // fresh inaccessible pages, the old ones returned to the host
+    mmap(p, n, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED | MAP_NORESERVE, -1, 0);
 }
 #endif
+
+uint8_t* g_base = nullptr;
 
 }  // namespace
 
@@ -118,8 +155,25 @@ uint8_t* map_guest_ram(uint32_t ram_size, std::string* error) {
         return nullptr;
     }
     uint8_t* base = map(ram_size, error);
-    if (base) rt::g_ram_aliases = true;
+    if (base) rt::g_ram_aliases = true, rt::g_ram_size = ram_size, g_base = base;
     return base;
+}
+
+// The host pages under guest pages [at, at + size) of the virtual memory:
+// committing makes every host page they touch accessible (a host page
+// may be larger than the guest's 4 KB); freeing returns only the host
+// pages they cover whole, as others may hold committed guest pages too.
+void commit_guest_pages(uint32_t at, uint32_t size) {
+    if (!g_base || !size) return;
+    const size_t page = host_page();
+    const size_t lo = size_t(at) & ~(page - 1), hi = (size_t(at) + size + page - 1) & ~(page - 1);
+    host_commit(g_base + lo, hi - lo);
+}
+void free_guest_pages(uint32_t at, uint32_t size) {
+    if (!g_base || !size) return;
+    const size_t page = host_page();
+    const size_t lo = (size_t(at) + page - 1) & ~(page - 1), hi = (size_t(at) + size) & ~(page - 1);
+    if (hi > lo) host_free(g_base + lo, hi - lo);
 }
 
 }  // namespace qilin::host

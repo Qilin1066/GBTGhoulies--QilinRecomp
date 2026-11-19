@@ -195,10 +195,15 @@ struct Mem {
 // mapped (not in tests that use a plain buffer).
 inline constexpr uint32_t kRamCachedAlias = 0x80000000u, kRamWriteCombinedAlias = 0xF0000000u;
 inline bool g_ram_aliases = false;
+inline uint32_t g_ram_size = 0;  // RAM's size, which is the windows' size when they're mapped
+// From the end of RAM to here, the title's virtual memory (what
+// NtAllocateVirtualMemory hands out), whose pages are only accessible
+// once committed: guest memory is [0, kVirtualLimit) in one piece.
+inline constexpr uint32_t kVirtualLimit = 0x7FFF0000u;
 
 inline void check(const Mem& m, uint32_t a, uint64_t n, uint32_t at) {
 #if defined(QILIN_CHECKED_MEMORY)
-    auto inside = [&](uint32_t lo, uint64_t limit) { return a >= lo && uint64_t(a - lo) + n <= std::min<uint64_t>(m.size, limit); };
+    auto inside = [&](uint32_t lo, uint64_t limit) { return a >= lo && uint64_t(a - lo) + n <= std::min<uint64_t>(g_ram_size, limit); };
     if (uint64_t(a) + n > m.size &&
         !(g_ram_aliases && (inside(kRamCachedAlias, kMmioLo - kRamCachedAlias) ||
                             inside(kRamWriteCombinedAlias, kMmioLo - kRamWriteCombinedAlias))))

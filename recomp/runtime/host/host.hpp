@@ -88,7 +88,10 @@ public:
     struct Info {
         uint32_t base, allocation_base, allocation_protect, size, state, protect, type;
     };
-    void init(uint8_t* ram, uint32_t lo, uint32_t hi);  // lo, hi: 64 KB aligned
+    // lo, hi: 64 KB aligned. host_backed: the range is the guest's virtual
+    // memory, whose host pages are made accessible on commit and given
+    // back on decommit and release (commit_guest_pages, free_guest_pages).
+    void init(uint8_t* ram, uint32_t lo, uint32_t hi, bool host_backed = false);
     // Reserves `size` bytes (rounded up to pages) at `base` (rounded down to
     // 64 KB), or anywhere free if base is 0, lowest first or highest first.
     // Returns the base, or 0 if that range isn't free.
@@ -104,6 +107,7 @@ public:
     uint32_t lo() const { return lo_; }
     uint32_t hi() const { return hi_; }
     uint64_t committed_bytes() const;
+    uint64_t uncommitted_bytes(uint32_t base, uint32_t size) const;  // in [base, base + size), of one reservation
     uint64_t reserved_bytes() const;
 
 private:
@@ -113,10 +117,21 @@ private:
     };
     uint8_t* ram_ = nullptr;
     uint32_t lo_ = 0, hi_ = 0;
+    bool host_backed_ = false;
     std::map<uint32_t, Region> regions_;
     const std::pair<const uint32_t, Region>* find(uint32_t addr) const;
 };
+// RAM: what the image, the main stack and the kernel leave, for the
+// title's contiguous memory (reservations here are physical pages).
 VirtualMemory& vm();
+// The title's virtual memory, above RAM (NtAllocateVirtualMemory): its
+// address space costs nothing, its committed pages come out of RAM.
+VirtualMemory& virtual_memory();
+// Whether `bytes` more of RAM can be used: the RAM range's size, less its
+// reservations and the virtual memory's committed pages.
+bool physical_room(uint64_t bytes);
+// Says on the console that a guest allocation found no room (what, its size).
+void out_of_memory(const char* what, uint32_t bytes);
 
 // The replacements for Ghoulies' XAPI, registered by address (xapi.cpp).
 void register_xapi();
@@ -186,6 +201,10 @@ uint32_t current_thread(const rt::Context& c);
 // reservation whose base is returned (the guest's address 0). Pages start
 // zero and cost nothing until touched. Null with the reason in *error.
 uint8_t* map_guest_ram(uint32_t ram_size, std::string* error);
+// The host pages under the guest's virtual memory [at, at + size): made
+// accessible, or given back (only those the range covers whole).
+void commit_guest_pages(uint32_t at, uint32_t size);
+void free_guest_pages(uint32_t at, uint32_t size);
 
 // ---- Device registers lifted code reads or writes (rt::mmio_read32 and
 // rt::mmio_write32). An unregistered register stops the runtime, named.

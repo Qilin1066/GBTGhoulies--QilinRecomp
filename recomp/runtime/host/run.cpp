@@ -215,7 +215,7 @@ int main(int argc, char** argv) {
     std::memcpy(ram.get() + xbe.base, xbe.image().data(), xbe.image().size());
     rt::Context c{};
     c.mem = ram.get();
-    c.mem_size = mm.ram_size;
+    c.mem_size = rt::kVirtualLimit;  // RAM, then the title's virtual memory
     const rt::Mem m{c.mem, c.mem_size};
     // Sections not marked preload stay unloaded until XeLoadSection, as the
     // kernel's loader leaves them: keep their file data and clear their memory.
@@ -261,8 +261,10 @@ int main(int argc, char** argv) {
         if (s.code && s.name != ".text") regions.push_back({s.va, s.va + s.vsize, s.name});
     host::set_regions(std::move(regions));
 
-    // Guest virtual memory: the RAM between the image and the main stack.
+    // RAM between the image and the main stack, for contiguous memory.
     host::vm().init(c.mem, (xbe.image_end() + 0xFFFFu) & ~0xFFFFu, mm.stack_bottom() & ~0xFFFFu);
+    // And the title's virtual memory, above it.
+    host::virtual_memory().init(c.mem, mm.ram_size, rt::kVirtualLimit, true);
     host::register_xapi();
     // The window: where there's no display, the game still runs and draws.
     std::unique_ptr<platform::Window> window;

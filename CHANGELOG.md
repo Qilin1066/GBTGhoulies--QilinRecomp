@@ -11,6 +11,17 @@ Each release is a git tag (`vX.Y.Z`) with a matching GitHub release. The version
 
 ## [Unreleased]
 
+## [0.27.0] - 2026-11-19
+Chapter 1's story plays through to the mansion's door.
+
+### Added
+- **Pre-transformed (XYZRHW) vertices** through the original's own passthrough program: one of three NV2A programs in its image, by the fog table mode, with the scale and offset constants its state flush loads (`docs/graphics.md`).
+- **Running out of memory is said on the console** (what was asked for and what's in use): the kernel's allocators fail as on the Xbox, and titles that never run out there may not check.
+
+### Fixed
+- **Virtual memory has its own address space**, above RAM to `0x7FFF0000`, as on the Xbox: a reservation costs no RAM and only committed pages count against it. Since v0.12.0 reservations took RAM's addresses, so the heap's uncommitted reservations fragmented RAM, an allocation the console makes failed, and the story's image loader inflated a picture through a null buffer over the game's code (`docs/runtime.md`). Host pages under uncommitted virtual memory are inaccessible, so a stray access faults as it would on the console.
+- The fixed-function pixel pipeline stops the runtime when fog is on, which it doesn't apply yet, rather than drawing without it.
+
 ## [0.26.0] - 2026-11-18
 The whole attract sequence draws: the desk, the Rare and Microsoft books, the title page and the comic-strip pages with their 3D scenes.
 

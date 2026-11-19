@@ -112,30 +112,49 @@ constexpr uint32_t kStatusSuccess = 0, kStatusInvalidParameter = 0xC000000D, kSt
 constexpr uint32_t kMemCommit = 0x1000, kMemReserve = 0x2000, kMemDecommit = 0x4000, kMemRelease = 0x8000,
                    kMemTopDown = 0x100000;
 
+// The address space an address is in: the title's virtual memory above
+// RAM, or RAM (an allocation at a fixed address there, or contiguous memory).
+VirtualMemory& space_of(uint32_t addr) { return addr >= virtual_memory().lo() ? virtual_memory() : vm(); }
+
 // NTSTATUS NtAllocateVirtualMemory(PVOID* BaseAddress, ULONG_PTR ZeroBits,
 //     PSIZE_T RegionSize, ULONG AllocationType, ULONG Protect) (184)
+// As the Xbox's kernel, the address space is separate from RAM: a
+// reservation costs none of it, committed pages do, and committing more
+// than there is fails with STATUS_NO_MEMORY. Reservations at a fixed
+// address in RAM's range are RAM, as the runtime's address space has it.
 void nt_allocate_virtual_memory(rt::Context& c) {
     const uint32_t pbase = arg(c, 0), psize = arg(c, 2), type = arg(c, 3), protect = arg(c, 4);
     uint32_t base = ld(c, pbase);
     const uint32_t size = ld(c, psize);
-    VirtualMemory& v = vm();
     uint32_t status = kStatusSuccess;
     if (!(type & (kMemCommit | kMemReserve)) || size == 0) {
         status = kStatusInvalidParameter;
     } else if ((type & kMemReserve) || base == 0) {  // a new reservation, committed too if asked
+        VirtualMemory& v = base ? space_of(base) : virtual_memory();
         const uint32_t at = v.reserve(base, size, protect, (type & kMemTopDown) != 0);
-        if (!at) {
+        const uint32_t bytes = at ? v.region_size(at) : 0;
+        // RAM's reservations count as soon as they're made; virtual memory, its committed pages.
+        const uint64_t more = &v == &vm() || !(type & kMemCommit) ? 0 : bytes;
+        if (at && !physical_room(more)) {
+            v.release(at);
+            out_of_memory("NtAllocateVirtualMemory", size);
+            status = kStatusNoMemory;
+        } else if (!at) {
             status = base ? kStatusConflictingAddresses : kStatusNoMemory;
+            if (!base) out_of_memory("NtAllocateVirtualMemory", size);
         } else {
-            const uint32_t bytes = v.region_size(at);
             if (type & kMemCommit) v.commit(at, bytes, protect);
             st(c, pbase, at);
             st(c, psize, bytes);
         }
     } else {  // commit inside an existing reservation
+        VirtualMemory& v = space_of(base);
         const uint32_t first = base & ~(VirtualMemory::kPage - 1);
         const uint32_t end = uint32_t((uint64_t(base) + size + VirtualMemory::kPage - 1) & ~uint64_t(VirtualMemory::kPage - 1));
-        if (!v.commit(base, size, protect)) {
+        if (&v == &virtual_memory() && !physical_room(v.uncommitted_bytes(base, size))) {
+            out_of_memory("NtAllocateVirtualMemory (commit)", size);
+            status = kStatusNoMemory;
+        } else if (!v.commit(base, size, protect)) {
             status = kStatusConflictingAddresses;
         } else {
             st(c, pbase, first);
@@ -149,7 +168,7 @@ void nt_allocate_virtual_memory(rt::Context& c) {
 void nt_free_virtual_memory(rt::Context& c) {
     const uint32_t pbase = arg(c, 0), psize = arg(c, 1), type = arg(c, 2);
     const uint32_t base = ld(c, pbase), size = ld(c, psize);
-    VirtualMemory& v = vm();
+    VirtualMemory& v = space_of(base);
     uint32_t status = kStatusSuccess;
     if (type == kMemRelease) {
         const uint32_t bytes = v.region_size(base);
@@ -176,6 +195,8 @@ void nt_query_virtual_memory(rt::Context& c) {
     VirtualMemory::Info i{};
     if (auto q = v.query(addr)) {
         i = *q;
+    } else if (auto vq = virtual_memory().query(addr)) {
+        i = *vq;
     } else if (addr < v.lo()) {  // the image: committed, MEM_IMAGE
         i = {page, 0x10000, 0x40, v.lo() - page, VirtualMemory::kMemCommit, 0x40, 0x1000000};
     } else if (addr < memory_map().ram_size) {  // the main stack and the kernel's area: committed
@@ -221,9 +242,11 @@ void mm_query_statistics(rt::Context& c) {
     const VirtualMemory& v = vm();
     const uint32_t page = VirtualMemory::kPage, total = memory_map().ram_size / page;
     const uint32_t image = v.lo() / page, stack = MemoryMap::kStackSize / page, kernel = (memory_map().ram_size - memory_map().stack_top()) / page;
-    const uint32_t committed = uint32_t(v.committed_bytes() / page);
-    const uint32_t used = image + stack + kernel + committed;
-    const uint32_t f[8] = {total, used < total ? total - used : 0, uint32_t(v.committed_bytes()), uint32_t(v.reserved_bytes()), 0, 0, stack, image};
+    const VirtualMemory& vv = virtual_memory();
+    const uint64_t committed_bytes = v.committed_bytes() + vv.committed_bytes();
+    const uint32_t used = image + stack + kernel + uint32_t(committed_bytes / page);
+    const uint32_t f[8] = {total, used < total ? total - used : 0, uint32_t(committed_bytes),
+                           uint32_t(v.reserved_bytes() + vv.reserved_bytes()), 0, 0, stack, image};
     for (uint32_t k = 0; k < 8; ++k) st(c, out + 4 + 4 * k, f[k]);
     ret(c, kStatusSuccess, 4);
 }

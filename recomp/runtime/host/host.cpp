@@ -71,16 +71,36 @@ void ret(rt::Context& c, uint32_t eax, uint32_t arg_bytes) {
 uint32_t contiguous(uint32_t bytes, uint32_t lowest, uint32_t highest, uint32_t align, uint32_t protect) {
     VirtualMemory& v = vm();
     const uint32_t a = std::max<uint32_t>(align, VirtualMemory::kPage);
-    const uint32_t at = v.reserve(0, bytes, protect, true, a & (a - 1) ? VirtualMemory::kPage : a, lowest & 0x0FFFFFFFu,
-                                  std::min<uint32_t>(highest, kPhysicalLimit - 1));
+    uint32_t at = physical_room((uint64_t(bytes) + VirtualMemory::kPage - 1) & ~uint64_t(VirtualMemory::kPage - 1))
+                      ? v.reserve(0, bytes, protect, true, a & (a - 1) ? VirtualMemory::kPage : a, lowest & 0x0FFFFFFFu,
+                                  std::min<uint32_t>(highest, kPhysicalLimit - 1))
+                      : 0;
     if (at) v.commit(at, v.region_size(at), protect);
+    else out_of_memory("contiguous memory", bytes);
     return at;
 }
 
-void VirtualMemory::init(uint8_t* ram, uint32_t lo, uint32_t hi) {
+// The title gets 0 or STATUS_NO_MEMORY, as from the Xbox's own kernel, and
+// many titles don't check (they don't run out on the hardware): said on the
+// console, with what's in use, since what follows may be a fault elsewhere.
+void out_of_memory(const char* what, uint32_t bytes) {
+    const VirtualMemory& v = vm();
+    std::printf("qilin_run: %s: no room for %u bytes (%llu KB of contiguous memory, %llu KB of virtual memory committed, of %u KB)\n", what, bytes,
+                static_cast<unsigned long long>(v.reserved_bytes() / 1024),
+                static_cast<unsigned long long>(virtual_memory().committed_bytes() / 1024), (v.hi() - v.lo()) / 1024);
+    std::fflush(stdout);
+}
+
+bool physical_room(uint64_t bytes) {
+    const VirtualMemory& v = vm();
+    return v.reserved_bytes() + virtual_memory().committed_bytes() + bytes <= uint64_t(v.hi() - v.lo());
+}
+
+void VirtualMemory::init(uint8_t* ram, uint32_t lo, uint32_t hi, bool host_backed) {
     ram_ = ram;
     lo_ = lo;
     hi_ = hi;
+    host_backed_ = host_backed;
     regions_.clear();
 }
 
@@ -142,6 +162,7 @@ bool VirtualMemory::commit(uint32_t base, uint32_t size, uint32_t protect) {
     const auto* r = find(first);
     if (!r || end > uint64_t(r->first) + r->second.size || end == first) return false;
     auto& pages = const_cast<Region&>(r->second).page_protect;
+    if (host_backed_) commit_guest_pages(first, uint32_t(end - first));
     for (uint64_t a = first; a < end; a += kPage) {
         uint32_t& p = pages[size_t((a - r->first) / kPage)];
         if (!p) std::memset(ram_ + a, 0, kPage);
@@ -158,10 +179,27 @@ bool VirtualMemory::decommit(uint32_t base, uint32_t size) {
     if (end > uint64_t(r->first) + r->second.size) return false;
     auto& pages = const_cast<Region&>(r->second).page_protect;
     for (uint64_t a = first; a < end; a += kPage) pages[size_t((a - r->first) / kPage)] = 0;
+    if (host_backed_) free_guest_pages(first, uint32_t(end - first));
     return true;
 }
 
-bool VirtualMemory::release(uint32_t base) { return regions_.erase(base) == 1; }
+bool VirtualMemory::release(uint32_t base) {
+    const auto it = regions_.find(base);
+    if (it == regions_.end()) return false;
+    if (host_backed_) free_guest_pages(base, it->second.size);
+    regions_.erase(it);
+    return true;
+}
+
+uint64_t VirtualMemory::uncommitted_bytes(uint32_t base, uint32_t size) const {
+    const uint32_t first = base & ~(kPage - 1);
+    const uint64_t end = (uint64_t(base) + size + kPage - 1) & ~uint64_t(kPage - 1);
+    const auto* r = find(first);
+    if (!r || end > uint64_t(r->first) + r->second.size) return 0;
+    uint64_t n = 0;
+    for (uint64_t a = first; a < end; a += kPage) n += r->second.page_protect[size_t((a - r->first) / kPage)] ? 0 : kPage;
+    return n;
+}
 
 uint32_t VirtualMemory::region_size(uint32_t base) const {
     const auto it = regions_.find(base);
@@ -197,6 +235,10 @@ uint64_t VirtualMemory::reserved_bytes() const {
     return n;
 }
 VirtualMemory& vm() {
+    static VirtualMemory v;
+    return v;
+}
+VirtualMemory& virtual_memory() {
     static VirtualMemory v;
     return v;
 }

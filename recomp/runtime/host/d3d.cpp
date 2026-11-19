@@ -1098,7 +1098,8 @@ const Device::CachedTexture* target_texture(rt::Context& c, Device& d, uint32_t 
 // as D3D does for programs (c-38, c-37), and the colours and texture
 // coordinates passed through. Lighting, vertex blending, fog, texture
 // coordinate generation and texture transforms stop the runtime until
-// they're modelled; so do pre-transformed (XYZRHW) vertices.
+// they're modelled. Pre-transformed (XYZRHW) vertices take the original's
+// own passthrough program instead (passthrough_constants).
 constexpr uint32_t kDevTransforms = 0xC50;          // the device's matrices, 64 bytes each
 constexpr uint32_t kTextureStateTable = 0x181970;  // D3D__TextureState: 32 dwords per stage
 constexpr uint32_t kRsFogEnable = 92, kRsLighting = 102, kRsVertexBlend = 137;
@@ -1171,6 +1172,27 @@ FixedFunction fixed_function_program(rt::Context& c, const char* fn) {
     return f;
 }
 
+// The constants the original loads with its passthrough program (0x173900),
+// into the GPU's c-96 and c-95, where they stay as they do on the hardware:
+// the multisample scale, the depth scale and the w scale (the depth scale
+// times the device's 0x940 for w-buffering, else 1); the screen-space
+// offset, less half a pixel where the device's flag 0x8000 and render state
+// 152 ask for it.
+constexpr uint32_t kRsFogTableMode = 93;
+
+void passthrough_constants(rt::Context& c, Device& d) {
+    const uint32_t dev = kDeviceStorage;
+    auto f = [&](uint32_t a) { return std::bit_cast<float>(ld(c, a)); };
+    const float wscale = ld(c, kRenderStateTable + 4 * kRsZEnable) == 2 ? f(dev + 0x944) * f(dev + 0x940) : 1.0f;
+    const float half = (ld(c, dev + 8) & 0x8000) && ld(c, kRenderStateTable + 4 * 152) ? 0.5f : 0.0f;
+    const float c96[4] = {f(dev + 0x958), f(dev + 0x95C), f(dev + 0x944), wscale};
+    const float c95[4] = {f(dev + 0xEE8) - half, f(dev + 0xEEC) - half, 0.0f, 0.0f};
+    for (int k = 0; k < 4; ++k) {
+        d.vs_constants[0][k] = std::bit_cast<uint32_t>(c96[k]);
+        d.vs_constants[1][k] = std::bit_cast<uint32_t>(c95[k]);
+    }
+}
+
 // The composite the fixed-function program reads in c0-c3: the columns of
 // World × View × Projection (D3D's row vectors: clip = v · W · V · P).
 void composite_constants(const rt::Context& c, float* out) {
@@ -1203,6 +1225,7 @@ constexpr uint32_t kOne = 0x20;  // the zero register, inverted: 1
 void fixed_function_combiners(rt::Context& c, const char* fn, gfx::nv2a::CombinerSetup& cs, std::vector<float>& fsu) {
     auto rs = [&](uint32_t i) { return ld(c, kRenderStateTable + 4 * i); };
     auto ts = [&](uint32_t stage, uint32_t i) { return ld(c, kTextureStateTable + 4 * (32 * stage + i)); };
+    if (rs(kRsFogEnable)) unmodelled(fn, "fog with the fixed-function pixel pipeline");
     if (rs(kRsSpecularEnable)) unmodelled(fn, "the specular colour added in the fixed-function pixel pipeline (D3DRS_SPECULARENABLE)");
     cs = {};
     uint32_t stages = 0, modes = 0;
@@ -1287,10 +1310,26 @@ void issue_draw(rt::Context& c, Device& d, const char* fn, uint32_t prim, Vertic
     // The vertex program at the selected slot of the GPU's program memory,
     // or the fixed-function pipeline as one.
     const uint32_t vs_flags = ld(c, ld(c, dev + kDevVertexShader) + 4);
-    const bool fixed_function = !(vs_flags & 0x10);
+    const bool passthrough = vs_flags & 0x2;  // pre-transformed (XYZRHW) vertices
+    const bool fixed_function = !(vs_flags & 0x10) && !passthrough;
     uint64_t vs_key = 0;
     std::optional<gfx::vsh::Program> prog;
-    if (fixed_function) {
+    if (passthrough) {
+        // The original's own program for these (0x173900, in its state flush):
+        // one of three in its image by the fog table mode, scaling by c-96 and
+        // offsetting by c-95, which it loads with it (passthrough_constants).
+        const uint32_t start = rs(kRsFogTableMode) == 0 ? 0x17FC28u : (ld(c, dev + 8) & 0x2) ? 0x17FB78u : 0x17FAB8u;
+        const uint32_t dwords = start == 0x17FB78u ? 0x2Cu : 0x30u;
+        std::vector<uint32_t> words{0x2078u | (dwords / 4) << 16};
+        for (uint32_t i = 0; i < dwords; ++i) words.push_back(ld(c, start + 4 * i));
+        vs_key = 0xF2F0000000000000ull ^ uint64_t(start) ^ (uint64_t(v.mask) << 40);
+        if (d.shaders[vs_key].empty()) {
+            std::string error;
+            prog = gfx::vsh::decode(words.data(), words.size(), &error);
+            if (!prog) unmodelled(fn, "the passthrough program doesn't decode (" + error + ")");
+        }
+        passthrough_constants(c, d);
+    } else if (fixed_function) {
         FixedFunction f = fixed_function_program(c, fn);
         vs_key = f.key ^ (uint64_t(v.mask) << 40);
         prog = std::move(f.program);
