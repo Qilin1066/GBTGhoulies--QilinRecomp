@@ -1,6 +1,6 @@
 # Runtime: status (roadmap step 3)
 
-Last updated 2026-11-18 (v0.24.0: controllers, the kernel's SHA-1 and HMAC, the game reaches its menus and saves; v0.17.0: the game creates its shaders and stops at its first transform; v0.16.0: guest RAM mapped at the kernel's windows too; D3D's resource code lifted; the game creates its textures and stops at its first vertex shader. v0.15.0: audio starts, `audio.md`; the renderer and Direct3D are in `graphics.md`).
+Last updated 2026-11-19 (v0.28.0: Chapter 1's first fight plays; v0.27.0: virtual memory in its own address space, as on the Xbox; v0.24.0: controllers, the kernel's SHA-1 and HMAC, the game reaches its menus and saves; v0.17.0: the game creates its shaders and stops at its first transform; v0.16.0: guest RAM mapped at the kernel's windows too; D3D's resource code lifted; the game creates its textures and stops at its first vertex shader. v0.15.0: audio starts, `audio.md`; the renderer and Direct3D are in `graphics.md`).
 
 The runtime is everything the lifted game code needs that isn't lifted: guest memory, the Xbox kernel, D3D, DirectSound/XACT and the other XDK libraries. All of it is replaced natively (HLE); none of it is emulated.
 
@@ -125,7 +125,7 @@ Names are matched case-insensitively, as on FATX and the disc's XDVDFS (an exact
 
 **DirectSound** (`recomp/runtime/host/dsound.cpp`) over the software mixer, beneath the lifted XACT. See `audio.md`.
 
-**Where it is now** (v0.24.0): the game runs its attract sequence, takes START, turns the book's pages, shows its save-slot menu, takes a name on its on-screen keyboard and saves (signed, as XAPI signs saves), then loads the save. Between there and play, it asks for disc files one at a time (they're staged from the disc as asked), and the runtime stops at each function it doesn't provide yet. Earlier, start-up writes the title's save metadata and images to `partition1/UDATA/4d530053/`, gets cache partition 5 formatted with 64 KB clusters and mounted as Z:, and checks that `D:\loctext\english` exists. With a disc file missing, the game shows its disc-error screen, as the console does: it loads `dirtydisk_bitmap` and draws the message into the front buffer (`LockRect`); the runtime doesn't show CPU writes to a frame buffer yet, so the screen stays as it was.
+**Where it is now** (v0.28.0): the game runs its attract sequence, takes START, turns the book's pages, shows its save-slot menu, takes a name on its on-screen keyboard and saves (signed, as XAPI signs saves), loads the save, plays Chapter 1's story pages and movie, and loads the first level (Chapter 1, scene 2): Cooper in the mansion hall against the imps, with health, hits and the book's page turn when he's beaten, then the level again. It asks for disc files one at a time (they're staged from the disc as asked), and the runtime stops at each function it doesn't provide yet. Earlier, start-up writes the title's save metadata and images to `partition1/UDATA/4d530053/`, gets cache partition 5 formatted with 64 KB clusters and mounted as Z:, and checks that `D:\loctext\english` exists. With a disc file missing, the game shows its disc-error screen, as the console does: it loads `dirtydisk_bitmap` and draws the message into the front buffer (`LockRect`); the runtime doesn't show CPU writes to a frame buffer yet, so the screen stays as it was.
 
 ## Tests
 
@@ -133,8 +133,7 @@ Names are matched case-insensitively, as on FATX and the disc's XDVDFS (an exact
 
 ## Next
 
-1. **Rendering into textures** (`graphics.md`), and surround sound (`audio.md`).
-2. **Into the game:** past the menus to the first level, implementing what it stops at.
-3. **Audio still to come** (`audio.md`): streams (streamed wave banks, music), WMA, the I3DL2 reverb, envelopes, LFOs, filters, 3D.
-4. **The scheduler:** guest threads (`PsCreateSystemThreadEx`), waits, events, timers and DPCs. Until then a second thread stops the runtime.
-5. **Keep running `qilin_run`** and implement each function it stops at.
+1. **Through Chapter 1:** playing on into its later scenes, implementing what they stop at; the fixed-function lighting and fog as they come (`graphics.md`).
+2. **Surround sound** and the audio still to come (`audio.md`): WMA, the I3DL2 reverb, envelopes, LFOs, filters, 3D.
+3. **The scheduler:** guest threads (`PsCreateSystemThreadEx`), waits, events, timers and DPCs. Until then a second thread stops the runtime.
+4. **Keep running `qilin_run`** and implement each function it stops at.
