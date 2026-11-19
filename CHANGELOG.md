@@ -11,6 +11,15 @@ Each release is a git tag (`vX.Y.Z`) with a matching GitHub release. The version
 
 ## [Unreleased]
 
+## [0.33.1] - 2026-11-19
+
+### Fixed
+- **Clipping in stereo**: the mix bins saturate at 24 bits where the console's do, and the stereo fold (the centre and back bins into the front pair, which is ours) goes through a look-ahead peak limiter that changes nothing below full scale. Samples at full scale in a 280-second recording: 569 clipped before, 47 held at full scale after. The game's own mix passes full scale at loud moments, as it does on the console.
+- **The interaural delay goes to the ear its sign names** (positive the left), as DirectSound's lookup makes it, instead of to the ear with the quieter filter; in five minutes of play the two agreed in all 7.96 million blocks.
+
+### Changed
+- Settled, from the XBE: an Xbox ADPCM block is 64 samples (`XAudioCreateAdpcmFormat` writes `wSamplesPerBlock` 64), as the runtime has it. The voice filter's step order (low, high, band) is the one the hardware measurements were checked against.
+
 ## [0.33.0] - 2026-11-19
 The voice processor as measured on a retail console (raddad772's measurements, xemu pull request 3105) wherever the engine has the same stage.
 

@@ -340,6 +340,36 @@ int main() {
         CHECK(finite);
     }
 
+    // Saturation at the mix bins' 24-bit full scale; the stereo fold's
+    // limiter: below full scale, the signal sample for sample, 72 frames
+    // (1.5 ms) late; above, nothing out of [−1, 1], and full gain again after.
+    {
+        audio::Bins b;
+        b.clear(4);
+        b.bin(0)[0] = 1.5f, b.bin(0)[1] = -2.0f, b.bin(0)[2] = 0.25f, b.bin(5)[3] = 1.0f;
+        audio::saturate(b, 0, audio::kMixBinCount);
+        CHECK(b.bin(0)[0] == 1.0f - 1.0f / 8388608.0f && b.bin(0)[1] == -1.0f && b.bin(0)[2] == 0.25f && b.bin(5)[3] < 1.0f);
+
+        audio::Limiter lim;
+        std::vector<float> x(2 * 48000);
+        for (size_t i = 0; i < 48000; ++i) x[2 * i] = 0.9f * float(std::sin(0.01 * double(i))), x[2 * i + 1] = -x[2 * i];
+        std::vector<float> y = x;
+        lim.process(y.data(), 48000);
+        bool same = true;
+        for (size_t i = 72; i < 48000; ++i) same &= y[2 * i] == x[2 * (i - 72)] && y[2 * i + 1] == x[2 * (i - 72) + 1];
+        CHECK(same);
+        // A burst to 1.6 among quiet: held to full scale, and back to unity after it.
+        std::vector<float> z(2 * 48000, 0.0f);
+        for (size_t i = 0; i < 48000; ++i) z[2 * i] = z[2 * i + 1] = (i >= 2000 && i < 2400 ? 1.6f : 0.5f) * float(std::sin(0.05 * double(i)));
+        std::vector<float> zin = z;
+        audio::Limiter lim2;
+        lim2.process(z.data(), 48000);
+        float most = 0;
+        for (float s : z) most = std::max(most, std::fabs(s));
+        CHECK(most <= 1.0f && most > 0.99f);
+        CHECK(z[2 * 47999] == zin[2 * (47999 - 72)]);  // recovered (the release: 50 ms, unity within 10^-5 after about 0.5 s)
+    }
+
     if (failures) std::fprintf(stderr, "%d check(s) failed\n", failures);
     else std::printf("all audio tests passed\n");
     return failures != 0;

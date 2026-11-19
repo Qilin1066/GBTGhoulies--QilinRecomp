@@ -104,6 +104,7 @@ struct DirectSound {
     size_t mem_size = 0;
     audio::Bins bins;
     audio::I3dl2Reverb reverb;
+    audio::Limiter limiter;  // the stereo fold's
     std::vector<float> speakers, stereo;
     std::thread mixer;
     std::atomic<bool> quit{false};
@@ -154,7 +155,12 @@ uint32_t apu_global_sample_count() { return uint32_t(audio_now()); }
 // for speakers, isn't applied), then the speakers to the device: 5.1 as
 // they are (front left, right, centre, LFE, back left, right: SDL's
 // order too), or folded to stereo (the centre at -3 dB into both, the
-// back bins into their sides, the LFE left out).
+// back bins into their sides, the LFE left out) through a peak limiter.
+// The bins saturate where the console's do: 24-bit, after the voices and
+// after the DSP's effects. The game's mix passes full scale at times (its
+// front bins alone reach 1.33 in the attract sequence) and saturates there
+// on the console too; the fold, ours, would add to it, and the limiter
+// takes that out without changing anything below full scale.
 void mix_block(DirectSound& d, uint32_t n) {
     d.bins.clear(n);
     for (auto& [addr, b] : d.buffers)
@@ -163,6 +169,7 @@ void mix_block(DirectSound& d, uint32_t n) {
         if (b->output) b->voice.mix(d.mem, d.mem_size, d.bins, n, &d.buffers.at(b->output)->voice);
     for (auto& [addr, b] : d.buffers)
         if (!b->output) b->voice.mix(d.mem, d.mem_size, d.bins, n);
+    audio::saturate(d.bins, 0, audio::kMixBinCount);  // the voice processor's 24-bit mix buffer
     d.reverb.process(d.bins);
     static constexpr uint32_t kXtlkTo[4] = {audio::kFrontLeft, audio::kFrontRight, audio::kBackLeft, audio::kBackRight};
     for (uint32_t k = 0; k < 4; ++k) {
@@ -170,6 +177,7 @@ void mix_block(DirectSound& d, uint32_t n) {
         float* to = d.bins.bin(kXtlkTo[k]);
         for (uint32_t i = 0; i < n; ++i) to[i] += from[i];
     }
+    audio::saturate(d.bins, 0, 6);  // the DSP's 24-bit outputs
     const float* fl = d.bins.bin(audio::kFrontLeft);
     const float* fr = d.bins.bin(audio::kFrontRight);
     const float* fc = d.bins.bin(audio::kFrontCenter);
@@ -181,6 +189,7 @@ void mix_block(DirectSound& d, uint32_t n) {
         d.stereo[2 * i] = fl[i] + fc[i] * 0.70710678f + bl[i];
         d.stereo[2 * i + 1] = fr[i] + fc[i] * 0.70710678f + br[i];
     }
+    d.limiter.process(d.stereo.data(), n);
     if (d.wav) d.wav->write(d.stereo.data(), n);
     if (d.out && d.out->channels() == 6) {
         d.speakers.resize(size_t(n) * 6);

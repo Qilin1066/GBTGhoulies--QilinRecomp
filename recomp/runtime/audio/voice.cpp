@@ -311,8 +311,11 @@ bool Voice::process(const uint8_t* mem, size_t mem_size, uint32_t frames) {
     // measured). A 3D voice with a head-related filter: 1 the DLS2 or 2 the
     // EQ from FCA, and in every mode the I3DL2 pair from FCB (DirectSound
     // makes its mode 0 a 3), a direct path for routes 0-4 and 6 and a room
-    // path for 5 and 7. The state-variable filter's order of steps per
-    // sample (low, high, band: Chamberlin's) isn't in the measurements.
+    // path for 5 and 7. The state-variable filter's steps run low, high,
+    // band each sample, at 48 kHz (Chamberlin's): the order of xemu's
+    // filter, which the measurements corrected (they removed its input
+    // scale, sqrt(q/2 + 0.01), and its cubic waveshaper, which are those of
+    // the Chamberlin filter it came from) and were matched against.
     const bool hrtf3d = three_d.active && three_d.hrtf && ch == 1;
     const uint32_t mode = hrtf3d && (filter_.mode & 3) == 0 ? 3 : filter_.mode & 3;
     auto dls2 = [&](uint32_t c, uint32_t word) {
@@ -354,8 +357,8 @@ bool Voice::process(const uint8_t* mem, size_t mem_size, uint32_t frames) {
         }
     }
     // A 3D voice's head-related filter: 31 taps a ear, the hardware's
-    // minifloats applied as written (hrtf_tap), the far ear (the quieter
-    // filter) delayed by the interaural delay.
+    // minifloats applied as written (hrtf_tap), the far ear delayed by the
+    // interaural delay.
     if (three_d.active && three_d.hrtf && ch == 1) {
         const uint32_t itd = uint32_t(std::min(std::abs(three_d.itd), 63));
         const size_t hist = 30 + 63;
@@ -366,7 +369,13 @@ bool Voice::process(const uint8_t* mem, size_t mem_size, uint32_t frames) {
         float taps[2][31], energy[2] = {};
         for (int e = 0; e < 2; ++e)
             for (int k = 0; k < 31; ++k) taps[e][k] = hrtf_tap(three_d.taps[e][k]), energy[e] += taps[e][k] * taps[e][k];
-        const int far = energy[0] < energy[1] ? 0 : 1;
+        // The delay's sign names the ear, as DirectSound's lookup makes it
+        // (the left table's delay past the azimuth split, else the right's
+        // negated): positive delays the left ear. (Checked against the
+        // filters over five minutes of play: in 7.96 million blocks with a
+        // delay, the delayed ear's filter was the quieter one every time.)
+        const int far = three_d.itd > 0 ? 0 : 1;
+        (void)energy;
         hrtf_out_.assign(size_t(frames) * 2, 0.0f);
         for (int e = 0; e < 2; ++e) {
             const uint32_t delay = e == far ? itd : 0;
@@ -604,6 +613,50 @@ void Voice::render_stream(const uint8_t* mem, size_t mem_size, float* out, uint3
         pos_ += step;
     }
     retire_played();
+}
+
+// ---------------------------------------------------------------- saturation and the limiter
+void saturate(Bins& bins, uint32_t first_bin, uint32_t count) {
+    constexpr float kTop = 1.0f - 1.0f / 8388608.0f;
+    for (uint32_t b = first_bin; b < first_bin + count && b < kMixBinCount; ++b) {
+        float* x = bins.bin(b);
+        for (uint32_t i = 0; i < bins.frames; ++i) x[i] = std::clamp(x[i], -1.0f, kTop);
+    }
+}
+
+void Limiter::process(float* io, uint32_t frames) {
+    // Each frame waits kLookahead frames in the ring; slot pos_ holds the
+    // one going out now, then pos_ + 1 … the ones after it, k frames from
+    // going out. For each frame needing less gain than now, the straight
+    // line from here that reaches its need when it goes out; the gain takes
+    // the steepest of them (so every frame gets at most what it needs), and
+    // otherwise recovers by a slow one-pole, never above what any frame in
+    // the window needs, snapping to unity when within 10^−5.
+    constexpr double kRelease = 0.99958;  // e^(−1/(0.05 · 48000))
+    for (uint32_t i = 0; i < frames; ++i) {
+        const float l = io[2 * i], r = io[2 * i + 1];
+        const float peak = std::max(std::fabs(l), std::fabs(r));
+        const float incoming = peak > 1.0f ? 1.0f / peak : 1.0f;  // goes out kLookahead frames from now
+        double next = incoming < gain_ ? gain_ - (gain_ - incoming) / double(kLookahead + 1) : gain_;
+        double lowest = incoming;
+        for (uint32_t k = 0; k < kLookahead; ++k) {
+            const float n = need_[(pos_ + k) % kLookahead];
+            lowest = std::min(lowest, double(n));
+            if (n < gain_) next = std::min(next, gain_ - (gain_ - n) / double(k + 1));
+        }
+        if (next < gain_) {
+            gain_ = next;
+        } else {
+            gain_ = std::min(lowest, 1.0 - (1.0 - gain_) * kRelease);
+            if (gain_ > 0.99999 && lowest >= 1.0) gain_ = 1.0;
+        }
+        const float out_l = delay_[2 * pos_], out_r = delay_[2 * pos_ + 1];
+        delay_[2 * pos_] = l, delay_[2 * pos_ + 1] = r;
+        need_[pos_] = incoming;
+        pos_ = (pos_ + 1) % kLookahead;
+        io[2 * i] = gain_ >= 1.0 ? out_l : float(out_l * gain_);
+        io[2 * i + 1] = gain_ >= 1.0 ? out_r : float(out_r * gain_);
+    }
 }
 
 // ---------------------------------------------------------------- WAV output

@@ -115,7 +115,7 @@ struct Voice3d {
     int32_t pitch_offset = 0;
     bool hrtf = false;
     uint8_t taps[2][31] = {};  // left, right: the hardware's minifloats (hrtf_tap)
-    int32_t itd = 0;           // frames the far ear lags
+    int32_t itd = 0;           // frames the far ear lags: positive the left, negative the right
     // The I3DL2 filters' coefficients (DS3DVOICEDATA's, bit 7), the voice's
     // FCB in place of SetFilter's: the direct path's in bits 15:0, the
     // room's in 31:16.
@@ -298,6 +298,29 @@ private:
     Allpass diffusers_[2];
     struct Line { std::vector<float> buf; uint32_t pos = 0; float gain = 0, lp = 0, state = 0; };
     Line lines_[kLines];
+};
+
+// The mix bins are the APU's 24-bit fixed point: a sample past full scale
+// saturates there (the game sets no headroom on any bin). Holds every
+// speaker and effect bin of a block to [−1, 1 − 2^−23].
+void saturate(Bins& bins, uint32_t first_bin, uint32_t count);
+
+// A peak limiter for the stereo fold of the speakers (ours: the console's
+// stereo downmix isn't known), which adds the centre and back bins into
+// the front pair and can pass full scale where no speaker does. Below full
+// scale it changes nothing, sample for sample (after its 1.5 ms delay);
+// above, the gain comes down to hold the peak at full scale, reached in
+// the delay's time so nothing clips, and recovers over about 50 ms.
+class Limiter {
+public:
+    void process(float* stereo, uint32_t frames);  // interleaved, in place
+
+private:
+    static constexpr uint32_t kLookahead = 72;  // 1.5 ms
+    std::vector<float> delay_ = std::vector<float>(2 * kLookahead, 0.0f);
+    std::vector<float> need_ = std::vector<float>(kLookahead, 1.0f);  // the gain each delayed frame needs
+    uint32_t pos_ = 0;
+    double gain_ = 1.0;  // double: the release's last steps are smaller than a float's near 1
 };
 
 // Xbox ADPCM: decodes one block (36 bytes per channel, channel headers then
