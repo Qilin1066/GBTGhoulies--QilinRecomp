@@ -1116,9 +1116,16 @@ const Device::CachedTexture* stage_texture(rt::Context& c, Device& d, const char
     const uint8_t* texels = c.mem + data;
     const bool same = e.id && e.texels.size() == shape.bytes && std::memcmp(e.texels.data(), texels, shape.bytes) == 0;
     if (!same) {
-        if (e.id) d.renderer->destroy_texture(e.id);
-        const gfx::TextureData t = gfx::decode_texture(shape, texels, shape.palettized ? palette : nullptr);
-        e.id = d.renderer->create_texture(t);
+        // DXT blocks go to the GPU as they are where it samples BC1-3 (a
+        // quarter or an eighth of the memory, and no decoding here).
+        const gfx::TextureData t = shape.compressed && shape.depth == 1 && d.renderer->takes_blocks()
+                                       ? gfx::texture_blocks(shape, texels)
+                                       : gfx::decode_texture(shape, texels, shape.palettized ? palette : nullptr);
+        // Changed texels (a video frame, say) go into the image it has.
+        if (!e.id || !d.renderer->update_texture(e.id, t)) {
+            if (e.id) d.renderer->destroy_texture(e.id);
+            e.id = d.renderer->create_texture(t);
+        }
         e.texels.assign(texels, texels + shape.bytes);
         e.dims = t.dims(), e.linear = t.linear, e.width = t.width, e.height = t.height, e.depth = t.depth;
     }

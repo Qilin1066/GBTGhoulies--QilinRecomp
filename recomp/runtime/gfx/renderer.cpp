@@ -204,6 +204,11 @@ private:
     // Vulkan's pipeline cache, loaded from config_.pipeline_cache and saved
     // there a few seconds after the last new pipeline (and at the end).
     VkPipelineCache pipeline_cache_ = VK_NULL_HANDLE;
+    bool takes_blocks_ = false;  // BC1-3 textures sampled as they are
+public:
+    bool takes_blocks() const override { return takes_blocks_; }
+    bool update_texture(uint32_t id, const TextureData& t) override;
+private:
     uint32_t unsaved_pipelines_ = 0;
     std::chrono::steady_clock::time_point last_pipeline_{};
     void load_pipeline_cache();
@@ -258,7 +263,14 @@ private:
         VkImage image = VK_NULL_HANDLE;
         VkDeviceMemory memory = VK_NULL_HANDLE;
         VkImageView view = VK_NULL_HANDLE;
+        // The shape it was made with: update_texture takes texels of the same.
+        uint32_t width = 0, height = 0, depth = 1, levels = 1, faces = 1;
+        Blocks blocks = Blocks::None;
     };
+    // The texels into the image through the ring (or a staging buffer of
+    // their own when larger than half of it), between barriers: from
+    // nothing for a new image, else after the draws that sampled it.
+    void upload_texels(VkImage image, const TextureData& t, bool fresh);
     std::unordered_map<uint32_t, Texture> textures_;
     uint32_t next_texture_ = 1;
     // Textures drawn into (create_render_target), by the same ids as textures;
@@ -506,6 +518,19 @@ void VulkanRenderer::create_device() {
     VkPhysicalDeviceFeatures2 f2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
     f2.pNext = &f13;
     f2.features.largePoints = have.largePoints;
+    // BC1-3 sampled with filtering, where the device has them; QILIN_NO_BC=1 decodes them on the CPU instead.
+    if (have.textureCompressionBC && !(std::getenv("QILIN_NO_BC") && *std::getenv("QILIN_NO_BC") == '1')) {
+        bool all = true;
+        for (VkFormat fmt : {VK_FORMAT_BC1_RGBA_UNORM_BLOCK, VK_FORMAT_BC2_UNORM_BLOCK, VK_FORMAT_BC3_UNORM_BLOCK}) {
+            VkFormatProperties fp{};
+            vkGetPhysicalDeviceFormatProperties(gpu_, fmt, &fp);
+            const VkFormatFeatureFlags need = VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT | VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT |
+                                              VK_FORMAT_FEATURE_TRANSFER_DST_BIT;
+            all = all && (fp.optimalTilingFeatures & need) == need;
+        }
+        takes_blocks_ = all;
+        f2.features.textureCompressionBC = all;
+    }
     VkDeviceCreateInfo info{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
     info.pNext = &f2;
     info.queueCreateInfoCount = 1;
@@ -1451,7 +1476,8 @@ void VulkanRenderer::create_draw_objects() {
     for (Slot& slot : slots_) {
         VkBufferCreateInfo bi{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
         bi.size = ring_size_;
-        bi.usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT;
+        bi.usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT |
+                   VK_BUFFER_USAGE_TRANSFER_SRC_BIT;  // also texels on their way to an image
         bi.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
         check(vkCreateBuffer(device_, &bi, nullptr, &slot.ring), "vkCreateBuffer");
         VkMemoryRequirements req{};
@@ -1648,7 +1674,14 @@ uint32_t VulkanRenderer::create_texture(const TextureData& t) {
     VkImageCreateInfo info{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
     info.imageType = t.dims() == 3 ? VK_IMAGE_TYPE_3D : VK_IMAGE_TYPE_2D;
     info.flags = t.faces == 6 ? VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT : 0;
-    info.format = VK_FORMAT_R8G8B8A8_UNORM;
+    info.format = t.blocks == Blocks::Bc1   ? VK_FORMAT_BC1_RGBA_UNORM_BLOCK
+                  : t.blocks == Blocks::Bc2 ? VK_FORMAT_BC2_UNORM_BLOCK
+                  : t.blocks == Blocks::Bc3 ? VK_FORMAT_BC3_UNORM_BLOCK
+                                            : VK_FORMAT_R8G8B8A8_UNORM;
+    if (t.blocks != Blocks::None && (!takes_blocks_ || t.dims() == 3)) {
+        std::fprintf(stderr, "qilin: renderer: BC blocks for a device or shape that doesn't take them\n");
+        std::exit(3);
+    }
     info.extent = {t.width, t.height, t.depth};
     info.mipLevels = t.levels;
     info.arrayLayers = layers;
@@ -1672,35 +1705,67 @@ uint32_t VulkanRenderer::create_texture(const TextureData& t) {
     view.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, t.levels, 0, layers};
     check(vkCreateImageView(device_, &view, nullptr, &tex.view), "vkCreateImageView");
 
-    // The texels through a staging buffer, freed after the submission.
-    VkBuffer staging = VK_NULL_HANDLE;
-    VkDeviceMemory staging_memory = VK_NULL_HANDLE;
-    VkBufferCreateInfo bi{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
-    bi.size = std::max<VkDeviceSize>(t.rgba.size(), 4);
-    bi.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
-    check(vkCreateBuffer(device_, &bi, nullptr, &staging), "vkCreateBuffer");
-    vkGetBufferMemoryRequirements(device_, staging, &req);
-    alloc.allocationSize = req.size;
-    alloc.memoryTypeIndex = memory_type(req.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-    check(vkAllocateMemory(device_, &alloc, nullptr, &staging_memory), "vkAllocateMemory");
-    check(vkBindBufferMemory(device_, staging, staging_memory, 0), "vkBindBufferMemory");
-    void* mapped = nullptr;
-    check(vkMapMemory(device_, staging_memory, 0, bi.size, 0, &mapped), "vkMapMemory");
-    std::memcpy(mapped, t.rgba.data(), t.rgba.size());
-    vkUnmapMemory(device_, staging_memory);
-    staging_.emplace_back(staging, staging_memory);
+    upload_texels(tex.image, t, true);
+    tex.width = t.width, tex.height = t.height, tex.depth = t.depth, tex.levels = t.levels, tex.faces = t.faces, tex.blocks = t.blocks;
 
+    const uint32_t id = next_texture_++;
+    textures_[id] = tex;
+    return id;
+}
+
+bool VulkanRenderer::update_texture(uint32_t id, const TextureData& t) {
+    auto it = textures_.find(id);
+    if (it == textures_.end()) return false;
+    const Texture& x = it->second;
+    if (x.width != t.width || x.height != t.height || x.depth != t.depth || x.levels != t.levels || x.faces != t.faces || x.blocks != t.blocks)
+        return false;
+    upload_texels(x.image, t, false);
+    return true;
+}
+
+void VulkanRenderer::upload_texels(VkImage image, const TextureData& t, bool fresh) {
     const bool was_open = pass_open_;
     end_pass();
     record();
+    // Where the texels come from: the ring, else a buffer freed after the submission.
+    VkBuffer from = VK_NULL_HANDLE;
+    VkDeviceSize base = 0;
+    const VkDeviceSize bytes = std::max<VkDeviceSize>(t.rgba.size(), 4);
+    if (bytes <= ring_size_ / 2) {
+        base = ring_alloc(bytes, 16, t.rgba.empty() ? nullptr : t.rgba.data());  // may submit first: then this goes in the next
+        from = ring_;
+    } else {
+        VkDeviceMemory staging_memory = VK_NULL_HANDLE;
+        VkBufferCreateInfo bi{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+        bi.size = bytes;
+        bi.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+        check(vkCreateBuffer(device_, &bi, nullptr, &from), "vkCreateBuffer");
+        VkMemoryRequirements req{};
+        vkGetBufferMemoryRequirements(device_, from, &req);
+        VkMemoryAllocateInfo alloc{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+        alloc.allocationSize = req.size;
+        alloc.memoryTypeIndex = memory_type(req.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+        check(vkAllocateMemory(device_, &alloc, nullptr, &staging_memory), "vkAllocateMemory");
+        check(vkBindBufferMemory(device_, from, staging_memory, 0), "vkBindBufferMemory");
+        void* mapped = nullptr;
+        check(vkMapMemory(device_, staging_memory, 0, bytes, 0, &mapped), "vkMapMemory");
+        std::memcpy(mapped, t.rgba.data(), t.rgba.size());
+        vkUnmapMemory(device_, staging_memory);
+        staging_.emplace_back(from, staging_memory);
+    }
+    record();
     VkImageMemoryBarrier2 b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};
+    if (!fresh) {  // after every earlier draw's sampling, in this submission or one before
+        b.srcStageMask = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
+        b.srcAccessMask = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT;
+    }
     b.dstStageMask = VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT;
     b.dstAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
-    b.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    b.oldLayout = fresh ? VK_IMAGE_LAYOUT_UNDEFINED : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
     b.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
     b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    b.image = tex.image;
-    b.subresourceRange = view.subresourceRange;
+    b.image = image;
+    b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, t.levels, 0, t.faces};
     VkDependencyInfo dep{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
     dep.imageMemoryBarrierCount = 1;
     dep.pImageMemoryBarriers = &b;
@@ -1709,12 +1774,12 @@ uint32_t VulkanRenderer::create_texture(const TextureData& t) {
     for (uint32_t f = 0; f < t.faces; ++f)
         for (uint32_t l = 0; l < t.levels; ++l) {
             VkBufferImageCopy r{};
-            r.bufferOffset = t.level_offset(f, l);
+            r.bufferOffset = base + t.level_offset(f, l);
             r.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, l, f, 1};
             r.imageExtent = {t.level_width(l), t.level_height(l), t.level_depth(l)};
             regions.push_back(r);
         }
-    vkCmdCopyBufferToImage(cmd_, staging, tex.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, uint32_t(regions.size()), regions.data());
+    vkCmdCopyBufferToImage(cmd_, from, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, uint32_t(regions.size()), regions.data());
     b.srcStageMask = VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT;
     b.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
     b.dstStageMask = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
@@ -1723,10 +1788,6 @@ uint32_t VulkanRenderer::create_texture(const TextureData& t) {
     b.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
     vkCmdPipelineBarrier2(cmd_, &dep);
     if (was_open) begin_pass();
-
-    const uint32_t id = next_texture_++;
-    textures_[id] = tex;
-    return id;
 }
 
 void VulkanRenderer::destroy_texture(uint32_t id) {

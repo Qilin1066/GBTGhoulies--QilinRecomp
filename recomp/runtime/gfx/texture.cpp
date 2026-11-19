@@ -162,11 +162,17 @@ uint32_t swizzle_offset(uint32_t x, uint32_t y, uint32_t z, uint32_t width, uint
     return r;
 }
 
+size_t TextureData::level_bytes(uint32_t l) const {
+    if (blocks == Blocks::None) return size_t(level_width(l)) * level_height(l) * level_depth(l) * 4;
+    const size_t block = blocks == Blocks::Bc1 ? 8 : 16;
+    return size_t((level_width(l) + 3) / 4) * ((level_height(l) + 3) / 4) * level_depth(l) * block;
+}
+
 size_t TextureData::level_offset(uint32_t face, uint32_t level) const {
     size_t off = 0, face_bytes = 0;
-    for (uint32_t l = 0; l < levels; ++l) face_bytes += size_t(level_width(l)) * level_height(l) * level_depth(l) * 4;
+    for (uint32_t l = 0; l < levels; ++l) face_bytes += level_bytes(l);
     off = face_bytes * face;
-    for (uint32_t l = 0; l < level; ++l) off += size_t(level_width(l)) * level_height(l) * level_depth(l) * 4;
+    for (uint32_t l = 0; l < level; ++l) off += level_bytes(l);
     return off;
 }
 
@@ -214,6 +220,21 @@ bool texture_shape(uint32_t format, uint32_t size, TextureShape* out, std::strin
     }
     *out = s;
     return true;
+}
+
+TextureData texture_blocks(const TextureShape& s, const uint8_t* data) {
+    const FormatInfo info = format_info(s.color_format);
+    TextureData t;
+    t.width = s.width, t.height = s.height, t.depth = s.depth, t.levels = s.levels, t.faces = s.cube ? 6 : 1;
+    t.blocks = info.kind == Kind::Dxt1 ? Blocks::Bc1 : info.kind == Kind::Dxt3 ? Blocks::Bc2 : Blocks::Bc3;
+    // The guest's face: its levels' blocks back to back (the same sizes as
+    // here: a level under 4×4 is one block), padded to 128 bytes in a cube.
+    size_t face_bytes = 0;
+    for (uint32_t l = 0; l < t.levels; ++l) face_bytes += t.level_bytes(l);
+    t.rgba.resize(face_bytes * t.faces);
+    const size_t guest_face = s.cube ? (face_bytes + 127) & ~size_t(127) : face_bytes;
+    for (uint32_t f = 0; f < t.faces; ++f) std::memcpy(t.rgba.data() + face_bytes * f, data + guest_face * f, face_bytes);
+    return t;
 }
 
 TextureData decode_texture(const TextureShape& s, const uint8_t* data, const uint8_t* palette) {

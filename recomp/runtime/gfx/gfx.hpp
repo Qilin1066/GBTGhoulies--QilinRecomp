@@ -151,6 +151,13 @@ public:
 
     // Textures: made from decoded texels (texture.hpp), named by a non-zero id.
     virtual uint32_t create_texture(const TextureData& data) = 0;
+    // Whether create_texture takes BC1-3 blocks (TextureData::blocks): the
+    // GPU samples them (desktop GPUs, Apple's); else they're decoded first.
+    virtual bool takes_blocks() const = 0;
+    // New texels for a texture made by create_texture, of the same shape,
+    // into its image (draws recorded before see the old ones); false, and
+    // nothing done, for another shape.
+    virtual bool update_texture(uint32_t id, const TextureData& data) = 0;
     virtual void destroy_texture(uint32_t id) = 0;
 
     // Draws into the back buffer.

@@ -10,12 +10,20 @@
 
 namespace qilin::gfx {
 
+// DXT1, DXT3 and DXT5 are BC1, BC2 and BC3: the same 4×4 blocks, decoded
+// by the same rules (DXT1's 3-colour mode with transparent black when
+// c0 <= c1, as BC1_RGBA; DXT3 and 5 always 4 colours).
+enum class Blocks : uint8_t { None, Bc1, Bc2, Bc3 };
+
 struct TextureData {
     uint32_t width = 0, height = 0, depth = 1;
     uint32_t levels = 1, faces = 1;  // faces: 6 for a cube map
     bool linear = false;             // a linear (LIN_) texture: the hardware addresses it in texels
-    // RGBA8, face by face, each face its levels from the largest, each level rows top to bottom.
+    Blocks blocks = Blocks::None;    // set: `rgba` holds the guest's blocks, for the GPU to decode
+    // RGBA8 (or the blocks), face by face, each face its levels from the
+    // largest, each level rows top to bottom (block rows, for blocks).
     std::vector<uint8_t> rgba;
+    size_t level_bytes(uint32_t level) const;
     size_t level_offset(uint32_t face, uint32_t level) const;
     uint32_t level_width(uint32_t l) const { return width >> l ? width >> l : 1; }
     uint32_t level_height(uint32_t l) const { return height >> l ? height >> l : 1; }
@@ -39,6 +47,10 @@ bool texture_shape(uint32_t format, uint32_t size, TextureShape* out, std::strin
 // Decodes the texels at `data` (bytes from that address on) to RGBA8; a
 // palettized texture (palettized) through `palette`, 256 A8R8G8B8 entries.
 TextureData decode_texture(const TextureShape& shape, const uint8_t* data, const uint8_t* palette = nullptr);
+
+// A DXT texture's blocks as they are, for a GPU that decodes BC1-3 (2D
+// and cube textures; the guest stores the blocks in rows, unswizzled).
+TextureData texture_blocks(const TextureShape& shape, const uint8_t* data);
 
 // The Morton (swizzled) offset of texel (x, y, z) in a power-of-two texture.
 uint32_t swizzle_offset(uint32_t x, uint32_t y, uint32_t z, uint32_t width, uint32_t height, uint32_t depth);

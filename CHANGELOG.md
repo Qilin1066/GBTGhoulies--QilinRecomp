@@ -11,6 +11,16 @@ Each release is a git tag (`vX.Y.Z`) with a matching GitHub release. The version
 
 ## [Unreleased]
 
+## [0.32.0] - 2026-11-19
+DXT textures go to the GPU as they are; textures that change are rewritten in place.
+
+### Added
+- **DXT1, DXT3 and DXT5 sampled as BC1-3** where the GPU has them (`textureCompressionBC` with filtering): the guest's blocks are uploaded as they are, a quarter or an eighth of the memory, with no decoding on the game's thread. Other GPUs (the Raspberry Pi's) and volume textures decode as before; `QILIN_NO_BC=1` forces that. The renderer test draws each format both ways: within 2 levels of the decoder.
+- `Renderer::update_texture`: new texels for a texture into its existing image.
+
+### Changed
+- **A texture whose texels change is rewritten in its image** instead of a new image being made and the old destroyed (the attract sequence re-uploads about 720 MB of video frames in 90 seconds). Texel uploads go through the vertex ring instead of a buffer and memory allocation each.
+
 ## [0.31.0] - 2026-11-19
 A draw costs the game's thread a quarter of what it did: 113 µs to 25 µs, measured on the attract sequence.
 

@@ -1,5 +1,6 @@
 // Renderer tests: clears and presents on whatever Vulkan device there is,
 // checked by reading the frames back. Exits 77 (skipped) without Vulkan.
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <string>
@@ -270,6 +271,100 @@ mad oPos.xyz, oPos.xyzz, r1.x, c-37.xyzz
         const uint32_t tex = r->create_texture(t);
         CHECK(tex != 0);
         r->destroy_texture(tex);
+    }
+
+    // DXT1, 3 and 5 sampled from their blocks on the GPU (BC1-3) against the
+    // CPU decoder: an 8×8 texture of pseudo-random blocks (both DXT1 modes,
+    // both DXT5 alpha modes) on an 8×8 square, one pixel a texel.
+    if (r && r->takes_blocks()) {
+        gfx::vsh::Program prog;
+        gfx::vsh::Instruction pos{};
+        pos.mac = gfx::vsh::Mac::Mov;
+        pos.a.kind = gfx::vsh::Src::Input;
+        pos.a.index = 0;
+        pos.out_mask = 0xF;
+        pos.out_address = gfx::vsh::kPos;
+        gfx::vsh::Instruction uv = pos;
+        uv.a.index = 9;
+        uv.out_address = gfx::vsh::kT0;
+        uv.final = true;
+        prog.code = {pos, uv};
+        const auto vs = gfx::nv2a::vertex_program(prog, 1u | 1u << 9);
+        gfx::nv2a::CombinerSetup cs{};
+        cs.texture_modes = 1;          // stage 0 PROJECT2D
+        cs.texture_dims[0] = 2;
+        cs.final_abcd = 0x00000008u;   // D = t0
+        cs.final_efgh = 0x00001800u;   // G = t0.a
+        const auto fs = gfx::nv2a::combiners(cs);
+        const float pos_v[4][4] = {{0, 0, 0.5f, 1}, {8, 0, 0.5f, 1}, {0, 8, 0.5f, 1}, {8, 8, 0.5f, 1}};
+        const float uv_v[4][4] = {{0, 0, 0, 1}, {1, 0, 0, 1}, {0, 1, 0, 1}, {1, 1, 0, 1}};
+        std::vector<float> vsu(gfx::nv2a::kVsUniformVec4s * 4, 0.0f), fsu(gfx::nv2a::kFsUniformVec4s * 4, 0.0f);
+        vsu[gfx::nv2a::kVsScreen * 4 + 0] = 2.0f / float(cfg.width);
+        vsu[gfx::nv2a::kVsScreen * 4 + 1] = 2.0f / float(cfg.height);
+        vsu[gfx::nv2a::kVsScreen * 4 + 2] = 1.0f;
+        for (uint32_t k = 0; k < 4; ++k) fsu[(gfx::nv2a::kFsTexScale) * 4 + k] = 1;
+        uint32_t seed = 12345;
+        auto rnd = [&] { seed = seed * 1664525u + 1013904223u; return uint8_t(seed >> 24); };
+        const struct { uint32_t code, block; } kinds[] = {{0x0C, 8}, {0x0E, 16}, {0x0F, 16}};
+        for (const auto& kd : kinds) {
+            gfx::TextureShape shape;
+            std::string why;
+            CHECK(gfx::texture_shape(kd.code << 8 | 0x20u | 1u << 16 | 3u << 20 | 3u << 24, 0, &shape, &why));
+            std::vector<uint8_t> blocks(4 * kd.block);
+            for (auto& b : blocks) b = rnd();
+            // Both colour orders and, for DXT5, both alpha orders.
+            for (uint32_t b = 0; b < 4; ++b) {
+                uint8_t* c = &blocks[b * kd.block + (kd.block == 16 ? 8 : 0)];
+                if ((b & 1) != (c[1] > c[3] || (c[1] == c[3] && c[0] > c[2]))) std::swap(c[0], c[2]), std::swap(c[1], c[3]);
+                if (kd.code == 0x0F && ((b >> 1) & 1) != (blocks[b * 16] > blocks[b * 16 + 1])) std::swap(blocks[b * 16], blocks[b * 16 + 1]);
+            }
+            // Draws the texture over the square and returns how far its pixels are from `want`.
+            auto drawn = [&](uint32_t tex, const gfx::TextureData& want) {
+                gfx::DrawCmd d;
+                d.vs_key = 900, d.fs_key = 901, d.vs_code = &vs, d.fs_code = &fs;
+                d.inputs = 1u | 1u << 9;
+                d.vertex_count = 4;
+                d.primitive = gfx::Primitive::TriangleStrip;
+                d.attributes[0] = &pos_v[0][0];
+                d.attributes[9] = &uv_v[0][0];
+                d.vs_uniforms = vsu.data();
+                d.fs_uniforms = fsu.data();
+                d.scissor = {0, 0, cfg.width, cfg.height};
+                d.textures[0] = tex;
+                d.samplers[0].mag = d.samplers[0].min = gfx::Filter::Nearest;
+                const float clear[4] = {0, 0, 0, 0};
+                r->clear(nullptr, 0, gfx::kClearColor, clear, 1, 0);
+                r->draw(d);
+                const gfx::Image im = r->read_back_buffer();
+                int worst = 0;
+                for (uint32_t y = 0; y < 8; ++y)
+                    for (uint32_t x = 0; x < 8; ++x)
+                        for (uint32_t ch = 0; ch < 4; ++ch)
+                            worst = std::max(worst, std::abs(int(im.rgba[(size_t(y) * im.width + x) * 4 + ch]) - int(want.rgba[(size_t(y) * 8 + x) * 4 + ch])));
+                return worst;
+            };
+            const gfx::TextureData cpu = gfx::decode_texture(shape, blocks.data());
+            const uint32_t tex = r->create_texture(gfx::texture_blocks(shape, blocks.data()));
+            // The GPU's interpolation may round the thirds and fifths differently by 1 or 2.
+            const int worst = drawn(tex, cpu);
+            if (worst > 2) std::fprintf(stderr, "DXT format %#x: the GPU's texels differ from the decoder's by up to %d\n", kd.code, worst);
+            CHECK(worst <= 2);
+            // New blocks into the same image (update_texture), then the decoded
+            // texels as RGBA, made and updated: exact.
+            std::vector<uint8_t> next(blocks.size());
+            for (auto& v : next) v = rnd();
+            const gfx::TextureData cpu2 = gfx::decode_texture(shape, next.data());
+            CHECK(r->update_texture(tex, gfx::texture_blocks(shape, next.data())));
+            CHECK(drawn(tex, cpu2) <= 2);
+            CHECK(!r->update_texture(tex, cpu2));  // another shape (RGBA): refused
+            r->destroy_texture(tex);
+            const uint32_t plain = r->create_texture(cpu);
+            CHECK(drawn(plain, cpu) == 0);
+            CHECK(r->update_texture(plain, cpu2));
+            CHECK(drawn(plain, cpu2) == 0);
+            r->destroy_texture(plain);
+            std::printf("DXT format %#x as BC on the GPU: within %d of the decoder\n", kd.code, worst);
+        }
     }
 
     if (failures) std::fprintf(stderr, "%d check(s) failed\n", failures);
