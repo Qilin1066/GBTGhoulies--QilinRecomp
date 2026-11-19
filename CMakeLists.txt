@@ -7,7 +7,7 @@ if(APPLE AND NOT CMAKE_OSX_DEPLOYMENT_TARGET)
     set(CMAKE_OSX_DEPLOYMENT_TARGET 10.15 CACHE STRING "oldest macOS the runtime runs on")
 endif()
 # The single source of the version number (see CHANGELOG.md for the scheme).
-project(GBTGQilincomp VERSION 0.33.5 LANGUAGES C CXX)
+project(GBTGQilincomp VERSION 0.34.0 LANGUAGES C CXX)
 
 # ---- Language: C++23 everywhere (recompiler, runtime, generated code) ----
 set(CMAKE_CXX_STANDARD 23)
@@ -60,6 +60,20 @@ else()
         target_compile_options(qilin_warnings INTERFACE -Werror)
     endif()
 endif()
+
+# ---- Sanitizers for the hand-written runtime (developer option) ----
+# -DQILIN_SANITIZE=address,undefined (or thread) builds the runtime's own
+# libraries and tests with those sanitizers and links every program with
+# them. The generated code in qilin_run is left as it is: it's far too
+# large to instrument, and its memory is the guest's, which it checks itself.
+set(QILIN_SANITIZE "" CACHE STRING "Sanitizers for the runtime's own code (GCC/Clang), e.g. address,undefined")
+add_library(qilin_sanitize INTERFACE)
+if(QILIN_SANITIZE AND NOT MSVC)
+    # (GCC's instrumented builds raise false array-bounds and overflow warnings.)
+    target_compile_options(qilin_sanitize INTERFACE -fsanitize=${QILIN_SANITIZE} -fno-omit-frame-pointer -g -Wno-error)
+    add_link_options(-fsanitize=${QILIN_SANITIZE})
+endif()
+target_link_libraries(qilin_warnings INTERFACE qilin_sanitize)
 
 # ---- Guest runtime (header-only) and the floating-point rules lifted code needs ----
 # Lifted SSE code must be bit-exact IEEE single precision: no multiply-add

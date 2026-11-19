@@ -3,10 +3,81 @@
 #include <SDL3/SDL.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
+#include <cstdlib>
+#include <initializer_list>
+
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
 
 namespace qilin::platform {
 namespace {
+
+#ifdef _WIN32
+// Windows' own XInput, read directly: the fallback for an Xbox-compatible
+// controller that SDL doesn't list (seen in the field: Windows had the
+// controller, SDL reported none for the whole run). Loaded at run time,
+// so nothing links against it; its structures as xinput.h has them. Only
+// used while SDL has no gamepad open, so a controller is never read twice.
+struct XiGamepad {
+    WORD buttons;
+    BYTE left_trigger, right_trigger;
+    SHORT lx, ly, rx, ry;
+};
+struct XiState {
+    DWORD packet;
+    XiGamepad pad;
+};
+struct XiVibration {
+    WORD left, right;
+};
+struct XInputApi {
+    DWORD(WINAPI* get_state)(DWORD, XiState*) = nullptr;
+    DWORD(WINAPI* set_state)(DWORD, XiVibration*) = nullptr;
+    bool present[4] = {};
+    std::chrono::steady_clock::time_point checked[4] = {};
+    bool said[4] = {};
+    XInputApi() {
+        for (const char* dll : {"XInput1_4.dll", "XInput1_3.dll", "XInput9_1_0.dll"}) {
+            const HMODULE lib = LoadLibraryA(dll);
+            if (!lib) continue;
+            get_state = reinterpret_cast<DWORD(WINAPI*)(DWORD, XiState*)>(reinterpret_cast<void*>(GetProcAddress(lib, "XInputGetState")));
+            set_state = reinterpret_cast<DWORD(WINAPI*)(DWORD, XiVibration*)>(reinterpret_cast<void*>(GetProcAddress(lib, "XInputSetState")));
+            if (get_state) break;
+        }
+    }
+    // The slot's state, or false with nothing there. An empty slot costs a
+    // device scan to ask about, so it's asked once a second.
+    bool read(uint32_t slot, XiState* out) {
+        if (!get_state || slot >= 4) return false;
+        const auto now = std::chrono::steady_clock::now();
+        if (!present[slot] && now - checked[slot] < std::chrono::seconds(1)) return false;
+        checked[slot] = now;
+        const bool was = present[slot];
+        present[slot] = get_state(slot, out) == ERROR_SUCCESS;
+        if (present[slot] && !said[slot]) {
+            said[slot] = true;
+            std::printf("qilin_run: controller %u: Windows' XInput slot %u, read directly (SDL didn't list it)\n", slot + 1, slot + 1);
+        } else if (was && !present[slot]) {
+            said[slot] = false;
+            std::printf("qilin_run: controller %u removed\n", slot + 1);
+        }
+        return present[slot];
+    }
+};
+XInputApi& xinput() {
+    static XInputApi api;
+    return api;
+}
+#endif
 
 // SDL's trigger axes run 0 to 32767; the Xbox's analog buttons 0 to 255.
 uint8_t trigger(int16_t v) { return uint8_t(std::clamp(int(v), 0, 32767) * 255 / 32767); }
@@ -74,6 +145,16 @@ bool Input::start() {
     int count = 0;
     SDL_JoystickID* sticks = SDL_GetJoysticks(&count);
     if (count == 0) std::printf("qilin_run: no controllers connected (one plugged in later is picked up); the keyboard is controller 1\n");
+#ifdef _WIN32
+    if (count == 0) {
+        // What Windows itself reports, so the log says where a controller went missing.
+        uint32_t seen = 0;
+        XiState st{};
+        for (uint32_t slot = 0; slot < 4; ++slot) seen += xinput().read(slot, &st) ? 1 : 0;
+        if (!xinput().get_state) std::printf("qilin_run: Windows' XInput couldn't be loaded either\n");
+        else if (!seen) std::printf("qilin_run: Windows' XInput reports no controller in any of its four slots\n");
+    }
+#endif
     for (int k = 0; k < count; ++k) {
         const char* name = SDL_GetJoystickNameForID(sticks[k]);
         if (SDL_IsGamepad(sticks[k])) {
@@ -130,10 +211,23 @@ void Input::on_event(const SDL_Event& e) {
     else if (e.type == SDL_EVENT_GAMEPAD_REMOVED) detach(uint32_t(e.gdevice.which));
 }
 
+bool Input::any_sdl_pad() const {
+    for (const Port& p : ports_)
+        if (p.pad) return true;
+    return false;
+}
+
 uint32_t Input::connected_ports() const {
     uint32_t mask = 0;
     for (uint32_t n = 0; n < kPorts; ++n)
         if (ports_[n].id) mask |= 1u << n;
+#ifdef _WIN32
+    if (!any_sdl_pad()) {
+        XiState st{};
+        for (uint32_t n = 0; n < kPorts; ++n)
+            if (xinput().read(n, &st)) mask |= 1u << n;
+    }
+#endif
     return mask | 1u;  // the keyboard is always on port 1
 }
 
@@ -170,6 +264,25 @@ PadState Input::state(uint32_t port) const {
         s.thumbs[2] = axis(SDL_GAMEPAD_AXIS_RIGHTX);
         s.thumbs[3] = flip(axis(SDL_GAMEPAD_AXIS_RIGHTY));
     }
+#ifdef _WIN32
+    // No controller through SDL: Windows' XInput slot of the same number.
+    // Its buttons' low byte and its sticks are the Xbox controller's own
+    // layout (y positive up); the shoulders are White and Black, as above.
+    if (XiState xi{}; !any_sdl_pad() && xinput().read(port, &xi)) {
+        s.connected = true;
+        s.buttons = uint16_t(xi.pad.buttons & 0xFF);
+        auto digital = [&](PadAnalog a, uint32_t bit) { s.analog[a] = (xi.pad.buttons & bit) ? 255 : 0; };
+        digital(kPadA, 0x1000);
+        digital(kPadB, 0x2000);
+        digital(kPadX, 0x4000);
+        digital(kPadY, 0x8000);
+        digital(kPadWhite, 0x0100);
+        digital(kPadBlack, 0x0200);
+        s.analog[kPadLeftTrigger] = xi.pad.left_trigger;
+        s.analog[kPadRightTrigger] = xi.pad.right_trigger;
+        s.thumbs[0] = xi.pad.lx, s.thumbs[1] = xi.pad.ly, s.thumbs[2] = xi.pad.rx, s.thumbs[3] = xi.pad.ry;
+    }
+#endif
     if (port == 0) {
         const PadState k = keyboard();
         s.connected = true;
@@ -181,6 +294,13 @@ PadState Input::state(uint32_t port) const {
 }
 
 void Input::rumble(uint32_t port, uint16_t left, uint16_t right) {
+#ifdef _WIN32
+    if (port < kPorts && !any_sdl_pad() && xinput().set_state && xinput().present[port]) {
+        XiVibration v{left, right};
+        xinput().set_state(port, &v);
+        return;
+    }
+#endif
     if (port >= kPorts || !ports_[port].pad) return;
     Port& p = ports_[port];
     p.left = left;

@@ -4,6 +4,10 @@
 // Xbox controller's: the face buttons, Black and White on the shoulder
 // buttons, the triggers, both sticks and the d-pad.
 //
+// On Windows, when SDL lists no gamepad, Windows' own XInput is read
+// directly instead (its four slots as the four ports), so an Xbox-compatible
+// controller works whatever SDL makes of it.
+//
 // Controllers take the lowest free port as they connect, and keep it until
 // they're removed. The keyboard also drives port 1 (index 0): merged with
 // the controller there, and on its own when no controller is connected, so
@@ -62,6 +66,7 @@ private:
     bool started_ = false;
     void attach(uint32_t id);
     void detach(uint32_t id);
+    bool any_sdl_pad() const;  // a gamepad is open through SDL (Windows' XInput is read directly only when none is)
 };
 
 }  // namespace qilin::platform

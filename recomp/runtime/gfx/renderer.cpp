@@ -112,6 +112,8 @@ public:
     }
     uint32_t create_texture(const TextureData& data) override;
     void destroy_texture(uint32_t id) override;
+    bool arena_alloc(uint64_t bytes, uint64_t* offset, void** write) override;
+    void arena_free(uint64_t offset, uint64_t bytes) override;
     void draw(const DrawCmd& cmd) override;
     uint32_t create_render_target(uint32_t width, uint32_t height) override;
     void copy_frame_to_target(uint32_t frame_index, uint32_t target_id, const std::vector<CopyRegion>& regions) override;
@@ -258,7 +260,7 @@ private:
     std::unordered_map<uint64_t, VkShaderModule> shaders_;
     struct PipelineKey {
         uint64_t vs = 0, fs = 0;
-        uint32_t inputs = 0;
+        uint32_t inputs = 0, constant_inputs = 0;
         uint8_t primitive = 0, blend = 0, write_mask = 0, factors[4] = {}, ops[2] = {};
         uint8_t depth = 0;  // the target has a depth-stencil attachment
         auto operator<=>(const PipelineKey&) const = default;
@@ -311,9 +313,16 @@ private:
         std::vector<Texture> dead;
         std::vector<std::pair<VkBuffer, VkDeviceMemory>> staging;
         std::map<DescriptorKey, VkDescriptorSet> sets;  // allocated from `pool` this submission
+        std::vector<std::pair<uint64_t, uint64_t>> arena_freed;  // arena ranges given back while this submission was recorded
         bool pending = false;
     };
     Slot slots_[kSlots];
+    // The vertex arena: one buffer, first-fit over its free ranges.
+    VkBuffer arena_ = VK_NULL_HANDLE;
+    VkDeviceMemory arena_memory_ = VK_NULL_HANDLE;
+    uint8_t* arena_mapped_ = nullptr;
+    std::map<uint64_t, uint64_t> arena_free_;  // offset → bytes, merged with neighbours
+    void arena_release(uint64_t offset, uint64_t bytes);
     uint32_t slot_ = 0;
     void use_slot(uint32_t i);
     void retire(uint32_t i);  // waits for the slot's submission and frees what it used
@@ -690,6 +699,8 @@ void VulkanRenderer::destroy() {
             if (sl.fence) vkDestroyFence(device_, sl.fence, nullptr);
             if (sl.acquired) vkDestroySemaphore(device_, sl.acquired, nullptr);
         }
+        if (arena_) vkDestroyBuffer(device_, arena_, nullptr);
+        if (arena_memory_) vkFreeMemory(device_, arena_memory_, nullptr);
         if (pipeline_layout_) vkDestroyPipelineLayout(device_, pipeline_layout_, nullptr);
         if (set_layout_) vkDestroyDescriptorSetLayout(device_, set_layout_, nullptr);
         if (readback_) vkDestroyBuffer(device_, readback_, nullptr);
@@ -1450,6 +1461,7 @@ Image VulkanRenderer::read(Target& t) {
 // ---------------------------------------------------------------- drawing
 constexpr uint32_t kSamplers = 4;
 constexpr VkDeviceSize kRingBytes = 32ull << 20;  // a slot's (kSlots of them)
+constexpr VkDeviceSize kArenaBytes = 64ull << 20;  // the vertex arena
 
 void VulkanRenderer::create_draw_objects() {
     VkDescriptorSetLayoutBinding b[2 + kSamplers]{};
@@ -1505,7 +1517,76 @@ void VulkanRenderer::create_draw_objects() {
         check(vkMapMemory(device_, slot.ring_memory, 0, ring_size_, 0, &mapped), "vkMapMemory");
         slot.ring_mapped = static_cast<uint8_t*>(mapped);
     }
+    // The vertex arena: device-local memory the CPU can write where the GPU
+    // has it (integrated GPUs, Apple's, the Raspberry Pi's, resizable BAR),
+    // else host memory, which the GPU reads as it reads the ring.
+    {
+        VkBufferCreateInfo bi{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+        bi.size = kArenaBytes;
+        bi.usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT;
+        bi.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+        check(vkCreateBuffer(device_, &bi, nullptr, &arena_), "vkCreateBuffer");
+        VkMemoryRequirements req{};
+        vkGetBufferMemoryRequirements(device_, arena_, &req);
+        const VkMemoryPropertyFlags visible = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+        uint32_t type = UINT32_MAX;
+        for (uint32_t i = 0; i < memory_.memoryTypeCount && type == UINT32_MAX; ++i) {
+            const VkMemoryPropertyFlags f = memory_.memoryTypes[i].propertyFlags;
+            const VkDeviceSize heap = memory_.memoryHeaps[memory_.memoryTypes[i].heapIndex].size;
+            if ((req.memoryTypeBits & (1u << i)) && (f & (visible | VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) == (visible | VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) &&
+                heap >= 4 * kArenaBytes)  // not the small 256 MB window a GPU without resizable BAR has
+                type = i;
+        }
+        if (type == UINT32_MAX) type = memory_type(req.memoryTypeBits, visible);
+        VkMemoryAllocateInfo alloc{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+        alloc.allocationSize = req.size;
+        alloc.memoryTypeIndex = type;
+        check(vkAllocateMemory(device_, &alloc, nullptr, &arena_memory_), "vkAllocateMemory");
+        check(vkBindBufferMemory(device_, arena_, arena_memory_, 0), "vkBindBufferMemory");
+        void* mapped = nullptr;
+        check(vkMapMemory(device_, arena_memory_, 0, kArenaBytes, 0, &mapped), "vkMapMemory");
+        arena_mapped_ = static_cast<uint8_t*>(mapped);
+        arena_free_ = {{0, kArenaBytes}};
+    }
     use_slot(0);
+}
+
+bool VulkanRenderer::arena_alloc(uint64_t bytes, uint64_t* offset, void** write) {
+    bytes = (bytes + 15) & ~uint64_t(15);
+    if (!bytes) return false;
+    for (auto it = arena_free_.begin(); it != arena_free_.end(); ++it) {
+        if (it->second < bytes) continue;
+        const uint64_t at = it->first, left = it->second - bytes;
+        arena_free_.erase(it);
+        if (left) arena_free_[at + bytes] = left;
+        *offset = at;
+        *write = arena_mapped_ + at;
+        return true;
+    }
+    return false;
+}
+
+// Given back now, but usable only once what was recorded so far has run:
+// with this submission's slot, after its fence (retire).
+void VulkanRenderer::arena_free(uint64_t offset, uint64_t bytes) {
+    bytes = (bytes + 15) & ~uint64_t(15);
+    if (bytes) slots_[slot_].arena_freed.push_back({offset, bytes});
+}
+
+void VulkanRenderer::arena_release(uint64_t offset, uint64_t bytes) {
+    auto next = arena_free_.lower_bound(offset);
+    if (next != arena_free_.begin()) {
+        auto prev = std::prev(next);
+        if (prev->first + prev->second == offset) {
+            offset = prev->first, bytes += prev->second;
+            arena_free_.erase(prev);
+        }
+    }
+    if (next != arena_free_.end() && offset + bytes == next->first) {
+        bytes += next->second;
+        arena_free_.erase(next);
+    }
+    arena_free_[offset] = bytes;
 }
 
 void VulkanRenderer::use_slot(uint32_t i) {
@@ -1534,6 +1615,8 @@ void VulkanRenderer::retire(uint32_t i) {
     sl.dead.clear();
     for (auto& [b, m] : sl.staging) vkDestroyBuffer(device_, b, nullptr), vkFreeMemory(device_, m, nullptr);
     sl.staging.clear();
+    for (auto [o, b] : sl.arena_freed) arena_release(o, b);
+    sl.arena_freed.clear();
 }
 
 void VulkanRenderer::wait_idle() {
@@ -1572,7 +1655,7 @@ VkShaderModule VulkanRenderer::shader(uint64_t key, const std::vector<uint32_t>*
 
 VkPipeline VulkanRenderer::pipeline(const DrawCmd& c) {
     PipelineKey k;
-    k.vs = c.vs_key, k.fs = c.fs_key, k.inputs = c.inputs, k.primitive = uint8_t(c.primitive);
+    k.vs = c.vs_key, k.fs = c.fs_key, k.inputs = c.inputs, k.constant_inputs = c.constant_inputs & c.inputs, k.primitive = uint8_t(c.primitive);
     k.blend = c.blend, k.write_mask = c.write_mask, k.depth = target_has_depth();
     if (c.blend) {
         k.factors[0] = uint8_t(c.src_color), k.factors[1] = uint8_t(c.dst_color), k.factors[2] = uint8_t(c.src_alpha), k.factors[3] = uint8_t(c.dst_alpha);
@@ -1593,7 +1676,9 @@ VkPipeline VulkanRenderer::pipeline(const DrawCmd& c) {
     std::vector<VkVertexInputAttributeDescription> attributes;
     for (uint32_t n = 0; n < 16; ++n)
         if (c.inputs & (1u << n)) {
-            bindings.push_back({n, 16, VK_VERTEX_INPUT_RATE_VERTEX});
+            // A constant attribute is one element at the instance rate: every
+            // vertex of the draw's one instance reads the same vec4.
+            bindings.push_back({n, 16, (c.constant_inputs >> n & 1) ? VK_VERTEX_INPUT_RATE_INSTANCE : VK_VERTEX_INPUT_RATE_VERTEX});
             attributes.push_back({n, n, VK_FORMAT_R32G32B32A32_SFLOAT, 0});
         }
     VkPipelineVertexInputStateCreateInfo vi{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
@@ -1929,7 +2014,9 @@ void VulkanRenderer::draw(const DrawCmd& c) {
     // Room for the whole draw in the ring first, so nothing below starts a
     // new submission halfway through its data.
     {
-        VkDeviceSize need = VkDeviceSize(std::popcount(c.inputs)) * (VkDeviceSize(c.vertex_count) * 16 + 16) +
+        uint32_t from_ring = 0;
+        for (uint32_t n = 0; n < 16; ++n) from_ring += (c.inputs >> n & 1) && c.arena[n] == DrawCmd::kNoArena && !(c.constant_inputs >> n & 1);
+        VkDeviceSize need = VkDeviceSize(from_ring) * (VkDeviceSize(c.vertex_count) * 16 + 16) + VkDeviceSize(std::popcount(c.constant_inputs)) * 32 +
                             (c.indices ? VkDeviceSize(c.index_count) * 4 + 4 : 0) + 2 * (nv2a::kVsUniformVec4s * 16 + uniform_align_);
         if (ring_used_ + need > ring_size_) ring_alloc(need, 16, nullptr), ring_used_ = 0;
     }
@@ -1942,8 +2029,14 @@ void VulkanRenderer::draw(const DrawCmd& c) {
     for (uint32_t n = 0; n < 16; ++n)
         if (c.inputs & (1u << n)) {
             if (!count) first = n;
-            buffers[count] = ring_;
-            offsets[count++] = ring_alloc(VkDeviceSize(c.vertex_count) * 16, 16, c.attributes[n]);
+            if (c.arena[n] != DrawCmd::kNoArena) {
+                buffers[count] = arena_;
+                offsets[count++] = c.arena[n];
+            } else {
+                buffers[count] = ring_;
+                const VkDeviceSize elements = (c.constant_inputs >> n & 1) ? 1 : c.vertex_count;
+                offsets[count++] = ring_alloc(elements * 16, 16, c.attributes[n]);
+            }
         }
     VkDeviceSize index_at = 0;
     if (c.indices) index_at = ring_alloc(VkDeviceSize(c.index_count) * 4, 4, c.indices);
@@ -2019,12 +2112,13 @@ void VulkanRenderer::draw(const DrawCmd& c) {
         VkBuffer span_buffers[16];
         VkDeviceSize span_offsets[16];
         for (uint32_t n = first, k = 0; n <= last; ++n) {
-            span_buffers[n - first] = ring_;
-            span_offsets[n - first] = (c.inputs & (1u << n)) ? offsets[k++] : 0;
+            const bool used = c.inputs & (1u << n);
+            span_buffers[n - first] = used ? buffers[k] : ring_;
+            span_offsets[n - first] = used ? offsets[k] : 0;
+            k += used;
         }
         vkCmdBindVertexBuffers(cmd_, first, last - first + 1, span_buffers, span_offsets);
     }
-    (void)buffers;
     const int32_t tw = int32_t(target().width), th = int32_t(target().height);
     const VkViewport viewport{0, 0, float(tw), float(th), 0, 1};
     if (all || std::memcmp(&was.viewport, &viewport, sizeof viewport) != 0) vkCmdSetViewport(cmd_, 0, 1, &viewport), was.viewport = viewport;

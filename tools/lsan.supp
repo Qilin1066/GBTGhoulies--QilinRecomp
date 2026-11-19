@@ -1,0 +1,10 @@
+leak:libLLVM
+leak:libvulkan_lvp
+leak:libvulkan
+leak:libasan
+leak:libdbus
+leak:libX11
+leak:libxcb
+leak:libSDL3
+leak:libgallium
+leak:libVkLayer

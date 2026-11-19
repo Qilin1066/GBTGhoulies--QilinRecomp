@@ -317,8 +317,9 @@ mad oPos.xyz, oPos.xyzz, r1.x, c-37.xyzz
                 uint8_t* c = &blocks[b * kd.block + (kd.block == 16 ? 8 : 0)];
                 const bool c0_first = c[1] > c[3] || (c[1] == c[3] && c[0] > c[2]);
                 if (((b & 1) != 0) != c0_first) std::swap(c[0], c[2]), std::swap(c[1], c[3]);
+                if (kd.code != 0x0F) continue;  // only DXT5 has the two alpha orders
                 const bool a0_first = blocks[b * 16] > blocks[b * 16 + 1];
-                if (kd.code == 0x0F && (((b >> 1) & 1) != 0) != a0_first) std::swap(blocks[b * 16], blocks[b * 16 + 1]);
+                if ((((b >> 1) & 1) != 0) != a0_first) std::swap(blocks[b * 16], blocks[b * 16 + 1]);
             }
             // Draws the texture over the square and returns how far its pixels are from `want`.
             auto drawn = [&](uint32_t tex, const gfx::TextureData& want) {

@@ -103,6 +103,14 @@ struct DrawCmd {
 
     uint32_t vertex_count = 0;
     const float* attributes[16] = {};
+    // An attribute already in the vertex arena (arena_alloc), at this byte
+    // offset, instead of `attributes`: kNoArena for none.
+    static constexpr uint64_t kNoArena = ~0ull;
+    // Attributes the same for every vertex (bit n: attributes[n] is one
+    // vec4, not one per vertex): read once per draw, not copied per vertex.
+    uint32_t constant_inputs = 0;
+    uint64_t arena[16] = {kNoArena, kNoArena, kNoArena, kNoArena, kNoArena, kNoArena, kNoArena, kNoArena,
+                          kNoArena, kNoArena, kNoArena, kNoArena, kNoArena, kNoArena, kNoArena, kNoArena};
     const uint32_t* indices = nullptr;
     uint32_t index_count = 0;
     const float* vs_uniforms = nullptr;
@@ -168,6 +176,16 @@ public:
     // nothing done, for another shape.
     virtual bool update_texture(uint32_t id, const TextureData& data) = 0;
     virtual void destroy_texture(uint32_t id) = 0;
+
+    // The vertex arena: GPU-visible memory for vertex data that stays the
+    // same from frame to frame, written once by the CPU and drawn from as
+    // often as wanted (DrawCmd::arena), instead of copied in with every
+    // draw. arena_alloc gives `bytes` (16-byte aligned) and where to write
+    // them, or false when there's no room; arena_free gives them back once
+    // the GPU is done with what was submitted so far. Memory just allocated
+    // isn't in use by the GPU.
+    virtual bool arena_alloc(uint64_t bytes, uint64_t* offset, void** write) = 0;
+    virtual void arena_free(uint64_t offset, uint64_t bytes) = 0;
 
     // Draws into the back buffer.
     virtual void draw(const DrawCmd& cmd) = 0;

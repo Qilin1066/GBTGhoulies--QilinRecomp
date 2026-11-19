@@ -137,6 +137,20 @@ struct Device {
         uint32_t width = 0, height = 0, depth = 1;
     };
     std::unordered_map<uint64_t, CachedTexture> textures;
+    // Vertex streams converted once and kept in the renderer's vertex arena
+    // (vertex_arrays): one stream's attributes for one run of vertices, with
+    // the guest bytes they came from, compared at every draw that uses them.
+    struct VertexRun {
+        uint32_t at = 0, stride = 0, count = 0;
+        uint64_t layout = 0;
+        std::vector<uint8_t> src;
+        uint64_t offset = 0, bytes = 0;  // in the arena; bytes 0 for none
+        uint32_t attr_offset[16] = {};
+        uint32_t used = 0;               // the swap it was last drawn in
+        uint32_t changes = 0;            // its bytes changed this many draws in a row
+        uint32_t unstable_until = 0;     // a stream that keeps changing goes the old way until this swap
+    };
+    std::unordered_map<uint64_t, VertexRun> vertex_runs;
     // Textures the game renders into: the renderer's image for each, by the
     // guest address of its texels. Their texels live on the GPU; guest
     // memory keeps what the CPU last put there, hashed, so a CPU write (the
@@ -412,6 +426,7 @@ void get_render_target2(rt::Context& c) {
 // pixels (the disc-error screen draws its message into the front buffer),
 // so its image is copied into guest memory first (cpu_frame_to_guest).
 void cpu_frame_to_guest(rt::Context& c, Device& d, uint32_t index);
+void sweep_vertex_runs(Device& d, uint32_t idle);
 void flush_cpu_frames(rt::Context& c, Device& d);
 void hand_back_target(rt::Context& c, Device& d, uint32_t data);
 Device::TargetTexture& texture_target(rt::Context& c, Device& d, uint32_t data, uint32_t w, uint32_t h, uint32_t fmt, uint32_t pitch);
@@ -582,6 +597,7 @@ void swap(rt::Context& c) {
     d.cpu_frames.clear();  // a lock lasts until the next Swap
     d.renderer->present();
     ++d.swaps;
+    if (d.swaps % 64 == 0) sweep_vertex_runs(d, 120);  // runs not drawn for 4 seconds leave the vertex arena
     // A render target that was the back buffer becomes the new one (the
     // device's internal reference moves with it).
     if (ld(c, kDeviceStorage + kDevRenderTarget) == old_back) {
@@ -853,6 +869,9 @@ void notice_once(Device& d, const std::string& what) {
 struct Vertices {
     uint32_t count = 0, mask = 0;
     std::vector<float> attr[16];
+    uint64_t arena[16];  // an attribute in the vertex arena instead of `attr` (gfx::DrawCmd::arena)
+    uint32_t constant = 0;  // bit n: attr[n] is one vec4 for every vertex (gfx::DrawCmd::constant_inputs)
+    Vertices() { std::fill_n(arena, 16, gfx::DrawCmd::kNoArena); }
 };
 
 void convert_attribute(const uint8_t* p, uint32_t format, float* out) {
@@ -922,7 +941,8 @@ thread_local Vertices t_spare_vertices;
 thread_local std::vector<uint32_t> t_spare_sequence;
 Vertices take_vertices() {
     Vertices v = std::move(t_spare_vertices);
-    v.count = v.mask = 0;
+    v.count = v.mask = v.constant = 0;
+    std::fill_n(v.arena, 16, gfx::DrawCmd::kNoArena);
     return v;
 }
 std::vector<uint32_t> take_sequence(uint32_t n) {
@@ -949,17 +969,118 @@ std::array<Slot, 16> slots(rt::Context& c, const char* fn) {
     return out;
 }
 
+// Draws of this many vertices or more keep their converted streams in the
+// vertex arena; smaller ones cost less to convert than to look up.
+constexpr uint32_t kArenaMinVertices = 16;
+// A stream whose bytes change this many draws in a row is drawn the old
+// way (converted into the ring each time, no comparison) for a while.
+constexpr uint32_t kUnstableChanges = 3, kUnstableSwaps = 300;
+void forget_vertex_run(Device& d, Device::VertexRun& r) {
+    if (r.bytes) d.renderer->arena_free(r.offset, r.bytes);
+    r.bytes = 0;
+}
+
+// Runs not drawn lately leave the arena (once a swap).
+void sweep_vertex_runs(Device& d, uint32_t idle) {
+    for (auto it = d.vertex_runs.begin(); it != d.vertex_runs.end();) {
+        if (d.swaps - it->second.used > idle) {
+            forget_vertex_run(d, it->second);
+            it = d.vertex_runs.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
+
+// One stream's attributes for a run of vertices from the vertex arena:
+// as converted before if the guest's bytes are the same, else converted
+// into it now. False to convert them for this draw only (a small draw, a
+// stream that keeps changing, or no room).
+bool stream_from_arena(rt::Context& c, Device& d, const std::array<Slot, 16>& sl, uint32_t stream, uint32_t stream_at,
+                       uint32_t stride, uint32_t count, Vertices& v) {
+    static const bool off = [] { const char* e = std::getenv("QILIN_NO_VERTEX_CACHE"); return e && *e == '1'; }();
+    if (off || count < kArenaMinVertices) return false;
+    // The attributes it feeds, and the bytes they read.
+    uint64_t layout = 0x9E3779B97F4A7C15ull;
+    uint32_t lo = UINT32_MAX, hi = 0, n_attrs = 0;
+    for (uint32_t n = 0; n < 16; ++n) {
+        if (!sl[n].bytes || sl[n].stream != stream) continue;
+        layout = (layout ^ (uint64_t(n) << 56 | uint64_t(sl[n].offset) << 24 | sl[n].format)) * 0xFF51AFD7ED558CCDull;
+        lo = std::min(lo, sl[n].offset), hi = std::max(hi, sl[n].offset + sl[n].bytes);
+        ++n_attrs;
+    }
+    const uint32_t src_at = stream_at + lo;
+    const uint64_t span = uint64_t(stride) * (count - 1) + (hi - lo);
+    if (uint64_t(src_at) + span > 0x100000000ull) return false;
+    rt::check(mem(c), src_at, span, 0);
+    const uint8_t* src = mem(c).base + src_at;
+    const uint64_t key = (uint64_t(stream_at) << 32 | stride) * 0x9E3779B97F4A7C15ull ^ uint64_t(count) * 0xC2B2AE3D27D4EB4Full ^ layout;
+    Device::VertexRun& r = d.vertex_runs[key];
+    const bool same_run = r.at == stream_at && r.stride == stride && r.count == count && r.layout == layout;
+    if (!same_run) {  // new, or another run under the same key: start over
+        forget_vertex_run(d, r);
+        r = Device::VertexRun{};
+        r.at = stream_at, r.stride = stride, r.count = count, r.layout = layout;
+    }
+    r.used = d.swaps;
+    if (r.unstable_until > d.swaps) return false;
+    if (r.bytes && r.src.size() == span && std::memcmp(r.src.data(), src, size_t(span)) == 0) {
+        r.changes = 0;
+    } else {
+        if (r.bytes && ++r.changes >= kUnstableChanges) {  // changes every time: not worth keeping
+            forget_vertex_run(d, r);
+            r.src.clear();
+            r.src.shrink_to_fit();
+            r.changes = 0;
+            r.unstable_until = d.swaps + kUnstableSwaps;
+            return false;
+        }
+        // Converted afresh into new space (the old may still be read by draws in flight).
+        forget_vertex_run(d, r);
+        const uint64_t bytes = uint64_t(n_attrs) * count * 16;
+        void* write = nullptr;
+        if (!d.renderer->arena_alloc(bytes, &r.offset, &write)) {
+            sweep_vertex_runs(d, 2);
+            if (!d.renderer->arena_alloc(bytes, &r.offset, &write)) return false;
+        }
+        r.bytes = bytes;
+        float* out = static_cast<float*>(write);
+        uint32_t k = 0;
+        for (uint32_t n = 0; n < 16; ++n) {
+            if (!sl[n].bytes || sl[n].stream != stream) continue;
+            r.attr_offset[n] = k * count * 16;
+            convert_attribute_run(mem(c).base + stream_at + sl[n].offset, stride, count, sl[n].format, out + size_t(k) * count * 4);
+            ++k;
+        }
+        r.src.assign(src, src + span);
+    }
+    for (uint32_t n = 0; n < 16; ++n) {
+        if (!sl[n].bytes || sl[n].stream != stream) continue;
+        v.mask |= 1u << n;
+        v.arena[n] = r.offset + r.attr_offset[n];
+    }
+    return true;
+}
+
 Vertices vertex_arrays(rt::Context& c, const char* fn, uint32_t base, uint32_t first, uint32_t count) {
     if (ld(c, kDirtyFlags) & 0x40000000u) unmodelled(fn, "a draw from SetVertexShaderInput streams");
+    Device& d = device(fn);
     Vertices v = take_vertices();
     v.count = count;
     const auto sl = slots(c, fn);
+    uint32_t streams_done = 0;  // streams taken from the vertex arena
     for (uint32_t n = 0; n < 16; ++n) {
         if (!sl[n].bytes) continue;
         const uint32_t entry = 0x1842A0 + 12 * sl[n].stream;
         const uint32_t stride = ld(c, entry), vb = ld(c, entry + 8);
         if (!vb) unmodelled(fn, strf("vertex attribute %u reads stream %u, which has no buffer", n, sl[n].stream));
-        const uint32_t at = ld(c, vb + 4) + ld(c, entry + 4) + sl[n].offset + stride * (base + first);
+        const uint32_t stream_at = ld(c, vb + 4) + ld(c, entry + 4) + stride * (base + first);
+        if (streams_done & (1u << sl[n].stream)) continue;
+        if (stream_from_arena(c, d, sl, sl[n].stream, stream_at, stride, count, v)) {
+            streams_done |= 1u << sl[n].stream;
+            continue;
+        }
+        const uint32_t at = stream_at + sl[n].offset;
         v.mask |= 1u << n;
         v.attr[n].resize(size_t(count) * 4);
         if (!count) continue;
@@ -995,8 +1116,17 @@ Vertices inline_vertices(rt::Context& c, const char* fn, const std::vector<uint3
 // NV2A primitives (D3DPRIMITIVETYPE has the same numbers) as Vulkan's:
 // loops, fans, quads, quad strips and polygons become indexed lists.
 gfx::Primitive convert_primitive(const char* fn, uint32_t prim, std::vector<uint32_t>& seq, bool& indexed) {
-    std::vector<uint32_t> out;
+    // The converted list is built in a buffer kept from the last draw, which
+    // takes the old sequence's buffer in turn: no allocation per draw.
+    thread_local std::vector<uint32_t> t_converted;
+    std::vector<uint32_t> out = std::move(t_converted);
+    out.clear();
     const size_t n = seq.size();
+    auto done = [&] {
+        t_converted = std::move(seq);
+        seq = std::move(out);
+        indexed = true;
+    };
     switch (prim) {
         case 1: return gfx::Primitive::Points;
         case 2: return gfx::Primitive::Lines;
@@ -1005,8 +1135,7 @@ gfx::Primitive convert_primitive(const char* fn, uint32_t prim, std::vector<uint
         case 6: return gfx::Primitive::TriangleStrip;
         case 3:
             for (size_t i = 0; i < n && n >= 2; ++i) out.push_back(seq[i]), out.push_back(seq[(i + 1) % n]);
-            seq = std::move(out);
-            indexed = true;
+            done();
             return gfx::Primitive::Lines;
         case 7: case 10:
             for (size_t i = 1; i + 1 < n; ++i) out.insert(out.end(), {seq[0], seq[i], seq[i + 1]});
@@ -1020,8 +1149,7 @@ gfx::Primitive convert_primitive(const char* fn, uint32_t prim, std::vector<uint
             break;
         default: unmodelled(fn, strf("primitive type %u", prim));
     }
-    seq = std::move(out);
-    indexed = true;
+    done();
     return gfx::Primitive::Triangles;
 }
 
@@ -1728,14 +1856,23 @@ void fixed_function_combiners(rt::Context& c, const char* fn, gfx::nv2a::Combine
 // A draw, as the original's state flush leaves the GPU, into the renderer.
 void issue_draw(rt::Context& c, Device& d, const char* fn, uint32_t prim, Vertices&& v, std::vector<uint32_t> seq, bool indexed) {
     st(c, kDeviceStorage + 8, ld(c, kDeviceStorage + 8) | 0x800u);
-    if (!v.count) return;
+    if (!v.count) {
+        t_spare_vertices = std::move(v), t_spare_sequence = std::move(seq);
+        return;
+    }
     // An attribute the vertices don't have reads the GPU's register for it:
     // the last value SetVertexData* wrote there (0, 0, 0, 1 if never written).
     for (uint32_t n = 0; n < 16; ++n) {
         if ((v.mask & (1u << n)) || !(d.attributes_written & (1u << n))) continue;
         v.mask |= 1u << n;
-        v.attr[n].resize(size_t(v.count) * 4);
-        for (uint32_t i = 0; i < v.count; ++i) std::copy_n(d.attribute_values[n], 4, &v.attr[n][size_t(i) * 4]);
+        static const bool off = [] { const char* e = std::getenv("QILIN_NO_VERTEX_CACHE"); return e && *e == '1'; }();
+        if (off) {
+            v.attr[n].resize(size_t(v.count) * 4);
+            for (uint32_t i = 0; i < v.count; ++i) std::copy_n(d.attribute_values[n], 4, &v.attr[n][size_t(i) * 4]);
+            continue;
+        }
+        v.attr[n].assign(d.attribute_values[n], d.attribute_values[n] + 4);  // one value, for every vertex
+        v.constant |= 1u << n;
     }
     const uint32_t dev = kDeviceStorage;
     auto rs = [&](uint32_t i) { return ld(c, kRenderStateTable + 4 * i); };
@@ -1964,7 +2101,11 @@ void issue_draw(rt::Context& c, Device& d, const char* fn, uint32_t prim, Vertic
     cmd.inputs = v.mask;
     cmd.vertex_count = v.count;
     for (uint32_t n = 0; n < 16; ++n)
-        if (v.mask & (1u << n)) cmd.attributes[n] = v.attr[n].data();
+        if (v.mask & (1u << n)) {
+            cmd.attributes[n] = v.attr[n].data();
+            cmd.arena[n] = v.arena[n];
+            if (v.constant & (1u << n)) cmd.constant_inputs |= 1u << n;
+        }
     if (indexed) cmd.indices = seq.data(), cmd.index_count = uint32_t(seq.size());
     cmd.vs_uniforms = vsu.data();
     cmd.fs_uniforms = fsu.data();

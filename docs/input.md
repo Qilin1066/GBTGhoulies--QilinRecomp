@@ -1,6 +1,6 @@
 # Input: controllers and the keyboard
 
-Last updated 2026-11-18 (v0.24.0: controllers through SDL3, the keyboard as controller 1).
+Last updated 2026-11-19 (v0.34.0: Windows' own XInput read directly when SDL lists no controller; v0.24.0: controllers through SDL3, the keyboard as controller 1).
 
 The game reads the Xbox's four controller ports through XInput (the XDK's XPP library), which the runtime replaces natively (`recomp/runtime/host/xinput.cpp`) over SDL3's gamepad API (`recomp/runtime/platform/input.*`).
 
@@ -33,6 +33,8 @@ Any controller SDL3 knows (Xbox, PlayStation, Switch and generic pads, over USB 
 The original controller's face, Black and White buttons are pressure-sensitive; SDL's buttons aren't, so a press reads fully pressed (255). Controllers take the lowest free port as they connect and keep it until they're removed; the player light, where a controller has one, shows the port. Controllers are read while the window is in the background, too.
 
 Rumble: the Xbox's left motor is the low-frequency one, as SDL's. SDL's rumble runs for a set time (at most about a minute); the game sends its rumble every frame, so it lasts until the game changes it, as on the console.
+
+**Windows' XInput as a fallback** (v0.34.0). On one Windows machine with an Xbox controller connected, SDL listed no controller at all for the whole run, while the keyboard worked. When SDL has no gamepad open, the runtime reads Windows' own XInput directly (`XInput1_4.dll`, else 1.3 or 9.1.0, loaded at run time): its four slots are the four ports, and its buttons and sticks are the Xbox controller's own layout, with the shoulders as White and Black and rumble through `XInputSetState`. An empty slot is asked about once a second (asking costs a device scan). As soon as SDL opens a gamepad, SDL's controllers are used and XInput isn't read, so a controller is never read twice. At start the log says what SDL sees, and when SDL sees nothing, whether XInput does (`controller 1: Windows' XInput slot 1, read directly (SDL didn't list it)`).
 
 ## The keyboard
 

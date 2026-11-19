@@ -11,6 +11,17 @@ Each release is a git tag (`vX.Y.Z`) with a matching GitHub release. The version
 
 ## [Unreleased]
 
+## [0.34.0] - 2026-11-19
+
+### Added
+- **Windows: controllers SDL doesn't list are read through Windows' own XInput.** A tester's Xbox controller was never seen by SDL (the log said no controllers were connected) while the keyboard worked. When SDL has no gamepad open, the runtime reads XInput's four slots directly, with rumble; the log names a controller found that way, and says whether XInput sees one when SDL doesn't.
+- **The vertex arena**: vertex streams that don't change between frames are converted once and kept in GPU-visible memory, compared with the guest's bytes at each draw instead of converted and copied again. Attributes that are the same for every vertex are sent once a draw. In play, 100 MB a frame through the vertex ring became 4 MB, and the game's thread went from 43% of a core to 25% (lavapipe). `QILIN_NO_VERTEX_CACHE=1` turns it off.
+- `-DQILIN_SANITIZE=address,undefined` (or `thread`) builds the runtime's own code with sanitizers. Six minutes of intro, menus and play under AddressSanitizer and UndefinedBehaviorSanitizer report nothing in the runtime; ThreadSanitizer reports only races inside Mesa's software Vulkan driver.
+
+### Fixed
+- **Primitive conversion and empty draws allocate nothing**: quads, fans, loops and polygons are converted into a buffer kept from the draw before, and a draw with no vertices hands its buffers back.
+- The DXT test read past the end of its DXT1 blocks (found by AddressSanitizer).
+
 ## [0.33.5] - 2026-11-19
 
 ### Fixed
