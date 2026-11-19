@@ -66,7 +66,23 @@ bool Input::start() {
         return false;
     }
     started_ = true;
-    // Controllers already connected arrive as SDL_EVENT_GAMEPAD_ADDED events too.
+    // What SDL sees now: every joystick, and whether it knows it as a gamepad
+    // (one without a mapping can't be read as a controller). Gamepads are
+    // opened here rather than left to their SDL_EVENT_GAMEPAD_ADDED events,
+    // so one already connected is there from the first frame; the events
+    // that follow for them change nothing (attach skips a known id).
+    int count = 0;
+    SDL_JoystickID* sticks = SDL_GetJoysticks(&count);
+    if (count == 0) std::printf("qilin_run: no controllers connected (one plugged in later is picked up); the keyboard is controller 1\n");
+    for (int k = 0; k < count; ++k) {
+        const char* name = SDL_GetJoystickNameForID(sticks[k]);
+        if (SDL_IsGamepad(sticks[k])) {
+            attach(uint32_t(sticks[k]));
+        } else {
+            std::printf("qilin_run: %s isn't known to SDL as a gamepad (no mapping), so it isn't used\n", name ? name : "a joystick");
+        }
+    }
+    SDL_free(sticks);
     return true;
 }
 
@@ -110,6 +126,7 @@ void Input::detach(uint32_t id) {
 void Input::on_event(const SDL_Event& e) {
     if (!started_) return;
     if (e.type == SDL_EVENT_GAMEPAD_ADDED) attach(uint32_t(e.gdevice.which));
+    else if (e.type == SDL_EVENT_JOYSTICK_ADDED && SDL_IsGamepad(e.jdevice.which)) attach(uint32_t(e.jdevice.which));
     else if (e.type == SDL_EVENT_GAMEPAD_REMOVED) detach(uint32_t(e.gdevice.which));
 }
 

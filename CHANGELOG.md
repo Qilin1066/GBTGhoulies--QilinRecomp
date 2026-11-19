@@ -11,6 +11,15 @@ Each release is a git tag (`vX.Y.Z`) with a matching GitHub release. The version
 
 ## [Unreleased]
 
+## [0.33.2] - 2026-11-19
+
+### Fixed
+- **Controllers connected at start-up** are opened at once, from SDL's list, instead of only when SDL's connection event arrives; a controller SDL reports first as a joystick is taken when it's a gamepad. The runtime names every controller it sees, and says when one has no gamepad mapping (so it can't be used) or none is connected.
+- **One voice can no longer silence the whole mix**: the voice filter is unstable at the top of its range with heavy damping (it grows without bound in about 30 ms), so its state is held to ±16, and a non-finite sample in a mix bin becomes silence instead of spreading through the mix and the reverb.
+
+### Changed
+- The MSVC build of `qilin_run` gets `/bigobj`, the project's conformance switches, and `/MP` under Visual Studio's generator; the test programs' MSVC warnings are gone.
+
 ## [0.33.1] - 2026-11-19
 
 ### Fixed

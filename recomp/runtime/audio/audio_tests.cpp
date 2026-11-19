@@ -370,6 +370,21 @@ int main() {
         CHECK(z[2 * 47999] == zin[2 * (47999 - 72)]);  // recovered (the release: 50 ms, unity within 10^-5 after about 0.5 s)
     }
 
+    // The filter at its unstable corner (the top of its range, damping
+    // 2): bounded, never infinite; and a NaN in a bin comes out as silence.
+    {
+        audio::Svf svf;
+        const double top = audio::Svf::frequency(0);
+        bool finite = true;
+        for (int i = 0; i < 48000; ++i) svf.step(i % 2 ? 0.5 : -0.5, top, 65535.0 / 32768.0), finite &= std::isfinite(svf.low) && std::fabs(svf.low) <= 16.0;
+        CHECK(finite);
+        audio::Bins b;
+        b.clear(2);
+        b.bin(0)[0] = std::nanf(""), b.bin(0)[1] = INFINITY;
+        audio::saturate(b, 0, 1);
+        CHECK(b.bin(0)[0] == 0.0f && b.bin(0)[1] < 1.0f);
+    }
+
     if (failures) std::fprintf(stderr, "%d check(s) failed\n", failures);
     else std::printf("all audio tests passed\n");
     return failures != 0;

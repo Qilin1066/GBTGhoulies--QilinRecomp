@@ -71,10 +71,17 @@ double Svf::frequency(uint32_t fc) {
     return std::min(65535.0, std::round(std::pow(2.0, octaves) * 65536.0)) / 65536.0;
 }
 
+// The filter is unstable at the top of its range with heavy damping (f
+// near 1, damping near 2: it grows without bound in about 30 ms). The
+// hardware's registers are fixed point and can't grow without bound; here
+// the state is held to ±16 (well past full scale, which the measurements
+// say the filter's output can pass), so such a voice is loud, not infinite,
+// and can't turn the whole mix into infinities.
 double Svf::step(double x, double f, double damping) {
-    low = round_step(low + f * band);
-    const double high = round_step(x - low - damping * band);
-    band = round_step(f * high + band);
+    constexpr double kLimit = 16.0;
+    low = std::clamp(round_step(low + f * band), -kLimit, kLimit);
+    const double high = std::clamp(round_step(x - low - damping * band), -kLimit, kLimit);
+    band = std::clamp(round_step(f * high + band), -kLimit, kLimit);
     return high;
 }
 
@@ -620,7 +627,7 @@ void saturate(Bins& bins, uint32_t first_bin, uint32_t count) {
     constexpr float kTop = 1.0f - 1.0f / 8388608.0f;
     for (uint32_t b = first_bin; b < first_bin + count && b < kMixBinCount; ++b) {
         float* x = bins.bin(b);
-        for (uint32_t i = 0; i < bins.frames; ++i) x[i] = std::clamp(x[i], -1.0f, kTop);
+        for (uint32_t i = 0; i < bins.frames; ++i) x[i] = std::isfinite(x[i]) ? std::clamp(x[i], -1.0f, kTop) : 0.0f;  // never pass on a NaN
     }
 }
 
