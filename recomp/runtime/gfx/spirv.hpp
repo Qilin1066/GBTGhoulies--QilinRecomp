@@ -49,7 +49,7 @@ namespace deco {
 enum : uint32_t { Block = 2, ArrayStride = 6, BuiltIn = 11, NoPerspective = 13, Flat = 14, Location = 30, Binding = 33, DescriptorSet = 34, Offset = 35 };
 }
 namespace builtin {
-enum : uint32_t { Position = 0, PointSize = 1, FragCoord = 15 };
+enum : uint32_t { Position = 0, PointSize = 1, FragCoord = 15, FragDepth = 22 };
 }
 
 class Builder {
@@ -86,6 +86,7 @@ public:
     Id input(Id type, uint32_t location);
     Id output(Id type, uint32_t location);
     Id builtin_var(Storage s, Id type, uint32_t which);
+    void depth_replacing() { depth_replacing_ = true; }  // a fragment shader that writes FragDepth
     // A uniform block: one member, an array of `count` vec4, at set/binding.
     Id uniform_vec4_array(uint32_t count, uint32_t set, uint32_t binding);
     Id sampler(Id sampler_type, uint32_t set, uint32_t binding);
@@ -116,6 +117,7 @@ public:
     std::vector<uint32_t> finish(const std::vector<Id>& interface);
 
 private:
+    bool depth_replacing_ = false;
     using Words = std::vector<uint32_t>;
     static void emit(Words& w, uint16_t opcode, std::initializer_list<uint32_t> operands);
     static void emit(Words& w, uint16_t opcode, const std::vector<uint32_t>& operands);

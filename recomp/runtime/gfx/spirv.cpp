@@ -222,6 +222,7 @@ std::vector<uint32_t> Builder::finish(const std::vector<Id>& interface) {
         emit(out, op::EntryPoint, ops);
     }
     if (stage_ == Stage::Fragment) emit(out, op::ExecutionMode, {main_, 7});  // OriginUpperLeft
+    if (depth_replacing_) emit(out, op::ExecutionMode, {main_, 12});  // DepthReplacing
     out.insert(out.end(), annotations_.begin(), annotations_.end());
     out.insert(out.end(), globals_.begin(), globals_.end());
     emit(out, op::Function, {t_void(), main_, 0, fn_type});

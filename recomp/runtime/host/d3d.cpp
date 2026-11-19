@@ -132,6 +132,12 @@ struct Device {
         uint64_t guest = 0;     // hash of the guest bytes when last rendered
     };
     std::map<uint32_t, TargetTexture> targets;
+    // Depth surfaces other than the device's, as the renderer's depth
+    // targets, by the guest address of their data.
+    struct DepthTarget {
+        uint32_t id = 0, width = 0, height = 0;
+    };
+    std::map<uint32_t, DepthTarget> depth_targets;
     std::vector<std::string> said;  // notices given once
 };
 Device* g_device = nullptr;
@@ -1040,12 +1046,12 @@ std::pair<uint32_t, uint32_t> surface_size(const rt::Context& c, uint32_t surf);
 
 // Points the renderer at the device's render target before a draw or clear,
 // and returns its size: the back buffer, or a texture's surface (made a
-// render target the first time). Drawing into the front buffer, a texture
-// target with a depth buffer, and other formats stop the runtime.
+// render target the first time). Drawing into the front buffer and other
+// formats stop the runtime.
 std::pair<uint32_t, uint32_t> apply_target(rt::Context& c, Device& d, const char* fn) {
     const uint32_t target = ld(c, kDeviceStorage + kDevRenderTarget), depth = ld(c, kDeviceStorage + kDevDepth);
     if (target == d.frame_buffers[d.renderer->back_index()]) {
-        d.renderer->set_render_target(0, true);
+        d.renderer->set_render_target(0, gfx::Renderer::kDeviceDepth);
         return {d.width, d.height};
     }
     for (uint32_t fb : d.frame_buffers)
@@ -1054,12 +1060,28 @@ std::pair<uint32_t, uint32_t> apply_target(rt::Context& c, Device& d, const char
     if (fmt != kFmtA8R8G8B8 && fmt != kFmtX8R8G8B8 && fmt != kFmtLinA8R8G8B8 && fmt != kFmtLinX8R8G8B8)
         unmodelled(fn, strf("rendering into a surface of format %#x", fmt));
     const auto [w, h] = surface_size(c, target);
-    // The device's depth buffer can go with a texture of its size (the
-    // renderer's depth buffer is it); any other depth surface stops the runtime.
-    if (depth && (depth != d.depth || w != d.width || h != d.height)) {
+    // The depth buffer with it, at least its size (as D3D requires): the
+    // device's is the renderer's own; another D24S8 surface gets a depth
+    // target of its own, made the first time, by the guest address of its
+    // data. What a depth surface holds isn't in guest memory: a title that
+    // reads or writes one with the CPU isn't modelled.
+    uint32_t depth_id = 0;
+    if (depth) {
         const auto [dw, dh] = surface_size(c, depth);
-        unmodelled(fn, strf("a depth buffer (%08X, %ux%u, format %#x) with a texture as the render target (%ux%u)", depth, dw, dh,
-                            (ld(c, depth + 12) >> 8) & 0xFF, w, h));
+        const uint32_t dfmt = (ld(c, depth + 12) >> 8) & 0xFF;
+        if (dw < w || dh < h || (dfmt != kFmtD24S8 && dfmt != kFmtLinD24S8))
+            unmodelled(fn, strf("a depth buffer (%08X, %ux%u, format %#x) with a texture as the render target (%ux%u)", depth, dw, dh,
+                                dfmt, w, h));
+        if (depth == d.depth) {
+            depth_id = gfx::Renderer::kDeviceDepth;
+        } else {
+            Device::DepthTarget& dt = d.depth_targets[ld(c, depth + 4)];
+            if (!dt.id || dt.width != dw || dt.height != dh) {
+                if (dt.id) d.renderer->destroy_texture(dt.id);
+                dt = {d.renderer->create_depth_target(dw, dh), dw, dh};
+            }
+            depth_id = dt.id;
+        }
     }
     const uint32_t data = ld(c, target + 4);
     Device::TargetTexture& t = d.targets[data];
@@ -1073,7 +1095,7 @@ std::pair<uint32_t, uint32_t> apply_target(rt::Context& c, Device& d, const char
     }
     if (size_t(data) + size_t(w) * h * 4 > c.mem_size) unmodelled(fn, strf("a render target past the end of memory (%08X)", data));
     t.guest = hash_bytes(c.mem + data, size_t(w) * h * 4, 0x9E3779B97F4A7C15ull);
-    d.renderer->set_render_target(t.texture.id, depth != 0);
+    d.renderer->set_render_target(t.texture.id, depth_id);
     return {w, h};
 }
 
@@ -1399,7 +1421,13 @@ void issue_draw(rt::Context& c, Device& d, const char* fn, uint32_t prim, Vertic
             fsu[(gfx::nv2a::kFsTexScale + stage) * 4 + 2] = 1.0f / float(t->depth);
         }
     }
-    if (const char* why = gfx::nv2a::combiners_unsupported(cs)) unmodelled(fn, why);
+    if (const char* why = gfx::nv2a::combiners_unsupported(cs)) {
+        std::string formats;
+        for (uint32_t stage = 0; stage < 4; ++stage)
+            if (const uint32_t tex = ld(c, dev + 0xF78 + 4 * stage))
+                formats += strf(" t%u format %#x size %08X data %08X;", stage, ld(c, tex + 12), ld(c, tex + 16), ld(c, tex + 4));
+        unmodelled(fn, std::string(why) + formats);
+    }
     const uint64_t fs_key = cs.hash() ^ 2;
     auto& fs_code = d.shaders[fs_key];
     if (fs_code.empty()) fs_code = gfx::nv2a::combiners(cs);

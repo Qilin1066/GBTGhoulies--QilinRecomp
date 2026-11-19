@@ -6,6 +6,7 @@
 // fixed point: results agree to within its precision.
 #include <cstring>
 #include <stdexcept>
+#include <string>
 
 #include "nv2a_shaders.hpp"
 #include "spirv.hpp"
@@ -22,9 +23,14 @@ namespace glsl = spv::glsl;
 enum Reg : uint32_t { kZero = 0, kC0 = 1, kC1 = 2, kFog = 3, kV0 = 4, kV1 = 5, kT0 = 8, kR0 = 12, kR1 = 13, kV1R0Sum = 14, kEfProd = 15 };
 
 // Texture modes (PS_TEXTUREMODES_*).
-enum Mode : uint32_t { kNone = 0, kProject2d = 1, kProject3d = 2, kCubemap = 3, kPassthru = 4, kClipPlane = 5 };
+enum Mode : uint32_t { kNone = 0, kProject2d = 1, kProject3d = 2, kCubemap = 3, kPassthru = 4, kClipPlane = 5, kDotZw = 10, kDotProduct = 17 };
 
 uint32_t mode_of(const CombinerSetup& s, uint32_t stage) { return (s.texture_modes >> (5 * stage)) & 0x1F; }
+// The dot-product stages' source (PS_INPUTTEXTURE: stage 1 reads t0, stage 2
+// bits 16-19, stage 3 bits 20-23) and how its colour reads as a vector
+// (PS_DOTMAPPING: stage n's at bits 4(n-1) on).
+uint32_t input_of(const CombinerSetup& s, uint32_t stage) { return stage < 2 ? 0 : (s.input_texture >> (16 + 4 * (stage - 2))) & 0xF; }
+uint32_t dot_map_of(const CombinerSetup& s, uint32_t stage) { return stage ? (s.dot_mapping >> (4 * (stage - 1))) & 0x7 : 0; }
 
 struct Ps {
     Builder b{spv::Stage::Fragment};
@@ -83,6 +89,36 @@ struct Ps {
         return b.ext(glsl::FClamp, v4, {v, b.c_vec({-1, -1, -1, -1}), one4});
     }
 
+    // A colour as a vector for the dot-product stages, from its 8-bit
+    // channels (as the renderer holds every texture): as is (ZERO_TO_ONE), or signed three ways: D3D's
+    // (b - 128) / 127, OpenGL's ((2b + 1) / 255 - 1, two's complement), and
+    // two's complement / 127.
+    // HILO_1: the texel's 32 bits as two 16-bit halves, (hi, lo, 1): for an
+    // A8R8G8B8 texel, hi is A and R, lo G and B.
+    Id dot_map(Id col, uint32_t map) {
+        if (map == 0) return col;
+        auto byte = [&](uint32_t k) {
+            return b.ext(glsl::RoundEven, f, {b.op(op::FMul, f, {b.ext(glsl::FClamp, f, {comp(col, k), b.c_float(0), b.c_float(1)}), b.c_float(255)})});
+        };
+        if (map == 4) {
+            auto half = [&](uint32_t high, uint32_t low) {
+                return b.op(op::FDiv, f, {b.op(op::FAdd, f, {b.op(op::FMul, f, {byte(high), b.c_float(256)}), byte(low)}), b.c_float(65535)});
+            };
+            return b.vec4(half(3, 0), half(1, 2), b.c_float(1), b.c_float(0));
+        }
+        auto ch = [&](uint32_t k) {
+            const Id x = byte(k);
+            if (map == 1) return b.op(op::FDiv, f, {b.op(op::FSub, f, {x, b.c_float(128)}), b.c_float(127)});
+            const Id high = b.op(op::FOrdGreaterThanEqual, boolean, {x, b.c_float(128)});
+            if (map == 2)
+                return b.op(op::Select, f, {high, b.op(op::FDiv, f, {b.op(op::FSub, f, {x, b.c_float(255.5f)}), b.c_float(127.5f)}),
+                                            b.op(op::FDiv, f, {b.op(op::FAdd, f, {x, b.c_float(0.5f)}), b.c_float(127.5f)})});
+            return b.op(op::Select, f, {high, b.op(op::FDiv, f, {b.op(op::FSub, f, {x, b.c_float(256)}), b.c_float(127)}),
+                                        b.op(op::FDiv, f, {x, b.c_float(127)})});
+        };
+        return b.vec4(ch(0), ch(1), ch(2), b.c_float(0));
+    }
+
     Id dot3(Id a, Id c) {
         return b.splat(b.op(op::Dot, f, {b.shuffle(v3, a, a, {0, 1, 2}), b.shuffle(v3, c, c, {0, 1, 2})}));
     }
@@ -108,7 +144,21 @@ uint64_t CombinerSetup::hash() const {
 const char* combiners_unsupported(const CombinerSetup& s) {
     for (uint32_t t = 0; t < 4; ++t) {
         const uint32_t m = mode_of(s, t);
-        if (m > kClipPlane) return "a texture mode beyond NONE, PROJECT2D, PROJECT3D, CUBEMAP, PASSTHRU and CLIPPLANE (bump mapping, dot products)";
+        if (m == kDotProduct && (t == 0 || t == 3 || mode_of(s, 3) != kDotZw))
+            return "texture mode DOTPRODUCT other than at stage 2 before DOT_ZW";
+        if (m == kDotZw && (t != 3 || mode_of(s, 2) != kDotProduct)) return "texture mode DOT_ZW other than at stage 3 after DOTPRODUCT";
+        if ((m == kDotProduct || m == kDotZw) && (dot_map_of(s, t) > 4 || input_of(s, t) >= t)) {
+            static thread_local std::string why;
+            why = "a dot-product stage with a HILO dot mapping, or reading a later stage (stage " + std::to_string(t) + ", dot mapping " +
+                  std::to_string(s.dot_mapping) + ", input texture " + std::to_string(s.input_texture) + ")";
+            return why.c_str();
+        }
+        if (m > kClipPlane && m != kDotZw && m != kDotProduct) {
+            static thread_local std::string why;
+            why = "texture mode " + std::to_string(m) + " at stage " + std::to_string(t) + " (modes " + std::to_string(s.texture_modes) + ")" +
+                  " (beyond NONE, PROJECT2D, PROJECT3D, CUBEMAP, PASSTHRU and CLIPPLANE: bump mapping, dot products)";
+            return why.c_str();
+        }
         if ((m == kProject2d || m == kProject3d || m == kCubemap) && s.texture_dims[t] &&
             !((m == kCubemap) == (s.texture_dims[t] == 6)))
             return "a texture whose kind doesn't match its stage's texture mode";
@@ -127,11 +177,16 @@ std::vector<uint32_t> combiners(const CombinerSetup& s) {
     for (uint32_t i = 0; i < 4; ++i) t[i] = p.varying(kVaryT0 + i);
 
     // Texture stages.
+    Id dots[4] = {};
     for (uint32_t i = 0; i < 4; ++i) {
         const uint32_t m = mode_of(s, i);
         Id result = p.zero4;
         const Id scale = p.uniform(kFsTexScale + i);
-        if (m == kPassthru) {
+        if (m == kDotProduct || m == kDotZw) {
+            // The stage's (s, t, r) with an earlier stage's colour; the register reads 0.
+            const Id src = p.dot_map(p.regs[kT0 + input_of(s, i)] ? p.regs[kT0 + input_of(s, i)] : p.zero4, dot_map_of(s, i));
+            dots[i] = p.comp(p.dot3(t[i], src), 0);
+        } else if (m == kPassthru) {
             result = p.clamp01(t[i]);
         } else if (m == kClipPlane) {
             // Each of s, t, r, q: discard below 0 (compare bit clear) or at 0 and above.
@@ -273,6 +328,14 @@ std::vector<uint32_t> combiners(const CombinerSetup& s) {
     const Id out = b.output(p.v4, 0);
     b.store(out, color);
     p.interface.push_back(out);
+    // DOT_ZW: the pixel's depth is stage 2's dot product over stage 3's (z / w).
+    if (mode_of(s, 3) == kDotZw) {
+        b.depth_replacing();
+        const Id depth = b.builtin_var(spv::Storage::Output, p.f, spv::builtin::FragDepth);
+        const Id zw = b.op(op::FDiv, p.f, {dots[2], dots[3]});
+        b.store(depth, b.ext(glsl::FClamp, p.f, {zw, b.c_float(0), b.c_float(1)}));
+        p.interface.push_back(depth);
+    }
     return b.finish(p.interface);
 }
 

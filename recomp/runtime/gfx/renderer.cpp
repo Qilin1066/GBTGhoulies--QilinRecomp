@@ -110,7 +110,8 @@ public:
     void destroy_texture(uint32_t id) override;
     void draw(const DrawCmd& cmd) override;
     uint32_t create_render_target(uint32_t width, uint32_t height) override;
-    void set_render_target(uint32_t id, bool depth) override;
+    uint32_t create_depth_target(uint32_t width, uint32_t height) override;
+    void set_render_target(uint32_t id, uint32_t depth) override;
     Image read_front_buffer() override { return read(color_[front_]); }
     Image read_back_buffer() override { return read(color_[back_]); }
     uint32_t validation_errors() const override { return validation_errors_; }
@@ -121,7 +122,14 @@ private:
     void create_device();
     Target create_target(VkFormat format, VkImageUsageFlags usage, VkImageAspectFlags aspect, uint32_t width = 0, uint32_t height = 0);
     Target& target() { return current_rt_ ? render_targets_.at(current_rt_) : color_[back_]; }  // what draws and clears go to
-    bool target_has_depth() const { return depth_.image && (!current_rt_ || rt_depth_); }
+    // The depth buffer draws and clears use, or null.
+    Target* depth_target() {
+        const uint32_t d = current_rt_ ? rt_depth_ : Renderer::kDeviceDepth;
+        if (d == Renderer::kDeviceDepth) return depth_.image ? &depth_ : nullptr;
+        auto it = depth_targets_.find(d);
+        return it == depth_targets_.end() ? nullptr : &it->second;
+    }
+    bool target_has_depth() { return depth_target() != nullptr; }
     uint32_t memory_type(uint32_t allowed, VkMemoryPropertyFlags wanted) const;
     void destroy();
 
@@ -214,7 +222,8 @@ private:
     // current_rt_ is the one draws go to, 0 for the back buffer.
     std::unordered_map<uint32_t, Target> render_targets_;
     uint32_t current_rt_ = 0;
-    bool rt_depth_ = false;  // the depth buffer goes with the render target
+    uint32_t rt_depth_ = 0;  // what goes with the render target: 0, kDeviceDepth or a depth target
+    std::unordered_map<uint32_t, Target> depth_targets_;  // by the same ids as textures
     std::vector<Texture> dead_textures_;                                  // freed once the GPU is done with them
     std::vector<std::pair<VkBuffer, VkDeviceMemory>> staging_;            // likewise
 };
@@ -516,6 +525,7 @@ void VulkanRenderer::destroy() {
         };
         for (Target& t : color_) drop(t);
         for (auto& [id, t] : render_targets_) drop(t);
+        for (auto& [id, t] : depth_targets_) drop(t);
         drop(depth_);
         auto drop_texture = [&](Texture& t) {
             if (t.view) vkDestroyImageView(device_, t.view, nullptr);
@@ -592,10 +602,10 @@ void VulkanRenderer::begin_pass() {
     info.layerCount = 1;
     info.colorAttachmentCount = 1;
     info.pColorAttachments = &color;
-    if (target_has_depth()) {
-        transition(depth_, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
-        depth.imageView = stencil.imageView = depth_.view;
-        depth.imageLayout = stencil.imageLayout = depth_.layout;
+    if (Target* dt = depth_target()) {
+        transition(*dt, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
+        depth.imageView = stencil.imageView = dt->view;
+        depth.imageLayout = stencil.imageLayout = dt->layout;
         depth.storeOp = stencil.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
         depth.loadOp = pending_.depth ? VK_ATTACHMENT_LOAD_OP_CLEAR : VK_ATTACHMENT_LOAD_OP_LOAD;
         stencil.loadOp = pending_.stencil ? VK_ATTACHMENT_LOAD_OP_CLEAR : VK_ATTACHMENT_LOAD_OP_LOAD;
@@ -1208,6 +1218,12 @@ void VulkanRenderer::destroy_texture(uint32_t id) {
         render_targets_.erase(rt);
         return;
     }
+    if (auto dt = depth_targets_.find(id); dt != depth_targets_.end()) {
+        if (current_rt_ && id == rt_depth_) end_pass(), rt_depth_ = 0;
+        dead_textures_.push_back({dt->second.image, dt->second.memory, dt->second.view});
+        depth_targets_.erase(dt);
+        return;
+    }
     auto it = textures_.find(id);
     if (it == textures_.end()) return;
     dead_textures_.push_back(it->second);
@@ -1235,16 +1251,37 @@ uint32_t VulkanRenderer::create_render_target(uint32_t width, uint32_t height) {
     return id;
 }
 
-void VulkanRenderer::set_render_target(uint32_t id, bool depth) {
-    depth = depth && id;
+uint32_t VulkanRenderer::create_depth_target(uint32_t width, uint32_t height) {
+    Target t = create_target(depth_format_, VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                             VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT, width, height);
+    const bool was_open = pass_open_;
+    end_pass();
+    record();
+    transition(t, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+    const VkClearDepthStencilValue zero{};
+    const VkImageSubresourceRange range{t.aspect, 0, 1, 0, 1};
+    vkCmdClearDepthStencilImage(cmd_, t.image, t.layout, &zero, 1, &range);
+    const uint32_t id = next_texture_++;
+    depth_targets_[id] = t;
+    if (was_open) begin_pass();
+    return id;
+}
+
+void VulkanRenderer::set_render_target(uint32_t id, uint32_t depth) {
+    if (!id) depth = 0;
     if (id == current_rt_ && depth == rt_depth_) return;
     if (id && !render_targets_.count(id)) {
         std::fprintf(stderr, "qilin: renderer: no render target %u\n", id);
         std::exit(3);
     }
-    if (depth && (!depth_.image || render_targets_.at(id).width != depth_.width || render_targets_.at(id).height != depth_.height)) {
-        std::fprintf(stderr, "qilin: renderer: the depth buffer doesn't fit render target %u\n", id);
-        std::exit(3);
+    if (depth) {
+        const Target& rt = render_targets_.at(id);
+        const Target* dt = depth == kDeviceDepth ? (depth_.image ? &depth_ : nullptr)
+                                                  : (depth_targets_.count(depth) ? &depth_targets_.at(depth) : nullptr);
+        if (!dt || dt->width < rt.width || dt->height < rt.height) {
+            std::fprintf(stderr, "qilin: renderer: depth buffer %u doesn't fit render target %u\n", depth, id);
+            std::exit(3);
+        }
     }
     end_pass();
     current_rt_ = id;

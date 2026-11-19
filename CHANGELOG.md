@@ -11,6 +11,14 @@ Each release is a git tag (`vX.Y.Z`) with a matching GitHub release. The version
 
 ## [Unreleased]
 
+## [0.29.0] - 2026-11-19
+Chapter 1's first fight can be won: Baines congratulates Cooper on battling unarmed.
+
+### Added
+- **Texture targets with their own depth surface**: a D24S8 surface other than the device's gets a renderer depth buffer of its own; a depth buffer larger than the target is accepted, as D3D allows.
+- **Depth written from a texture** (`texm3x2depth`): texture modes DOTPRODUCT and DOT_ZW, with the ZERO_TO_ONE, signed and HILO_1 dot mappings; the fragment shader writes the depth.
+- Unsupported combiner settings are reported with the texture mode, dot mapping, input textures and the bound textures' formats.
+
 ## [0.28.0] - 2026-11-19
 The game plays: Chapter 1's first fight in the mansion hall, Cooper against the imps, his health going down, the page turn when he's beaten and the level again.
 
