@@ -11,6 +11,14 @@ Each release is a git tag (`vX.Y.Z`) with a matching GitHub release. The version
 
 ## [Unreleased]
 
+## [0.28.0] - 2026-11-19
+The game plays: Chapter 1's first fight in the mansion hall, Cooper against the imps, his health going down, the page turn when he's beaten and the level again.
+
+### Added
+- **`D3DDevice_SetModelView`**: the title's own model-view, inverse and composite, as the original keeps and pushes them; the fixed-function pipeline draws with that composite (to the screen already, as D3D's own) while D3D's flag for it is on.
+- **`D3DDevice_DrawVerticesUP`**: vertices from the caller's memory, each attribute at its slot's offset, after the dirty-flag changes the original's flush for it makes.
+- **Vertices without colours** in the fixed-function pipeline: `SetVertexShader` sets the GPU's attribute registers for the colours an FVF lacks as the original pushes them (diffuse white, specular zero), and draws read them.
+
 ## [0.27.0] - 2026-11-19
 Chapter 1's story plays through to the mansion's door.
 

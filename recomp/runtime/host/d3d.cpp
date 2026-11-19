@@ -105,6 +105,10 @@ struct Device {
     uint32_t immediate = 0;  // the primitive between Begin and End, 0 outside
     float attribute_values[16][4] = {};
     uint32_t attributes_written = 0;
+    // The transforms SetModelView gives the GPU (D3D's matrix layout, row
+    // vectors), which the fixed-function pipeline uses in place of
+    // World × View × Projection while D3D's dirty flag 0x80000000 is set.
+    float model_view[16] = {}, inverse_model_view[12] = {}, composite[16] = {};
     std::vector<float> immediate_vertices;  // 16 vec4s a vertex
     // Draws decoded since the last Swap, until the renderer draws them.
     // Shaders made so far, by key, and textures uploaded, by their header and address.
@@ -251,6 +255,7 @@ void set_push_buffer_size(rt::Context& c) {
 // HRESULT Direct3D_CreateDevice(UINT Adapter, D3DDEVTYPE, HWND, DWORD BehaviorFlags,
 //     D3DPRESENT_PARAMETERS*, IDirect3DDevice8** ppReturnedDeviceInterface)
 void init_push_sink(rt::Context& c, Device& d);
+void absent_colour_registers(rt::Context& c, uint32_t vs);
 
 // The guest-visible part of the original's device initialisation, after the
 // frame buffers (0x17AB79 on): the fixed-function vertex shader for
@@ -262,6 +267,7 @@ void init_device_state(rt::Context& c) {
     st(c, kDeviceStorage + 0x790, 0x184478);
     host::call_guest(c, 0x1739F0, {4});  // D3DFVF_XYZRHW
     host::call_guest(c, 0x1739F0, {2});  // D3DFVF_XYZ
+    absent_colour_registers(c, kFixedFunctionShader);  // what that call pushed of them
     for (uint32_t k = 0; k < 0x46; ++k) st(c, 0x184360 + 4 * k, 0);
     st(c, 0x184364, 0x10);
     // SetRenderTarget(back buffer, depth buffer), which also sets the
@@ -1119,7 +1125,6 @@ FixedFunction fixed_function_program(rt::Context& c, const char* fn) {
     const uint32_t position = fvf & 0xE, texcount = (fvf >> 8) & 0xF;
     if (fvf & 1u) unmodelled(fn, strf("FVF %#x: a vertex shader handle where an FVF was expected", fvf));
     if (position != 0x2) unmodelled(fn, strf("the fixed-function pipeline with FVF %#x (positions other than D3DFVF_XYZ)", fvf));
-    if (!(fvf & 0x40)) unmodelled(fn, strf("the fixed-function pipeline with FVF %#x (no diffuse colour)", fvf));
     if (fvf & ~0xFFFF0FE2u) unmodelled(fn, strf("FVF %#x", fvf));
     if (rs(kRsLighting)) unmodelled(fn, "fixed-function lighting (D3DRS_LIGHTING)");
     if (rs(kRsVertexBlend)) unmodelled(fn, "vertex blending (D3DRS_VERTEXBLEND)");
@@ -1164,8 +1169,8 @@ FixedFunction fixed_function_program(rt::Context& c, const char* fn) {
         out(in, address, 0xF);
         f.program.code.push_back(in);
     };
-    mov(kD0, 3);
-    if (fvf & 0x80) mov(kD1, 4);
+    mov(kD0, 3);  // the vertices' colours, or the registers' (absent_colour_registers)
+    mov(kD1, 4);
     for (uint8_t n = 0; n < texcount; ++n) mov(uint8_t(kT0 + n), uint8_t(9 + n));
     f.program.code.back().final = true;
     f.program.header = 0x2078u | uint32_t(f.program.code.size()) << 16;
@@ -1413,7 +1418,17 @@ void issue_draw(rt::Context& c, Device& d, const char* fn, uint32_t prim, Vertic
     std::vector<float> vsu(gfx::nv2a::kVsUniformVec4s * 4, 0.0f);
     std::memcpy(vsu.data(), d.vs_constants, sizeof d.vs_constants);
     viewport_constants(c, &vsu[58 * 4], &vsu[59 * 4]);  // c-38, c-37
-    if (fixed_function) composite_constants(c, vsu.data());  // c0-c3 (the program's own constants aren't used)
+    if (fixed_function && (ld(c, kDirtyFlags) & 0x80000000u)) {
+        // The title's composite (SetModelView), already to the screen: the
+        // program's screen-space step only divides by w.
+        for (int col = 0; col < 4; ++col)
+            for (int row = 0; row < 4; ++row) vsu[size_t(col) * 4 + size_t(row)] = d.composite[row * 4 + col];
+        const float one[4] = {1, 1, 1, 0}, zero[4] = {};
+        std::copy_n(one, 4, &vsu[58 * 4]);
+        std::copy_n(zero, 4, &vsu[59 * 4]);
+    } else if (fixed_function) {
+        composite_constants(c, vsu.data());  // c0-c3 (the program's own constants aren't used)
+    }
     const float zscale = std::bit_cast<float>(ld(c, dev + 0x944));
     vsu[gfx::nv2a::kVsScreen * 4 + 0] = 2.0f / float(target_w);
     vsu[gfx::nv2a::kVsScreen * 4 + 1] = 2.0f / float(target_h);
@@ -1482,6 +1497,44 @@ void draw_vertices(rt::Context& c) {
     consume_dirty_state(c, 0);
     issue_draw(c, d, fn, primitive, vertex_arrays(c, fn, 0, start, count), identity_sequence(count), false);
     ret(c, c.eax, 12);
+}
+
+// VOID D3DDevice_DrawVerticesUP(D3DPRIMITIVETYPE, UINT VertexCount,
+//     CONST void* pVertexStreamZeroData, UINT VertexStreamZeroStride): vertices
+// from the caller's memory, which the original (0x1727B0) copies into the
+// push buffer as inline vertices, each attribute from its slot's offset in
+// the caller's vertex (the stream isn't read). Its state flush (0x179BC0)
+// is the ordinary one (dirty flags left & 0xC0000070), then the inline
+// layout: 0x20 off, 0x10 and 0x40 on, so the next ordinary draw sends the
+// stream layout and base vertex again. The device's own copy of that layout
+// (+0xBB8 on) only serves the original's copying, which this replaces.
+void draw_vertices_up(rt::Context& c) {
+    const char* fn = "D3DDevice_DrawVerticesUP";
+    Device& d = device(fn);
+    const uint32_t primitive = arg(c, 0), count = arg(c, 1), data = arg(c, 2), stride = arg(c, 3);
+    uint32_t dirty = ld(c, kDirtyFlags);
+    if (dirty & 0x3FFFFF8Fu) dirty &= 0xC0000070u;
+    if (dirty & 0x20u) dirty = (dirty & ~0x20u) | 0x50u;
+    st(c, kDirtyFlags, dirty);
+    Vertices v;
+    v.count = count;
+    const auto sl = slots(c, fn);
+    for (uint32_t n = 0; n < 16; ++n) {
+        if (!sl[n].bytes) continue;
+        v.mask |= 1u << n;
+        v.attr[n].resize(size_t(count) * 4);
+        uint8_t buf[16];
+        for (uint32_t i = 0; i < count; ++i) {
+            const uint32_t at = data + stride * i + sl[n].offset;
+            for (uint32_t b = 0; b < sl[n].bytes; ++b) buf[b] = rt::ld8(mem(c), at + b, 0);
+            convert_attribute(buf, sl[n].format, &v.attr[n][size_t(i) * 4]);
+        }
+    }
+    issue_draw(c, d, fn, primitive, std::move(v), identity_sequence(count), false);
+    const uint32_t flags = ld(c, kDeviceStorage + 8);
+    st(c, kDeviceStorage + 8, flags & ~0x1800u);
+    if (flags & 0x1000u) unmodelled(fn, "the device's flag 0x1000 (a kick-off the original makes after the draw)");
+    ret(c, c.eax, 16);
 }
 
 // VOID D3DDevice_DrawIndexedVertices(D3DPRIMITIVETYPE, UINT VertexCount, CONST WORD* pIndexData):
@@ -2163,6 +2216,52 @@ void select_vertex_shader(rt::Context& c) {
 // 0x400 when the attribute layout (+0x10) changes and 0x1600 when the
 // shader's flags (+4) do. The program upload and the viewport constants it
 // pushes are left to the renderer, which reads these at draw time.
+// VOID D3DDevice_SetModelView(CONST D3DMATRIX* pModelView,
+//     CONST D3DMATRIX* pInverseModelView, CONST D3DMATRIX* pComposite):
+// the title's own transforms for the fixed-function pipeline, the composite
+// as D3D's own is, through the viewport to the screen (its
+// GetProjectionViewportMatrix). As the original (0x174BC0): with a
+// composite, dirty flag 0x80000000 on and 0x200 off, the composite kept at
+// the device's +0x9B0 unless its flag 0x10 is set, and the three pushed to
+// the GPU (the inverse's 4×3 only if given), which the runtime keeps for
+// draws; with none, 0x80000000 off and 0x200 on (D3D's own again).
+void set_model_view(rt::Context& c) {
+    const char* fn = "D3DDevice_SetModelView";
+    Device& d = device(fn);
+    const uint32_t mv = arg(c, 0), inv = arg(c, 1), comp = arg(c, 2);
+    const uint32_t dirty = ld(c, kDirtyFlags);
+    if (!comp) {
+        st(c, kDirtyFlags, (dirty & 0x7FFFFDFFu) | 0x200u);
+        ret(c, c.eax, 12);
+        return;
+    }
+    st(c, kDirtyFlags, (dirty & ~0x200u) | 0x80000000u);
+    if (!(ld(c, kDeviceStorage + 8) & 0x10))
+        for (uint32_t k = 0; k < 16; ++k) st(c, kDeviceStorage + 0x9B0 + 4 * k, ld(c, comp + 4 * k));
+    auto f = [&](uint32_t a) { return std::bit_cast<float>(ld(c, a)); };
+    for (uint32_t k = 0; k < 16; ++k) d.model_view[k] = f(mv + 4 * k), d.composite[k] = f(comp + 4 * k);
+    if (inv)
+        for (uint32_t k = 0; k < 12; ++k) d.inverse_model_view[k] = f(inv + 4 * k);
+    ret(c, c.eax, 12);
+}
+
+// What the original's SetVertexShader (0x1739F0) pushes for a fixed-function
+// shader object, besides its program: the GPU's attribute registers for
+// the colours its vertices lack (the object's flags at +4: 0x400 diffuse,
+// 0x800 specular, 0x1000 back diffuse, 0x2000 back specular), diffuse ones
+// white and specular ones zero (SET_VERTEX_DATA4UB). Draws without that
+// attribute read the register (issue_draw), so a vertex with no colour is white.
+void absent_colour_registers(rt::Context& c, uint32_t vs) {
+    Device& d = device("D3DDevice_SetVertexShader");
+    const uint32_t flags = ld(c, vs + 4);
+    constexpr struct { uint32_t flag, reg; float value; } kColours[] = {{0x400, 3, 1}, {0x800, 4, 0}, {0x1000, 7, 1}, {0x2000, 8, 0}};
+    for (const auto& k : kColours) {
+        if (flags & k.flag) continue;
+        std::fill_n(d.attribute_values[k.reg], 4, k.value);
+        d.attributes_written |= 1u << k.reg;
+    }
+}
+
 void set_vertex_shader(rt::Context& c) {
     const char* fn = "D3DDevice_SetVertexShader";
     const uint32_t handle = arg(c, 0), dev = kDeviceStorage;
@@ -2189,6 +2288,7 @@ void set_vertex_shader(rt::Context& c) {
     st(c, dev + kDevVertexShader, vs);
     st(c, dev + kDevVertexShader + 4, handle);
     st(c, dev + kDevVertexShader + 8, 0);
+    absent_colour_registers(c, vs);
     ret(c, c.eax, 4);
 }
 
@@ -2306,6 +2406,7 @@ constexpr D3dFn kD3d[] = {
     {"D3DDevice_SetPixelShader", 4, set_pixel_shader},
     {"D3DDevice_SetPixelShaderConstant", 12, set_pixel_shader_constant},
     {"D3DDevice_SetVertexShader", 4, set_vertex_shader},
+    {"D3DDevice_SetModelView", 12, set_model_view},
     {"D3DDevice_LoadVertexShader", 8, load_vertex_shader},
     {"D3DDevice_SelectVertexShader", 8, select_vertex_shader},
     {"D3DDevice_SetRenderStateNotInline", 8, set_render_state_not_inline},
@@ -2316,6 +2417,7 @@ constexpr D3dFn kD3d[] = {
     {"D3DDevice_BeginStateBig", 4, begin_state_big},
     {"D3DDevice_SetRenderTarget", 8, set_render_target},
     {"D3DDevice_DrawVertices", 12, draw_vertices},
+    {"D3DDevice_DrawVerticesUP", 16, draw_vertices_up},
     {"D3DDevice_DrawIndexedVertices", 12, draw_indexed_vertices},
     {"D3DDevice_InsertFence", 0, insert_fence},
     {"D3DDevice_BlockOnFence", 4, block_on_fence},
