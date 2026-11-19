@@ -108,6 +108,7 @@ constexpr uint32_t kLiftedD3d[] = {
     0x177840,  // D3DDevice_CreateTexture2
     0x1779C0,  // D3DDevice_CreateVertexBuffer2
     0x175C90,  // D3DDevice_CreateSurface2
+    0x176E00,  // writes a texture's methods into a recorded push buffer (a fixup), memory only
     0x17B5D0,  // the pixel-container header builder they share
     0x175C00,  // a texture's surface-level header
     0x177900,  // D3DTexture_GetSurfaceLevel2
@@ -379,6 +380,26 @@ int cmd_lift(const Xbe& xbe, Decoder& dec, std::span<const std::string_view> arg
         lib_n = lib.size();
         for (uint32_t a : lib)
             if (!lift_one(a, cfg.functions().at(a))) ++lib_failed;
+        // Jumps into the middle of a lifted function (the C runtime's shared
+        // exits: `call __SEH_epilog; ret` after a __finally block that the
+        // CFG split off) get a function of their own from there.
+        for (bool more = true; more;) {
+            more = false;
+            std::ranges::sort(done);
+            std::vector<uint32_t> missing;
+            std::ranges::set_difference(called, done, std::back_inserter(missing));
+            for (uint32_t t : missing) {
+                if (cfg.functions().contains(t) || is_native(t)) continue;
+                auto fn = cfg.entry_inside(t);
+                if (!fn) continue;
+                bool inside_lifted = false;
+                for (auto& [s0, f0] : cfg.functions())
+                    if (t > f0.lo && t < f0.hi && std::ranges::binary_search(done, s0) && std::ranges::binary_search(f0.insns, t)) inside_lifted = true;
+                if (!inside_lifted) continue;
+                if (!lift_one(t, *fn)) ++lib_failed;
+                more = true;
+            }
+        }
         std::ranges::sort(done);
     }
     flush();

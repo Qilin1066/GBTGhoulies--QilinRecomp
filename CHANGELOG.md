@@ -11,6 +11,17 @@ Each release is a git tag (`vX.Y.Z`) with a matching GitHub release. The version
 
 ## [Unreleased]
 
+## [0.30.1] - 2026-11-19
+Fixes for what lifted code could reach and stop at; a fifteen-minute run explores the mansion's upper floor with nothing stopping.
+
+### Fixed
+- **`CopyRects` with a texture the GPU drew into**, which stopped the runtime ten minutes into play: the texture comes back to guest memory first (read back, written into its swizzled or linear texels), so the copy reads and writes what the console's memory would hold.
+- **A render target's image starts from the texture's memory**, and takes what the CPU wrote since the GPU last drew; before, a new one started black, as the console's never does.
+- **Jumps into the middle of a function** (nine shared exits in the C runtime's file functions, `call __SEH_epilog; ret` after a split-off `__finally` block) are lifted as functions of their own from there; they were stubs that would have stopped the runtime.
+- `D3DDevice_Release` (the device's count, as the original; the last reference, only at shutdown, stops the runtime) and `D3DResource_IsBusy` (busy while the device holds the resource, as the original), both called by lifted code and stubs until now. D3D's recorded-push-buffer texture helper (`0x176E00`) is lifted.
+- Reading back a render target of another size than the frame (the read-back buffer grows to the largest image); a render target keeps the layout it's sampled in after a read or write.
+- The differential test's harness links again (it lacked the scheduler's preemption hook). WMADEC under it: 132 functions, 106 exercised with matching trials; three mismatches in the batch run didn't recur when the functions were run on their own (200 trials each, 0 mismatches).
+
 ## [0.30.0] - 2026-11-19
 The missing pieces of the console's sound and picture: threads, fog, every texture mode, 3D sound, reverb and 5.1.
 

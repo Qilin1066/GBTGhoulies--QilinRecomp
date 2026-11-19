@@ -555,6 +555,15 @@ void Cfg::run_queue(std::vector<uint32_t> q, Origin origin, uint8_t round) {
     }
 }
 
+std::optional<Function> Cfg::entry_inside(uint32_t a) {
+    for (auto& [start, fn] : funcs_) {
+        if (a < fn.lo || a >= fn.hi || !std::ranges::binary_search(fn.insns, a)) continue;
+        Explored r = explore(a, fn.hi);
+        return make_function(a, fn.origin, fn.round, r);
+    }
+    return std::nullopt;
+}
+
 Function Cfg::make_function(uint32_t f, Origin origin, uint8_t round, Explored& r) {
     Function fn;
     fn.start = f;

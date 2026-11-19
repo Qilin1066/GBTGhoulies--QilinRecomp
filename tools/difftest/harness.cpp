@@ -54,6 +54,8 @@ std::span<const qilin::gen::Entry> functions() { return {qilin::gen::kFunctions,
 
 namespace qilin::rt {
 void trap(uint32_t guest_addr, const char* why) { throw Trap{guest_addr, why}; }
+// One thread here: nothing ever asks for a switch (g_preempt stays false).
+void preempt() {}
 // Device registers aren't mapped in the emulator either, so the original
 // faults on them: the lifted code traps, and the trial counts as faulting in both.
 uint32_t mmio_read32(uint32_t addr, uint32_t at) { (void)addr; trap(at, "device register read"); }

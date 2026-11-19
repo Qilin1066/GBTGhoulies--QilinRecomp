@@ -116,7 +116,9 @@ public:
     Image read_front_buffer() override { return read(color_[front_]); }
     Image read_back_buffer() override { return read(color_[back_]); }
     Image read_frame_buffer(uint32_t index) override { return read(color_.at(index)); }
-    void write_frame_buffer(uint32_t index, const Image& image) override;
+    void write_frame_buffer(uint32_t index, const Image& image) override { write(color_.at(index), image); }
+    Image read_render_target(uint32_t id) override { return read(render_targets_.at(id)); }
+    void write_render_target(uint32_t id, const Image& image) override { write(render_targets_.at(id), image); }
     void show_front() override {
         end_pass();
         show(color_[front_]);
@@ -157,6 +159,7 @@ private:
     VkPipeline pipeline(const DrawCmd& cmd);
     VkSampler sampler(const SamplerDesc& d);
     Image read(Target& t);
+    void write(Target& t, const Image& image);
 
     Config config_;
     std::string device_name_;
@@ -192,6 +195,7 @@ private:
     VkFormat depth_format_ = VK_FORMAT_UNDEFINED;
     VkBuffer readback_ = VK_NULL_HANDLE;
     VkDeviceMemory readback_memory_ = VK_NULL_HANDLE;
+    VkDeviceSize readback_size_ = 0;
 
     bool recording_ = false, pass_open_ = false;
     struct PendingClear {  // whole-buffer clears waiting to become the pass's load operations
@@ -1223,8 +1227,7 @@ VkBuffer VulkanRenderer::staging_buffer(const void* data, VkDeviceSize bytes) {
 }
 
 // The CPU's pixels into a frame buffer (RGBA in, the image's BGRA out).
-void VulkanRenderer::write_frame_buffer(uint32_t index, const Image& im) {
-    Target& t = color_.at(index);
+void VulkanRenderer::write(Target& t, const Image& im) {
     if (im.width != t.width || im.height != t.height) return;
     std::vector<uint8_t> bgra(im.rgba.size());
     for (size_t i = 0; i < im.rgba.size(); i += 4) {
@@ -1237,19 +1240,28 @@ void VulkanRenderer::write_frame_buffer(uint32_t index, const Image& im) {
     const bool was_open = pass_open_;
     end_pass();
     record();
+    const VkImageLayout before = t.layout;  // a render target goes back to being sampled
     transition(t, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
     VkBufferImageCopy r{};
     r.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
     r.imageExtent = {t.width, t.height, 1};
     vkCmdCopyBufferToImage(cmd_, staging, t.image, t.layout, 1, &r);
+    if (before == VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL) transition(t, before);
     if (was_open) begin_pass();
 }
 
 Image VulkanRenderer::read(Target& t) {
-    const VkDeviceSize bytes = VkDeviceSize(config_.width) * config_.height * 4;
-    if (!readback_) {
+    // The read-back buffer, kept and grown to the largest image read.
+    const VkDeviceSize bytes = VkDeviceSize(t.width) * t.height * 4;
+    if (bytes > readback_size_) {
+        if (readback_) {
+            wait_idle();
+            vkDestroyBuffer(device_, readback_, nullptr);
+            vkFreeMemory(device_, readback_memory_, nullptr);
+        }
+        readback_size_ = std::max(bytes, VkDeviceSize(config_.width) * config_.height * 4);
         VkBufferCreateInfo info{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
-        info.size = bytes;
+        info.size = readback_size_;
         info.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
         info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
         check(vkCreateBuffer(device_, &info, nullptr, &readback_), "vkCreateBuffer");
@@ -1264,17 +1276,19 @@ Image VulkanRenderer::read(Target& t) {
     }
     end_pass();
     record();
+    const VkImageLayout before = t.layout;
     transition(t, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
     VkBufferImageCopy region{};
     region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-    region.imageExtent = {config_.width, config_.height, 1};
+    region.imageExtent = {t.width, t.height, 1};
     vkCmdCopyImageToBuffer(cmd_, t.image, t.layout, readback_, 1, &region);
+    if (before == VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL) transition(t, before);
     submit();
     wait_idle();
 
     Image out;
-    out.width = config_.width;
-    out.height = config_.height;
+    out.width = t.width;
+    out.height = t.height;
     out.rgba.resize(size_t(bytes));
     void* mapped = nullptr;
     check(vkMapMemory(device_, readback_memory_, 0, bytes, 0, &mapped), "vkMapMemory");

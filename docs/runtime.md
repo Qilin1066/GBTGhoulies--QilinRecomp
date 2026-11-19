@@ -1,6 +1,6 @@
 # Runtime: status (roadmap step 3)
 
-Last updated 2026-11-19 (v0.30.0: guest threads on host threads, with the kernel's scheduling, waits, timers and DPCs; v0.29.0: the first fight won, the mansion explored; v0.28.0: Chapter 1's first fight plays; v0.27.0: virtual memory in its own address space, as on the Xbox; v0.24.0: controllers, the kernel's SHA-1 and HMAC, the game reaches its menus and saves; v0.17.0: the game creates its shaders and stops at its first transform; v0.16.0: guest RAM mapped at the kernel's windows too; D3D's resource code lifted; the game creates its textures and stops at its first vertex shader. v0.15.0: audio starts, `audio.md`; the renderer and Direct3D are in `graphics.md`).
+Last updated 2026-11-19 (v0.30.1: nothing lifted code calls is left without a body or replacement but an exit-time destructor; v0.30.0: guest threads on host threads, with the kernel's scheduling, waits, timers and DPCs; v0.29.0: the first fight won, the mansion explored; v0.28.0: Chapter 1's first fight plays; v0.27.0: virtual memory in its own address space, as on the Xbox; v0.24.0: controllers, the kernel's SHA-1 and HMAC, the game reaches its menus and saves; v0.17.0: the game creates its shaders and stops at its first transform; v0.16.0: guest RAM mapped at the kernel's windows too; D3D's resource code lifted; the game creates its textures and stops at its first vertex shader. v0.15.0: audio starts, `audio.md`; the renderer and Direct3D are in `graphics.md`).
 
 The runtime is everything the lifted game code needs that isn't lifted: guest memory, the Xbox kernel, D3D, DirectSound/XACT and the other XDK libraries. All of it is replaced natively (HLE); none of it is emulated.
 
@@ -151,4 +151,4 @@ In the runs so far the game starts no threads of its own (`qilin_run` prints eac
 
 1. **Through Chapter 1:** playing on into its later scenes, implementing what they stop at (`graphics.md`).
 2. **Checking against the console:** the HRTF's scale, the reverb's levels, point sprites' coordinates (`audio.md`, `graphics.md`).
-3. **Keep running `qilin_run`** and implement each function it stops at: `D3DDevice_Release`, `D3DResource_IsBusy` and a few unlifted code addresses near Bink's (`0x165F96` to `0x16DF5A`) are called by lifted code and not yet reached.
+3. **Keep running `qilin_run`** and implement each function it stops at. Since v0.30.1 every target lifted code calls has a body or a replacement, except DirectSound's destructor at `0x1C7879`, which only the C runtime's exit path reaches.

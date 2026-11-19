@@ -165,6 +165,10 @@ public:
     // destroy_texture frees it.
     virtual uint32_t create_depth_target(uint32_t width, uint32_t height) = 0;
     virtual void set_render_target(uint32_t id, uint32_t depth) = 0;
+    // A render target's pixels read back, or written from the CPU (an image
+    // of its size): its texels as the guest's memory has them.
+    virtual Image read_render_target(uint32_t id) = 0;
+    virtual void write_render_target(uint32_t id, const Image& image) = 0;
 
     // Validation messages of error severity so far (0 without the layers).
     virtual uint32_t validation_errors() const = 0;

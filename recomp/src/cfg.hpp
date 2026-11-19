@@ -19,6 +19,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <map>
+#include <optional>
 #include <set>
 #include <string>
 #include <vector>
@@ -164,6 +165,12 @@ public:
 
     // All reachable instruction addresses, sorted.
     std::vector<uint32_t> all_instructions() const { return owned_.to_vector(); }
+
+    // A secondary entry: code inside a known function that other code jumps
+    // to (a shared exit such as `call __SEH_epilog; ret`), explored from
+    // there to the containing function's end. Empty if `a` isn't an
+    // instruction of some function.
+    std::optional<Function> entry_inside(uint32_t a);
 
 private:
     struct Explored;

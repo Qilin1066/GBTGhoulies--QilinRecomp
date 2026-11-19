@@ -62,6 +62,7 @@ constexpr uint32_t kDirtyFlags = 0x181968;      // D3D__DirtyFlags
 constexpr uint32_t kRenderStateTable = 0x181B70;  // D3D__RenderState (the pixel shader's registers first)
 constexpr uint32_t kDevFence = 0x2C;  // the device's current fence
 constexpr uint32_t kDevViewport = 0xED0;
+constexpr uint32_t kDevRefs = 0x934;  // the device object's reference count
 constexpr uint32_t kDevVertexShader = 0x790, kFixedFunctionShader = 0x184478;
 constexpr uint32_t kFmtA8R8G8B8 = 0x06, kFmtX8R8G8B8 = 0x07, kFmtLinA8R8G8B8 = 0x12, kFmtLinX8R8G8B8 = 0x1E,
                    kFmtD24S8 = 0x2A, kFmtLinD24S8 = 0x2E;
@@ -139,6 +140,7 @@ struct Device {
         CachedTexture texture;  // the renderer's id, the shape
         uint32_t format = 0;
         uint64_t guest = 0;     // hash of the guest bytes when last rendered
+        uint32_t pitch = 0;     // bytes a row, for a linear one
     };
     std::map<uint32_t, TargetTexture> targets;
     // Depth surfaces other than the device's, as the renderer's depth
@@ -356,6 +358,7 @@ void create_device(rt::Context& c) {
                 multisample, d->renderer->device_name().c_str());
     if (multisample != kMultisampleNone && multisample != 0)
         unmodelled("Direct3D_CreateDevice", strf("multisample type %#x", multisample));
+    st(c, kDeviceStorage + kDevRefs, 1);  // the device's reference count, which Release reads
     g_device = d.release();
     st(c, kGlobalDevice, kDeviceStorage);
     mirror_device(c, *g_device);
@@ -452,6 +455,34 @@ void resource_register(rt::Context& c) {
     ret(c, c.eax, 8);
 }
 
+// ULONG D3DDevice_Release(): as the original (0x173EF0), the device's count
+// down by one, returning it; the last reference tears the device down
+// (frees its resources, zeroes it), which the game does only when it
+// shuts down, and stops the runtime here.
+void device_release(rt::Context& c) {
+    device("D3DDevice_Release");
+    const uint32_t refs = ld(c, kDeviceStorage + kDevRefs);
+    if (refs <= 1) unmodelled("D3DDevice_Release", "releasing the device's last reference (tearing it down)");
+    st(c, kDeviceStorage + kDevRefs, refs - 1);
+    ret(c, refs - 1, 0);
+}
+
+// BOOL D3DResource_IsBusy(D3DResource*): as the original (0x175AD0), busy
+// while the device holds it (an internal reference on it, or for a surface
+// on its texture); else the GPU is done with it (draws copy what they
+// read, so it never runs behind the CPU here), and its lock fence is cleared.
+void resource_is_busy(rt::Context& c) {
+    uint32_t r = arg(c, 0);
+    auto held = [&](uint32_t x) { return (ld(c, x) & kIntRefMask) != 0; };
+    if ((ld(c, r) & kTypeMask) == kTypeSurface && ld(c, r + 20)) {
+        if (held(r) || held(ld(c, r + 20))) return ret(c, 1, 4);
+        r = ld(c, r + 20);
+    }
+    if (held(r)) return ret(c, 1, 4);
+    st(c, r + 8, 0);
+    ret(c, 0, 4);
+}
+
 // VOID D3DDevice_SetVerticalBlankCallback(D3DVBLANKCALLBACK)
 void set_vertical_blank_callback(rt::Context& c) {
     device("D3DDevice_SetVerticalBlankCallback").vblank_callback = arg(c, 0);
@@ -482,6 +513,7 @@ void block_until_idle(rt::Context& c) {
 //     float Z, DWORD Stencil): the render target and depth buffer, all of
 //     them or the rectangles given (D3DRECT: x1, y1, x2, y2).
 std::pair<uint32_t, uint32_t> apply_target(rt::Context& c, Device& d, const char* fn);
+void hand_back_target(rt::Context& c, Device& d, uint32_t data);
 void clear(rt::Context& c) {
     Device& d = device("D3DDevice_Clear");
     const uint32_t count = arg(c, 0), rects = arg(c, 1), flags = arg(c, 2), color = arg(c, 3), stencil = arg(c, 5);
@@ -597,17 +629,21 @@ uint32_t pixel_offset(const SurfacePixels& p, uint32_t x, uint32_t y) {
 // between surfaces of one format (no rectangles: the whole source at 0, 0;
 // no points: each rectangle to the same place). The game copies the frame
 // it has drawn into textures this way (the book's pages show the screen
-// they turn from). A frame buffer as the source is read back from the GPU;
+// they turn from). A frame buffer as the source is read back from the GPU,
+// and a texture the GPU drew into is handed back to guest memory first;
 // the destination is written in guest memory, where the texture is decoded
-// from when it's next drawn. A frame buffer as the destination stops the runtime.
+// from when it's next drawn (or a render target's image starts from when
+// it's next drawn into). A frame buffer as the destination stops the runtime.
 void copy_rects(rt::Context& c) {
     static constexpr const char* fn = "D3DDevice_CopyRects";
     Device& d = device(fn);
     const uint32_t src = arg(c, 0), rects = arg(c, 1), count = arg(c, 2), dst = arg(c, 3), points = arg(c, 4);
     const SurfacePixels from = surface_pixels(c, d, fn, src), to = surface_pixels(c, d, fn, dst);
     if (to.frame_buffer >= 0) unmodelled(fn, "a copy into a frame buffer");
-    if (d.targets.count(to.data)) unmodelled(fn, "a copy into a texture the GPU renders into");
-    if (d.targets.count(from.data)) unmodelled(fn, "a copy from a texture the GPU renders into");
+    // Textures the GPU drew into come back to guest memory first, so the
+    // copy reads and writes what the console's memory would hold.
+    hand_back_target(c, d, from.data);
+    hand_back_target(c, d, to.data);
     if (count == 0 && rects) unmodelled(fn, "a rectangle list with no rectangles");
 
     std::vector<uint32_t> source;  // only for a frame buffer
@@ -1130,6 +1166,44 @@ void flush_cpu_frames(rt::Context& c, Device& d) {
 // and returns its size: the back buffer, or a texture's surface (made a
 // render target the first time). Drawing into the front buffer and other
 // formats stop the runtime.
+// A 32-bit texture's texels (A8R8G8B8 or X8R8G8B8, swizzled or linear)
+// as an image, and back.
+uint32_t texel_offset(uint32_t x, uint32_t y, uint32_t w, uint32_t h, bool linear, uint32_t pitch) {
+    return linear ? y * pitch + x * 4 : gfx::swizzle_offset(x, y, 0, w, h, 1) * 4;
+}
+gfx::Image guest_image(const rt::Context& c, uint32_t data, uint32_t w, uint32_t h, bool linear, uint32_t pitch) {
+    gfx::Image im;
+    im.width = w, im.height = h;
+    im.rgba.resize(size_t(w) * h * 4);
+    for (uint32_t y = 0; y < h; ++y)
+        for (uint32_t x = 0; x < w; ++x) {
+            const uint8_t* p = c.mem + data + texel_offset(x, y, w, h, linear, pitch);
+            uint8_t* o = &im.rgba[(size_t(y) * w + x) * 4];
+            o[0] = p[2], o[1] = p[1], o[2] = p[0], o[3] = p[3];
+        }
+    return im;
+}
+void image_to_guest(rt::Context& c, uint32_t data, bool linear, uint32_t pitch, const gfx::Image& im) {
+    for (uint32_t y = 0; y < im.height; ++y)
+        for (uint32_t x = 0; x < im.width; ++x) {
+            uint8_t* p = c.mem + data + texel_offset(x, y, im.width, im.height, linear, pitch);
+            const uint8_t* i = &im.rgba[(size_t(y) * im.width + x) * 4];
+            p[0] = i[2], p[1] = i[1], p[2] = i[0], p[3] = i[3];
+        }
+}
+
+// A texture the GPU drew into, handed back to guest memory: its image read
+// back into the texels, as the console's memory would hold them, and the
+// renderer's image dropped, so the memory is the texture again.
+void hand_back_target(rt::Context& c, Device& d, uint32_t data) {
+    auto it = d.targets.find(data);
+    if (it == d.targets.end()) return;
+    const Device::TargetTexture& t = it->second;
+    image_to_guest(c, data, t.texture.linear, t.pitch, d.renderer->read_render_target(t.texture.id));
+    d.renderer->destroy_texture(t.texture.id);
+    d.targets.erase(it);
+}
+
 std::pair<uint32_t, uint32_t> apply_target(rt::Context& c, Device& d, const char* fn) {
     if (!d.cpu_frames.empty()) flush_cpu_frames(c, d);
     const uint32_t target = ld(c, kDeviceStorage + kDevRenderTarget), depth = ld(c, kDeviceStorage + kDevDepth);
@@ -1167,17 +1241,25 @@ std::pair<uint32_t, uint32_t> apply_target(rt::Context& c, Device& d, const char
         }
     }
     const uint32_t data = ld(c, target + 4);
+    if (size_t(data) + size_t(w) * h * 4 > c.mem_size) unmodelled(fn, strf("a render target past the end of memory (%08X)", data));
+    const uint64_t guest = hash_bytes(c.mem + data, size_t(w) * h * 4, 0x9E3779B97F4A7C15ull);
     Device::TargetTexture& t = d.targets[data];
+    const bool linear = fmt == kFmtLinA8R8G8B8 || fmt == kFmtLinX8R8G8B8;
+    const uint32_t pitch = linear ? ((ld(c, target + 16) >> 24) + 1) * 64 : w * 4;
     if (!t.texture.id || t.texture.width != w || t.texture.height != h || t.format != fmt) {
         if (t.texture.id) d.renderer->destroy_texture(t.texture.id);
         t.texture = {};
         t.texture.id = d.renderer->create_render_target(w, h);
         t.texture.width = w, t.texture.height = h, t.texture.dims = 2;
-        t.texture.linear = fmt == kFmtLinA8R8G8B8 || fmt == kFmtLinX8R8G8B8;
+        t.texture.linear = linear;
         t.format = fmt;
+        t.pitch = pitch;
+        t.guest = ~guest;  // so its image starts as the memory's texels (below)
     }
-    if (size_t(data) + size_t(w) * h * 4 > c.mem_size) unmodelled(fn, strf("a render target past the end of memory (%08X)", data));
-    t.guest = hash_bytes(c.mem + data, size_t(w) * h * 4, 0x9E3779B97F4A7C15ull);
+    // The texels the image starts from, or that the CPU wrote since the GPU
+    // last drew: on the Xbox the GPU draws over the texture's memory.
+    if (t.guest != guest) d.renderer->write_render_target(t.texture.id, guest_image(c, data, w, h, linear, pitch));
+    t.guest = guest;
     d.renderer->set_render_target(t.texture.id, depth_id);
     return {w, h};
 }
@@ -2672,6 +2754,8 @@ constexpr D3dFn kD3d[] = {
     {"D3D_BlockOnResource", 4, block_on_resource},
     {"D3DVertexBuffer_Lock2", 8, vertex_buffer_lock2},
     {"D3DResource_Release", 4, resource_release},
+    {"D3DDevice_Release", 0, device_release},
+    {"D3DResource_IsBusy", 4, resource_is_busy},
     {"D3DResource_Register", 8, resource_register},
     {"D3DDevice_SetVerticalBlankCallback", 4, set_vertical_blank_callback},
     {"D3DDevice_SetGammaRamp", 8, set_gamma_ramp},
