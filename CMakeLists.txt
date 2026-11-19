@@ -188,4 +188,15 @@ if(QILIN_GEN_DIR)
     target_include_directories(qilin_run PRIVATE "${QILIN_GEN_DIR}")
     target_compile_definitions(qilin_run PRIVATE QILIN_CHECKED_MEMORY)  # bring-up: bad guest accesses stop with an address
     target_link_libraries(qilin_run PRIVATE qilin_host qilin_xbe)
+    if(MSVC)
+        # The generated files are large (up to 2.5 MB, hundreds of functions
+        # each): room for their sections (/bigobj); the conformance switches
+        # the rest of the project builds with; and, under Visual Studio's own
+        # generator, the files compiled in parallel (/MP), not one by one.
+        target_compile_options(qilin_run PRIVATE /bigobj /permissive- /utf-8 /Zc:__cplusplus /Zc:preprocessor)
+        target_compile_definitions(qilin_run PRIVATE _CRT_SECURE_NO_WARNINGS)
+        if(CMAKE_GENERATOR MATCHES "Visual Studio")
+            target_compile_options(qilin_run PRIVATE /MP)
+        endif()
+    endif()
 endif()
