@@ -1104,6 +1104,10 @@ gfx::StencilOp stencil_op(const char* fn, uint32_t v) {
     }
 }
 
+// D3DRS_ZBIAS's slot, which SetRenderState_ZBias keeps.
+constexpr uint32_t kRsZBiasSlot = 0x181DC4;
+// D3DRS_LINEWIDTH's slot (a float), which SetRenderState_LineWidth keeps.
+constexpr uint32_t kRsLineWidthSlot = 0x181DE4;
 // D3D's render states this needs (XDK 5659 numbering).
 enum Rs : uint32_t {
     kRsPsConstant0 = 10, kRsPsConstant1 = 18, kRsPsAlphaOutputs = 26, kRsPsRgbInputs = 34, kRsPsCompareMode = 42,
@@ -1933,6 +1937,21 @@ void issue_draw(rt::Context& c, Device& d, const char* fn, uint32_t prim, Vertic
     // D3DCULL_CW culls clockwise triangles, D3DCULL_CCW counter-clockwise
     // ones. (Checked on the attract sequence's books: the other way round,
     // pages read mirrored and the desk behind them vanishes.)
+    // D3DRS_ZBIAS, as SetRenderState_ZBias (0x171660) gives the GPU: a
+    // polygon offset of factor -ZBias/4 and units -ZBias (toward the eye
+    // for a positive bias), for points, lines and fills alike.
+    if (const int32_t zbias = int32_t(ld(c, kRsZBiasSlot))) {
+        cmd.depth_bias = -float(zbias);
+        cmd.depth_slope = -float(zbias) * 0.25f;
+    }
+    // D3DRS_LINEWIDTH, as SetRenderState_LineWidth (0x171570) gives the
+    // GPU: the width times the supersampling scale, in eighths of a pixel
+    // up to 63.875. The renderer draws at the guest's resolution, so the
+    // width as set.
+    if (prim >= 2 && prim <= 4) {
+        cmd.line_width = std::clamp(std::bit_cast<float>(ld(c, kRsLineWidthSlot)), 0.0f, 63.875f);
+        if (cmd.line_width > 1 && !d.renderer->wide_lines()) notice_once(d, "lines wider than a pixel (this GPU draws only thin lines)");
+    }
     cmd.cull = cull == 0x900 ? gfx::Cull::Clockwise : cull == 0x901 ? gfx::Cull::CounterClockwise : gfx::Cull::None;
     // The viewport's rectangle bounds what's drawn.
     cmd.scissor.x = int32_t(ld(c, dev + kDevViewport));

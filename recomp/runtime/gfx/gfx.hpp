@@ -84,6 +84,13 @@ struct DrawCmd {
     BlendOp color_op = BlendOp::Add, alpha_op = BlendOp::Add;
     uint8_t write_mask = 0xF;  // R G B A: bits 0-3
     float blend_constant[4] = {};
+    // Polygon offset, as glPolygonOffset has it: the depth moves by
+    // depth_slope times the polygon's depth slope plus depth_bias times the
+    // depth buffer's smallest step (both 0: none).
+    float depth_bias = 0, depth_slope = 0;
+    // Lines' width in pixels of the target (1 where the device draws only
+    // thin lines: wide_lines()).
+    float line_width = 1;
 
     bool depth_test = false, depth_write = false;
     Compare depth_compare = Compare::LessEqual;
@@ -154,6 +161,8 @@ public:
     // Whether create_texture takes BC1-3 blocks (TextureData::blocks): the
     // GPU samples them (desktop GPUs, Apple's); else they're decoded first.
     virtual bool takes_blocks() const = 0;
+    // Whether lines wider than a pixel are drawn (Vulkan's wideLines).
+    virtual bool wide_lines() const = 0;
     // New texels for a texture made by create_texture, of the same shape,
     // into its image (draws recorded before see the old ones); false, and
     // nothing done, for another shape.

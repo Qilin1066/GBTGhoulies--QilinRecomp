@@ -11,6 +11,15 @@ Each release is a git tag (`vX.Y.Z`) with a matching GitHub release. The version
 
 ## [Unreleased]
 
+## [0.33.4] - 2026-11-19
+
+### Fixed
+- **Shadows no longer flicker into the floor**: `D3DRS_ZBIAS` reaches the GPU as the original's `SetRenderState_ZBias` gives it (a polygon offset of factor −ZBias/4 and units −ZBias), as Vulkan's depth bias. The game draws its projected character shadows with a bias of 4 and an equal depth test against the floor they lie on; without the offset they z-fought it.
+- **Wide lines**: `D3DRS_LINEWIDTH` (the game sets 14) is the lines' width, as `SetRenderState_LineWidth` gives the GPU, where the device has Vulkan's `wideLines`; elsewhere lines stay a pixel wide and the runtime says so once.
+
+### Changed
+- Audited every render state and texture-stage state the draw path doesn't read, through the intro, the menus and play: apart from these two, the game leaves them at D3D's defaults (the multisample modes, which only set the console's supersampling, aside).
+
 ## [0.33.3] - 2026-11-19
 
 ### Fixed

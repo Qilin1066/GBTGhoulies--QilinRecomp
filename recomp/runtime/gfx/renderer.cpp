@@ -208,6 +208,9 @@ private:
     bool takes_blocks_ = false;  // BC1-3 textures sampled as they are
 public:
     bool takes_blocks() const override { return takes_blocks_; }
+    bool wide_lines() const override { return wide_lines_; }
+    bool wide_lines_ = false;
+    float line_width_max_ = 1;
     bool update_texture(uint32_t id, const TextureData& t) override;
 private:
     uint32_t unsaved_pipelines_ = 0;
@@ -231,6 +234,8 @@ private:
         VkCompareOp stencil_compare = VK_COMPARE_OP_NEVER;
         uint32_t stencil_read = 0, stencil_write = 0, stencil_ref = 0;
         float blend[4] = {};
+        bool bias_on = false;
+        float bias = 0, slope = 0, line = 0;
     } drawn_;
     struct PendingClear {  // whole-buffer clears waiting to become the pass's load operations
         bool color = false, depth = false, stencil = false;
@@ -519,6 +524,14 @@ void VulkanRenderer::create_device() {
     VkPhysicalDeviceFeatures2 f2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
     f2.pNext = &f13;
     f2.features.largePoints = have.largePoints;
+    // Lines wider than a pixel (D3D's LineWidth), where the device has them.
+    f2.features.wideLines = have.wideLines;
+    wide_lines_ = have.wideLines;
+    {
+        VkPhysicalDeviceProperties props{};
+        vkGetPhysicalDeviceProperties(gpu_, &props);
+        line_width_max_ = wide_lines_ ? props.limits.lineWidthRange[1] : 1.0f;
+    }
     // BC1-3 sampled with filtering, where the device has them; QILIN_NO_BC=1 decodes them on the CPU instead.
     if (have.textureCompressionBC && !(std::getenv("QILIN_NO_BC") && *std::getenv("QILIN_NO_BC") == '1')) {
         bool all = true;
@@ -1616,7 +1629,8 @@ VkPipeline VulkanRenderer::pipeline(const DrawCmd& c) {
     const VkDynamicState dynamic[] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR, VK_DYNAMIC_STATE_CULL_MODE, VK_DYNAMIC_STATE_FRONT_FACE,
                                       VK_DYNAMIC_STATE_DEPTH_TEST_ENABLE, VK_DYNAMIC_STATE_DEPTH_WRITE_ENABLE, VK_DYNAMIC_STATE_DEPTH_COMPARE_OP,
                                       VK_DYNAMIC_STATE_STENCIL_TEST_ENABLE, VK_DYNAMIC_STATE_STENCIL_OP, VK_DYNAMIC_STATE_STENCIL_COMPARE_MASK,
-                                      VK_DYNAMIC_STATE_STENCIL_WRITE_MASK, VK_DYNAMIC_STATE_STENCIL_REFERENCE, VK_DYNAMIC_STATE_BLEND_CONSTANTS};
+                                      VK_DYNAMIC_STATE_STENCIL_WRITE_MASK, VK_DYNAMIC_STATE_STENCIL_REFERENCE, VK_DYNAMIC_STATE_BLEND_CONSTANTS,
+                                      VK_DYNAMIC_STATE_DEPTH_BIAS_ENABLE, VK_DYNAMIC_STATE_DEPTH_BIAS, VK_DYNAMIC_STATE_LINE_WIDTH};
     VkPipelineDynamicStateCreateInfo dyn{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
     dyn.dynamicStateCount = uint32_t(std::size(dynamic));
     dyn.pDynamicStates = dynamic;
@@ -2047,6 +2061,14 @@ void VulkanRenderer::draw(const DrawCmd& c) {
         vkCmdSetStencilReference(cmd_, VK_STENCIL_FACE_FRONT_AND_BACK, c.stencil_ref), was.stencil_ref = c.stencil_ref;
     if (all || std::memcmp(was.blend, c.blend_constant, sizeof was.blend) != 0)
         vkCmdSetBlendConstants(cmd_, c.blend_constant), std::memcpy(was.blend, c.blend_constant, sizeof was.blend);
+    // ZBias (the NV2A's polygon offset): glPolygonOffset's factor and units
+    // are Vulkan's slope and constant factors.
+    const bool bias_on = c.depth_bias != 0 || c.depth_slope != 0;
+    if (all || was.bias_on != bias_on) vkCmdSetDepthBiasEnable(cmd_, bias_on), was.bias_on = bias_on;
+    if (bias_on && (all || was.bias != c.depth_bias || was.slope != c.depth_slope))
+        vkCmdSetDepthBias(cmd_, c.depth_bias, 0.0f, c.depth_slope), was.bias = c.depth_bias, was.slope = c.depth_slope;
+    const float line = wide_lines_ ? std::clamp(c.line_width, 1.0f, line_width_max_) : 1.0f;
+    if (all || was.line != line) vkCmdSetLineWidth(cmd_, line), was.line = line;
     was.valid = true;
     if (c.indices) {
         vkCmdBindIndexBuffer(cmd_, ring_, index_at, VK_INDEX_TYPE_UINT32);
