@@ -31,7 +31,7 @@ enum : uint16_t {
     LogicalNot = 168, Select = 169, IEqual = 170, INotEqual = 171, ULessThan = 176, SLessThan = 177, FOrdEqual = 180,
     FOrdNotEqual = 182, FOrdLessThan = 184, FOrdGreaterThan = 186, FOrdLessThanEqual = 188, FOrdGreaterThanEqual = 190,
     ShiftRightLogical = 194, ShiftLeftLogical = 196, BitwiseOr = 197, BitwiseAnd = 199, SelectionMerge = 247,
-    Label = 248, Branch = 249, BranchConditional = 250, Kill = 252, Return = 253,
+    DPdx = 207, DPdy = 208, Label = 248, Branch = 249, BranchConditional = 250, Kill = 252, Return = 253,
 };
 }  // namespace op
 

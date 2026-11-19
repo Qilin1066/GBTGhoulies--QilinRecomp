@@ -11,6 +11,16 @@ Each release is a git tag (`vX.Y.Z`) with a matching GitHub release. The version
 
 ## [Unreleased]
 
+## [0.30.2] - 2026-11-19
+Speed and picture quality; a 25-minute play run with nothing stopping.
+
+### Changed
+- **Descriptor sets are reused within a submission**: a draw with the same textures and samplers as an earlier one takes its set (the uniforms are dynamic offsets) instead of allocating and writing a new one. Profiling showed per-draw allocation as a cost on the game's thread (on lavapipe it maps memory).
+- **Sharp bilinear scaling** in the present pass: each window pixel samples the frame at its own position pulled towards the nearest texel centre, so texels stay solid blocks and only the pixels across a texel edge blend. At whole-number scales it is nearest-neighbour; at others no texel is a pixel wider than its neighbours, and nothing is blurred. Before, the frame was stretched with plain bilinear filtering.
+
+### Fixed
+- The differential test called it a stack imbalance when random arguments made the original and the lifted code overwrite their return address alike (a count past a local buffer's end, in WMADEC's `0x1EE165`): the original faults fetching there and the lifted code's caller would trap at its return check, so both fault. It now reports the full message with both sides' `esp` and `ebp` otherwise. WMADEC: 132 functions, 104 exercised, 0 mismatches.
+
 ## [0.30.1] - 2026-11-19
 Fixes for what lifted code could reach and stop at; a fifteen-minute run explores the mansion's upper floor with nothing stopping.
 

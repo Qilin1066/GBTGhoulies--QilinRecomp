@@ -248,6 +248,11 @@ private:
     // (staging buffers, destroyed textures) until its fence says the GPU is
     // done; cmd_, fence_, descriptor_pool_, ring_* and acquired_ are the
     // current slot's.
+    struct DescriptorKey {
+        VkImageView views[4] = {};
+        VkSampler samplers[4] = {};
+        auto operator<=>(const DescriptorKey&) const = default;
+    };
     static constexpr uint32_t kSlots = 2;
     struct Slot {
         VkCommandBuffer cmd = VK_NULL_HANDLE;
@@ -259,6 +264,7 @@ private:
         VkSemaphore acquired = VK_NULL_HANDLE;
         std::vector<Texture> dead;
         std::vector<std::pair<VkBuffer, VkDeviceMemory>> staging;
+        std::map<DescriptorKey, VkDescriptorSet> sets;  // allocated from `pool` this submission
         bool pending = false;
     };
     Slot slots_[kSlots];
@@ -991,18 +997,39 @@ std::vector<uint32_t> present_vs() {
     return b.finish({in, pos, out});
 }
 // The frame, filtered, then each channel through its table (texel i at (i + 0.5) / 256).
-std::vector<uint32_t> present_fs() {
+// The frame (width × height) scaled into the window: sharp bilinear. Each
+// window pixel samples the frame at its own position, moved towards the
+// nearest texel centre so that whole texels come out as solid blocks and
+// only the window pixels across a texel edge blend the two (by how much of
+// the pixel each covers); at whole-number scales that is nearest-neighbour,
+// at others no texel is wider than its neighbours by a pixel, and nothing
+// is blurred. Then each channel through the gamma ramp.
+std::vector<uint32_t> present_fs(uint32_t width, uint32_t height) {
     namespace op = spv::op;
+    namespace glsl = spv::glsl;
     spv::Builder b{spv::Stage::Fragment};
     const spv::Id f = b.t_float(), v2 = b.t_vec(2), v4 = b.t_vec(4), s2 = b.t_sampler2d();
     const spv::Id in = b.input(v4, 0);
     const spv::Id uv = b.load(v4, in);
     const spv::Id frame = b.load(s2, b.sampler(s2, 0, 0)), ramp = b.load(s2, b.sampler(s2, 0, 1));
-    const spv::Id c = b.op(op::ImageSampleImplicitLod, v4, {frame, b.shuffle(v2, uv, uv, {0, 1})});
+    auto axis = [&](uint32_t k, float size, uint16_t deriv) {
+        const spv::Id texel = b.op(op::FMul, f, {b.extract(f, uv, k), b.c_float(size)});
+        // Window pixels per texel along this axis, at least 1.
+        const spv::Id per_pixel = b.ext(glsl::FAbs, f, {b.op(deriv, f, {texel})});
+        const spv::Id scale = b.ext(glsl::FMax, f, {b.op(op::FDiv, f, {b.c_float(1), b.ext(glsl::FMax, f, {per_pixel, b.c_float(1e-6f)})}), b.c_float(1)});
+        const spv::Id base = b.ext(glsl::Floor, f, {texel});
+        const spv::Id centre = b.op(op::FSub, f, {b.op(op::FSub, f, {texel, base}), b.c_float(0.5f)});
+        const spv::Id range = b.op(op::FSub, f, {b.c_float(0.5f), b.op(op::FDiv, f, {b.c_float(0.5f), scale})});
+        const spv::Id held = b.ext(glsl::FClamp, f, {centre, b.op(op::FNegate, f, {range}), range});
+        const spv::Id moved = b.op(op::FAdd, f, {b.op(op::FMul, f, {b.op(op::FSub, f, {centre, held}), scale}), b.c_float(0.5f)});
+        return b.op(op::FDiv, f, {b.op(op::FAdd, f, {base, moved}), b.c_float(size)});
+    };
+    const spv::Id at = b.op(op::CompositeConstruct, v2, {axis(0, float(width), op::DPdx), axis(1, float(height), op::DPdy)});
+    const spv::Id c = b.op(op::ImageSampleImplicitLod, v4, {frame, at});
     auto through = [&](uint32_t k) {
         const spv::Id x = b.op(op::FAdd, f, {b.op(op::FMul, f, {b.extract(f, c, k), b.c_float(255.0f / 256.0f)}), b.c_float(0.5f / 256.0f)});
-        const spv::Id at = b.op(op::CompositeConstruct, v2, {x, b.c_float(0.5f)});
-        return b.extract(f, b.op(op::ImageSampleImplicitLod, v4, {ramp, at}), k);
+        const spv::Id pos = b.op(op::CompositeConstruct, v2, {x, b.c_float(0.5f)});
+        return b.extract(f, b.op(op::ImageSampleImplicitLod, v4, {ramp, pos}), k);
     };
     const spv::Id out = b.output(v4, 0);
     b.store(out, b.vec4(through(0), through(1), through(2), b.c_float(1)));
@@ -1046,7 +1073,7 @@ VkPipeline VulkanRenderer::present_pipeline() {
         pl.setLayoutCount = 1;
         pl.pSetLayouts = &present_set_layout_;
         check(vkCreatePipelineLayout(device_, &pl, nullptr, &present_layout_), "vkCreatePipelineLayout");
-        const std::vector<uint32_t> code[2] = {present_vs(), present_fs()};
+        const std::vector<uint32_t> code[2] = {present_vs(), present_fs(config_.width, config_.height)};
         for (int i = 0; i < 2; ++i) {
             VkShaderModuleCreateInfo mi{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
             mi.codeSize = code[i].size() * 4;
@@ -1380,6 +1407,7 @@ void VulkanRenderer::retire(uint32_t i) {
         check(vkResetFences(device_, 1, &sl.fence), "vkResetFences");
         sl.pending = false;
         vkResetDescriptorPool(device_, sl.pool, 0);
+        sl.sets.clear();
     }
     for (Texture& t : sl.dead) {
         vkDestroyImageView(device_, t.view, nullptr);
@@ -1744,44 +1772,59 @@ void VulkanRenderer::draw(const DrawCmd& c) {
     // (A ring flush above may have ended the pass: make sure it's open.)
     begin_pass();
 
-    VkDescriptorSetAllocateInfo ai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
-    ai.descriptorPool = descriptor_pool_;
-    ai.descriptorSetCount = 1;
-    ai.pSetLayouts = &set_layout_;
-    VkDescriptorSet set = VK_NULL_HANDLE;
-    if (vkAllocateDescriptorSets(device_, &ai, &set) != VK_SUCCESS) {  // the pool is spent: start a new submission
-        end_pass();
-        submit();
-        record();
-        begin_pass();
-        check(vkAllocateDescriptorSets(device_, &ai, &set), "vkAllocateDescriptorSets");
-    }
-    VkDescriptorBufferInfo ub[2] = {{ring_, 0, vs_bytes}, {ring_, 0, fs_bytes}};
+    // The descriptor set: the ring's two uniform blocks (dynamic offsets per
+    // draw) and the four textures. Draws with the same textures and samplers
+    // in a submission share one set (the slot's cache, emptied with its pool).
+    DescriptorKey key{};
     VkDescriptorImageInfo images[kSamplers]{};
-    VkWriteDescriptorSet writes[2 + kSamplers]{};
-    uint32_t nw = 0;
-    for (uint32_t i = 0; i < 2; ++i) {
-        writes[nw].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        writes[nw].dstSet = set;
-        writes[nw].dstBinding = i;
-        writes[nw].descriptorCount = 1;
-        writes[nw].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC;
-        writes[nw++].pBufferInfo = &ub[i];
-    }
     for (uint32_t i = 0; i < kSamplers; ++i) {
         VkImageView view = VK_NULL_HANDLE;
         if (auto it = textures_.find(c.textures[i]); it != textures_.end()) view = it->second.view;
         else if (auto rt = render_targets_.find(c.textures[i]); rt != render_targets_.end()) view = rt->second.view;
         if (!view) continue;
         images[i] = {sampler(c.samplers[i]), view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
-        writes[nw].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        writes[nw].dstSet = set;
-        writes[nw].dstBinding = 2 + i;
-        writes[nw].descriptorCount = 1;
-        writes[nw].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-        writes[nw++].pImageInfo = &images[i];
+        key.views[i] = view, key.samplers[i] = images[i].sampler;
     }
-    vkUpdateDescriptorSets(device_, nw, writes, 0, nullptr);
+    VkDescriptorSet set = VK_NULL_HANDLE;
+    auto& cache = slots_[slot_].sets;
+    if (auto hit = cache.find(key); hit != cache.end()) {
+        set = hit->second;
+    } else {
+        VkDescriptorSetAllocateInfo ai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+        ai.descriptorPool = descriptor_pool_;
+        ai.descriptorSetCount = 1;
+        ai.pSetLayouts = &set_layout_;
+        if (vkAllocateDescriptorSets(device_, &ai, &set) != VK_SUCCESS) {  // the pool is spent: start a new submission
+            end_pass();
+            submit();
+            record();
+            begin_pass();
+            ai.descriptorPool = descriptor_pool_;
+            check(vkAllocateDescriptorSets(device_, &ai, &set), "vkAllocateDescriptorSets");
+        }
+        VkDescriptorBufferInfo ub[2] = {{ring_, 0, vs_bytes}, {ring_, 0, fs_bytes}};
+        VkWriteDescriptorSet writes[2 + kSamplers]{};
+        uint32_t nw = 0;
+        for (uint32_t i = 0; i < 2; ++i) {
+            writes[nw].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            writes[nw].dstSet = set;
+            writes[nw].dstBinding = i;
+            writes[nw].descriptorCount = 1;
+            writes[nw].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC;
+            writes[nw++].pBufferInfo = &ub[i];
+        }
+        for (uint32_t i = 0; i < kSamplers; ++i) {
+            if (!images[i].imageView) continue;
+            writes[nw].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            writes[nw].dstSet = set;
+            writes[nw].dstBinding = 2 + i;
+            writes[nw].descriptorCount = 1;
+            writes[nw].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+            writes[nw++].pImageInfo = &images[i];
+        }
+        vkUpdateDescriptorSets(device_, nw, writes, 0, nullptr);
+        slots_[slot_].sets.emplace(key, set);
+    }
 
     vkCmdBindPipeline(cmd_, VK_PIPELINE_BIND_POINT_GRAPHICS, pl);
     vkCmdBindDescriptorSets(cmd_, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_layout_, 0, 1, &set, 2, uniform_offsets);

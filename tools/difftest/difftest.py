@@ -719,8 +719,15 @@ class Runner:
             result = "skip"  # an unlifted callee ran past the budget
         elif rc == 4:
             result, detail = "fail", err.value.decode()
+        elif rc == 0 and status == "fault" and ctx.ret_to != SENTINEL and uc_eip(uc) == ctx.ret_to:
+            # Both overwrote their own return address (random arguments that
+            # overrun a local buffer) and went to the same place: the
+            # original faulted fetching there, the lifted code's caller
+            # would trap at the return check.
+            result = "fault-both"
         elif rc == 0 and ctx.ret_to != SENTINEL:
-            result, detail = "fail", f"returns to {ctx.ret_to:08X} instead of its caller (stack imbalance: not a whole function?)"
+            result, detail = "fail", (f"returns to {ctx.ret_to:08X} instead of its caller (stack imbalance: not a whole function?)"
+                                      f" [original esp={uc_regs[4]:08X} ebp={uc_regs[5]:08X}; lifted esp={ctx.esp:08X} ebp={ctx.ebp:08X}]")
         elif status == "budget":
             result = "skip"
         elif status == "fault":
