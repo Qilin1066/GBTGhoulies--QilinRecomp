@@ -140,6 +140,7 @@ struct D3dConfig {
     std::string dump_dir;     // write each presented frame there as frame_NNNNN.png (--dump-frames)
     uint64_t max_frames = 0;  // stop after this many frames, 0 for never (--frames)
     int gpu = -1;             // Vulkan device index, -1 for the best one (--gpu)
+    std::string pipeline_cache;  // the renderer's compiled pipelines between runs, in the data directory
     platform::Window* window = nullptr;  // where frames are shown; none with --headless
     platform::Input* input = nullptr;    // controllers, whose events the window's pump passes on
 };

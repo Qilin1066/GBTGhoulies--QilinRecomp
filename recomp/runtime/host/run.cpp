@@ -291,6 +291,8 @@ int main(int argc, char** argv) {
     d3d.window = window.get();
     d3d.input = input.get();
     host::register_xinput(input.get());
+    // Outside the partitions, so the game's disk never sees it.
+    d3d.pipeline_cache = ((data_dir ? std::filesystem::path(data_dir) : default_data_dir()) / "vulkan_pipelines.cache").string();
     host::register_d3d(d3d);
     // Sound: the mixer's output to the default playback device, unless asked not to.
     std::unique_ptr<platform::AudioOut> sound;

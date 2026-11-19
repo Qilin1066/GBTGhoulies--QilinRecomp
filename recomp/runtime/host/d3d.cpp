@@ -97,6 +97,11 @@ struct Device {
     uint32_t depth = 0;                   // guest surface, or 0
     uint32_t vblank_callback = 0, vblank_data = 0;
     uint32_t vblanks = 0, swaps = 0;
+    // Bumped whenever the CPU may have changed a resource's memory: a lock
+    // or a destroy (both reach D3D_BlockOnResource), or a CopyRects. A
+    // render target's memory is compared again only after one of these,
+    // or once a frame (as textures are).
+    uint32_t memory_epoch = 0;
     std::chrono::steady_clock::time_point epoch;  // vblank 0
     uint8_t gamma[3][256];
     uint32_t heap = 0, heap_used = 0, heap_size = 0;  // guest memory for resource headers
@@ -125,7 +130,7 @@ struct Device {
     std::unordered_map<uint64_t, std::vector<uint32_t>> shaders;
     struct CachedTexture {
         uint32_t id = 0;
-        uint64_t content = 0;  // a hash of the texels when uploaded
+        std::vector<uint8_t> texels;  // the guest's texels when uploaded, compared byte for byte
         uint32_t checked = ~0u;  // the frame the texels were last compared
         uint32_t dims = 2;
         bool linear = false;
@@ -141,6 +146,7 @@ struct Device {
         uint32_t format = 0;
         uint64_t guest = 0;     // hash of the guest bytes when last rendered
         uint32_t pitch = 0;     // bytes a row, for a linear one
+        uint32_t checked_swap = ~0u, checked_epoch = ~0u;  // when guest was last compared with the memory
     };
     std::map<uint32_t, TargetTexture> targets;
     // Depth surfaces other than the device's, as the renderer's depth
@@ -326,6 +332,7 @@ void create_device(rt::Context& c) {
     gc.back_buffers = count;
     gc.depth_stencil = auto_depth != 0;
     gc.gpu = d->config.gpu;
+    gc.pipeline_cache = d->config.pipeline_cache;
     if (platform::Window* w = d->config.window) {
         gc.surface.instance_extensions = w->vulkan_instance_extensions();
         gc.surface.loader = w->vulkan_loader();
@@ -407,6 +414,7 @@ void get_render_target2(rt::Context& c) {
 void cpu_frame_to_guest(rt::Context& c, Device& d, uint32_t index);
 void flush_cpu_frames(rt::Context& c, Device& d);
 void block_on_resource(rt::Context& c) {
+    if (g_device) ++g_device->memory_epoch;
     if (g_device)
         for (uint32_t i = 0; i < g_device->frame_buffers.size(); ++i)
             if (g_device->frame_buffers[i] == arg(c, 0)) cpu_frame_to_guest(c, *g_device, i);
@@ -637,6 +645,7 @@ uint32_t pixel_offset(const SurfacePixels& p, uint32_t x, uint32_t y) {
 void copy_rects(rt::Context& c) {
     static constexpr const char* fn = "D3DDevice_CopyRects";
     Device& d = device(fn);
+    ++d.memory_epoch;  // the destination's memory changes
     const uint32_t src = arg(c, 0), rects = arg(c, 1), count = arg(c, 2), dst = arg(c, 3), points = arg(c, 4);
     const SurfacePixels from = surface_pixels(c, d, fn, src), to = surface_pixels(c, d, fn, dst);
     if (to.frame_buffer >= 0) unmodelled(fn, "a copy into a frame buffer");
@@ -811,6 +820,7 @@ void notice_once(Device& d, const std::string& what) {
     std::printf("qilin_run: D3D: %s isn't drawn yet\n", what.c_str());
 }
 
+
 // ---- Vertices: each hardware attribute as vec4 floats, NV2A formats
 // converted as the hardware reads them; missing components (0, 0, 0, 1).
 struct Vertices {
@@ -862,6 +872,38 @@ void convert_attribute(const uint8_t* p, uint32_t format, float* out) {
     }
 }
 
+// A run of `count` attributes `stride` bytes apart, as convert_attribute
+// converts each, with the format chosen once for the run.
+void convert_attribute_run(const uint8_t* p, uint32_t stride, uint32_t count, uint32_t format, float* out) {
+    const uint32_t type = format & 0xF, size = (format >> 4) & 0xF;
+    if (type == 2 && size >= 1 && size <= 4) {  // F: the common case, floats copied
+        for (uint32_t i = 0; i < count; ++i, p += stride, out += 4) {
+            out[0] = out[1] = out[2] = 0, out[3] = 1;
+            std::memcpy(out, p, 4 * size);
+        }
+    } else if (type == 0 && size == 4) {  // UB_D3D colour
+        for (uint32_t i = 0; i < count; ++i, p += stride, out += 4)
+            out[0] = p[2] / 255.0f, out[1] = p[1] / 255.0f, out[2] = p[0] / 255.0f, out[3] = p[3] / 255.0f;
+    } else {
+        for (uint32_t i = 0; i < count; ++i, p += stride, out += 4) convert_attribute(p, format, out);
+    }
+}
+
+// Vertices' buffers are kept for the next draw rather than freed (a draw
+// is several of them, many times a frame). One spare set per host thread.
+thread_local Vertices t_spare_vertices;
+thread_local std::vector<uint32_t> t_spare_sequence;
+Vertices take_vertices() {
+    Vertices v = std::move(t_spare_vertices);
+    v.count = v.mask = 0;
+    return v;
+}
+std::vector<uint32_t> take_sequence(uint32_t n) {
+    std::vector<uint32_t> s = std::move(t_spare_sequence);
+    s.resize(n);
+    return s;
+}
+
 // The shader object's hardware attributes in order: slot n's {stream, offset, format}.
 struct Slot {
     uint32_t stream, offset, format, bytes;
@@ -882,10 +924,9 @@ std::array<Slot, 16> slots(rt::Context& c, const char* fn) {
 
 Vertices vertex_arrays(rt::Context& c, const char* fn, uint32_t base, uint32_t first, uint32_t count) {
     if (ld(c, kDirtyFlags) & 0x40000000u) unmodelled(fn, "a draw from SetVertexShaderInput streams");
-    Vertices v;
+    Vertices v = take_vertices();
     v.count = count;
     const auto sl = slots(c, fn);
-    std::vector<uint8_t> buf;
     for (uint32_t n = 0; n < 16; ++n) {
         if (!sl[n].bytes) continue;
         const uint32_t entry = 0x1842A0 + 12 * sl[n].stream;
@@ -894,11 +935,12 @@ Vertices vertex_arrays(rt::Context& c, const char* fn, uint32_t base, uint32_t f
         const uint32_t at = ld(c, vb + 4) + ld(c, entry + 4) + sl[n].offset + stride * (base + first);
         v.mask |= 1u << n;
         v.attr[n].resize(size_t(count) * 4);
-        buf.resize(sl[n].bytes);
-        for (uint32_t i = 0; i < count; ++i) {
-            for (uint32_t b = 0; b < sl[n].bytes; ++b) buf[b] = rt::ld8(mem(c), at + stride * i + b, 0);
-            convert_attribute(buf.data(), sl[n].format, &v.attr[n][size_t(i) * 4]);
-        }
+        if (!count) continue;
+        // The whole run, checked once (as the byte loads it replaces were), then read in place.
+        const uint64_t span = uint64_t(stride) * (count - 1) + sl[n].bytes;
+        if (uint64_t(at) + span > 0x100000000ull) unmodelled(fn, strf("vertex attribute %u runs past 4 GB", n));
+        rt::check(mem(c), at, span, 0);
+        convert_attribute_run(mem(c).base + at, stride, count, sl[n].format, v.attr[n].data());
     }
     return v;
 }
@@ -910,14 +952,14 @@ Vertices inline_vertices(rt::Context& c, const char* fn, const std::vector<uint3
     uint32_t stride = 0;
     for (const Slot& s : sl) stride += s.bytes;
     if (!stride || stride % 4) unmodelled(fn, strf("inline vertices of %u bytes", stride));
-    Vertices v;
+    Vertices v = take_vertices();
     v.count = uint32_t(dwords.size() * 4 / stride);
     const auto* bytes = reinterpret_cast<const uint8_t*>(dwords.data());
     for (uint32_t n = 0, off = 0; n < 16; ++n) {
         if (!sl[n].bytes) continue;
         v.mask |= 1u << n;
         v.attr[n].resize(size_t(v.count) * 4);
-        for (uint32_t i = 0; i < v.count; ++i) convert_attribute(bytes + size_t(i) * stride + off, sl[n].format, &v.attr[n][size_t(i) * 4]);
+        convert_attribute_run(bytes + off, stride, v.count, sl[n].format, v.attr[n].data());
         off += sl[n].bytes;
     }
     return v;
@@ -956,8 +998,22 @@ gfx::Primitive convert_primitive(const char* fn, uint32_t prim, std::vector<uint
     return gfx::Primitive::Triangles;
 }
 
+// Four independent lanes over 32-byte blocks (a serial chain of multiplies
+// is bound by their latency; the lanes overlap), folded into h, then the
+// rest 8 bytes at a time.
 uint64_t hash_bytes(const uint8_t* p, size_t n, uint64_t h = 0x9E3779B97F4A7C15ull) {
     size_t i = 0;
+    if (n >= 64) {
+        uint64_t lane[4] = {h, h ^ 0x632BE59BD9B4E019ull, h ^ 0x85EBCA77C2B2AE63ull, h ^ 0x27D4EB2F165667C5ull};
+        for (; i + 32 <= n; i += 32)
+            for (int k = 0; k < 4; ++k) {
+                uint64_t w;
+                std::memcpy(&w, p + i + 8 * k, 8);
+                lane[k] = (lane[k] ^ w) * 0xFF51AFD7ED558CCDull;
+                lane[k] ^= lane[k] >> 32;
+            }
+        for (int k = 0; k < 4; ++k) h = (h ^ lane[k]) * 0xC4CEB9FE1A85EC53ull, h ^= h >> 29;
+    }
     for (; i + 8 <= n; i += 8) {
         uint64_t w;
         std::memcpy(&w, p + i, 8);
@@ -1058,12 +1114,12 @@ const Device::CachedTexture* stage_texture(rt::Context& c, Device& d, const char
     Device::CachedTexture& e = d.textures[key];
     if (e.id && e.checked == d.swaps) return &e;
     const uint8_t* texels = c.mem + data;
-    const uint64_t h = hash_bytes(texels, shape.bytes) ^ palette_hash;
-    if (!e.id || e.content != h) {
+    const bool same = e.id && e.texels.size() == shape.bytes && std::memcmp(e.texels.data(), texels, shape.bytes) == 0;
+    if (!same) {
         if (e.id) d.renderer->destroy_texture(e.id);
         const gfx::TextureData t = gfx::decode_texture(shape, texels, shape.palettized ? palette : nullptr);
         e.id = d.renderer->create_texture(t);
-        e.content = h;
+        e.texels.assign(texels, texels + shape.bytes);
         e.dims = t.dims(), e.linear = t.linear, e.width = t.width, e.height = t.height, e.depth = t.depth;
     }
     e.checked = d.swaps;
@@ -1242,8 +1298,9 @@ std::pair<uint32_t, uint32_t> apply_target(rt::Context& c, Device& d, const char
     }
     const uint32_t data = ld(c, target + 4);
     if (size_t(data) + size_t(w) * h * 4 > c.mem_size) unmodelled(fn, strf("a render target past the end of memory (%08X)", data));
-    const uint64_t guest = hash_bytes(c.mem + data, size_t(w) * h * 4, 0x9E3779B97F4A7C15ull);
     Device::TargetTexture& t = d.targets[data];
+    const bool compare = !t.texture.id || t.checked_swap != d.swaps || t.checked_epoch != d.memory_epoch;
+    const uint64_t guest = compare ? hash_bytes(c.mem + data, size_t(w) * h * 4, 0x9E3779B97F4A7C15ull) : t.guest;
     const bool linear = fmt == kFmtLinA8R8G8B8 || fmt == kFmtLinX8R8G8B8;
     const uint32_t pitch = linear ? ((ld(c, target + 16) >> 24) + 1) * 64 : w * 4;
     if (!t.texture.id || t.texture.width != w || t.texture.height != h || t.format != fmt) {
@@ -1260,6 +1317,7 @@ std::pair<uint32_t, uint32_t> apply_target(rt::Context& c, Device& d, const char
     // last drew: on the Xbox the GPU draws over the texture's memory.
     if (t.guest != guest) d.renderer->write_render_target(t.texture.id, guest_image(c, data, w, h, linear, pitch));
     t.guest = guest;
+    t.checked_swap = d.swaps, t.checked_epoch = d.memory_epoch;
     d.renderer->set_render_target(t.texture.id, depth_id);
     return {w, h};
 }
@@ -1274,12 +1332,14 @@ const Device::CachedTexture* target_texture(rt::Context& c, Device& d, uint32_t 
     const uint32_t format = ld(c, tex + 12), fmt = (format >> 8) & 0xFF;
     const auto [w, h] = surface_size(c, tex);
     const bool same_shape = fmt == t.format && w == t.texture.width && h == t.texture.height && ((format >> 16) & 0xF) <= 1;
-    const bool cpu_wrote = hash_bytes(c.mem + data, size_t(t.texture.width) * t.texture.height * 4, 0x9E3779B97F4A7C15ull) != t.guest;
+    const bool compare = t.checked_swap != d.swaps || t.checked_epoch != d.memory_epoch;
+    const bool cpu_wrote = compare && hash_bytes(c.mem + data, size_t(t.texture.width) * t.texture.height * 4, 0x9E3779B97F4A7C15ull) != t.guest;
     if (!same_shape || cpu_wrote) {  // the memory holds something else now
         d.renderer->destroy_texture(t.texture.id);
         d.targets.erase(it);
         return nullptr;
     }
+    t.checked_swap = d.swaps, t.checked_epoch = d.memory_epoch;
     return &t.texture;
 }
 
@@ -1700,7 +1760,8 @@ void issue_draw(rt::Context& c, Device& d, const char* fn, uint32_t prim, Vertic
     cs.input_texture = rs(kRsPsInputTexture), cs.dot_mapping = rs(kRsPsDotMapping), cs.compare_mode = rs(kRsPsCompareMode);
     cs.alpha_func = rs(kRsAlphaTestEnable) ? rs(kRsAlphaFunc) : 0;
 
-    std::vector<float> fsu(gfx::nv2a::kFsUniformVec4s * 4, 0.0f);
+    thread_local std::vector<float> fsu;
+    fsu.assign(gfx::nv2a::kFsUniformVec4s * 4, 0.0f);
     const bool fixed_pixels = !ld(c, dev + 0x780);  // no pixel shader: the texture-stage operations
     if (fixed_pixels) {
         fixed_function_combiners(c, fn, cs, fsu);
@@ -1762,7 +1823,8 @@ void issue_draw(rt::Context& c, Device& d, const char* fn, uint32_t prim, Vertic
     fsu[gfx::nv2a::kFsAlphaRef * 4] = float(rs(kRsAlphaRef) & 0xFF);
 
     // Vertex constants, with the viewport's and the renderer's own.
-    std::vector<float> vsu(gfx::nv2a::kVsUniformVec4s * 4, 0.0f);
+    thread_local std::vector<float> vsu;
+    vsu.assign(gfx::nv2a::kVsUniformVec4s * 4, 0.0f);
     std::memcpy(vsu.data(), d.vs_constants, sizeof d.vs_constants);
     viewport_constants(c, &vsu[58 * 4], &vsu[59 * 4]);  // c-38, c-37
     if (fixed_function && (ld(c, kDirtyFlags) & 0x80000000u)) {
@@ -1843,10 +1905,12 @@ void issue_draw(rt::Context& c, Device& d, const char* fn, uint32_t prim, Vertic
     cmd.vs_uniforms = vsu.data();
     cmd.fs_uniforms = fsu.data();
     d.renderer->draw(cmd);
+    t_spare_vertices = std::move(v);
+    t_spare_sequence = std::move(seq);
 }
 
 std::vector<uint32_t> identity_sequence(uint32_t n) {
-    std::vector<uint32_t> s(n);
+    std::vector<uint32_t> s = take_sequence(n);
     for (uint32_t i = 0; i < n; ++i) s[i] = i;
     return s;
 }
@@ -1907,7 +1971,7 @@ void draw_indexed_vertices(rt::Context& c) {
     const uint32_t primitive = arg(c, 0), count = arg(c, 1), index_data = arg(c, 2);
     const uint32_t base = ld(c, kDeviceStorage + 0x1C);
     consume_dirty_state(c, base);
-    std::vector<uint32_t> indices(count);
+    std::vector<uint32_t> indices = take_sequence(count);
     uint32_t lo = 0xFFFF, hi = 0;
     for (uint32_t k = 0; k < count; ++k) {
         indices[k] = rt::ld16(mem(c), index_data + 2 * k, 0);

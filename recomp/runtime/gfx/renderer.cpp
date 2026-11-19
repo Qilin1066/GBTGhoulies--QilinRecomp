@@ -9,6 +9,9 @@
 // operation, which is what tile-based GPUs (Raspberry Pi, Apple) want; a
 // clear inside a pass, or of a rectangle, is a vkCmdClearAttachments.
 #include <algorithm>
+#include <chrono>
+#include <filesystem>
+#include <fstream>
 #include <bit>
 #include <cstdio>
 #include <cstdlib>
@@ -198,6 +201,31 @@ private:
     VkDeviceSize readback_size_ = 0;
 
     bool recording_ = false, pass_open_ = false;
+    // Vulkan's pipeline cache, loaded from config_.pipeline_cache and saved
+    // there a few seconds after the last new pipeline (and at the end).
+    VkPipelineCache pipeline_cache_ = VK_NULL_HANDLE;
+    uint32_t unsaved_pipelines_ = 0;
+    std::chrono::steady_clock::time_point last_pipeline_{};
+    void load_pipeline_cache();
+    void save_pipeline_cache();
+    // The state draw() last set in the command buffer being recorded, so a
+    // draw sets only what changed. Forgotten when a command buffer begins
+    // and when another pipeline (the present pass's) is bound, which sets
+    // its own static state.
+    struct DrawState {
+        bool valid = false;
+        VkPipeline pipeline = VK_NULL_HANDLE;
+        VkViewport viewport{};
+        VkRect2D scissor{};
+        VkCullModeFlags cull = 0;
+        VkFrontFace front = VK_FRONT_FACE_CLOCKWISE;
+        bool depth_test = false, depth_write = false, stencil_test = false;
+        VkCompareOp depth_compare = VK_COMPARE_OP_NEVER;
+        VkStencilOp stencil_fail = VK_STENCIL_OP_KEEP, stencil_pass = VK_STENCIL_OP_KEEP, stencil_depth_fail = VK_STENCIL_OP_KEEP;
+        VkCompareOp stencil_compare = VK_COMPARE_OP_NEVER;
+        uint32_t stencil_read = 0, stencil_write = 0, stencil_ref = 0;
+        float blend[4] = {};
+    } drawn_;
     struct PendingClear {  // whole-buffer clears waiting to become the pass's load operations
         bool color = false, depth = false, stencil = false;
         VkClearColorValue color_value{};
@@ -487,6 +515,7 @@ void VulkanRenderer::create_device() {
     check(vkCreateDevice(gpu_, &info, nullptr, &device_), "vkCreateDevice");
     volkLoadDevice(device_);
     vkGetDeviceQueue(device_, queue_family_, 0, &queue_);
+    load_pipeline_cache();
 
     VkCommandPoolCreateInfo pool{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
     pool.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
@@ -610,6 +639,8 @@ void VulkanRenderer::destroy() {
         for (Texture& t : dead_textures_) drop_texture(t);
         for (auto& [b, m] : staging_) vkDestroyBuffer(device_, b, nullptr), vkFreeMemory(device_, m, nullptr);
         for (uint32_t i = 0; i < kSlots; ++i) retire(i);
+        save_pipeline_cache();
+        if (pipeline_cache_) vkDestroyPipelineCache(device_, pipeline_cache_, nullptr);
         for (auto& [k, pl] : pipelines_) vkDestroyPipeline(device_, pl, nullptr);
         for (auto& [k, m] : shaders_) vkDestroyShaderModule(device_, m, nullptr);
         for (auto& [d, smp] : samplers_) vkDestroySampler(device_, smp, nullptr);
@@ -643,6 +674,7 @@ void VulkanRenderer::record() {
     begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     check(vkBeginCommandBuffer(cmd_, &begin), "vkBeginCommandBuffer");
     recording_ = true;
+    drawn_.valid = false;
 }
 
 void VulkanRenderer::transition(Target& t, VkImageLayout to) {
@@ -782,7 +814,51 @@ void VulkanRenderer::submit(VkSemaphore wait, VkSemaphore signal) {
     use_slot(next);
 }
 
+// The cache file is the driver's data as vkGetPipelineCacheData gives it.
+// Its header names the vendor, device and driver build (the cache UUID);
+// a file from another GPU or driver is left unread, as the driver would
+// ignore it anyway, and some drivers don't take foreign data well.
+void VulkanRenderer::load_pipeline_cache() {
+    std::vector<char> data;
+    if (!config_.pipeline_cache.empty()) {
+        std::ifstream in(config_.pipeline_cache, std::ios::binary);
+        if (in) data.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+        VkPhysicalDeviceProperties props{};
+        vkGetPhysicalDeviceProperties(gpu_, &props);
+        uint32_t header[4] = {};
+        if (data.size() >= 32) std::memcpy(header, data.data(), sizeof header);
+        const bool ours = data.size() >= 32 && header[0] >= 32 && header[1] == VK_PIPELINE_CACHE_HEADER_VERSION_ONE &&
+                          header[2] == props.vendorID && header[3] == props.deviceID &&
+                          std::memcmp(data.data() + 16, props.pipelineCacheUUID, VK_UUID_SIZE) == 0;
+        if (!ours) data.clear();
+    }
+    VkPipelineCacheCreateInfo info{VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO};
+    info.initialDataSize = data.size();
+    info.pInitialData = data.empty() ? nullptr : data.data();
+    if (vkCreatePipelineCache(device_, &info, nullptr, &pipeline_cache_) != VK_SUCCESS) pipeline_cache_ = VK_NULL_HANDLE;
+}
+
+// Written to a new file and renamed over the old one, so a run stopped
+// halfway leaves the last whole cache.
+void VulkanRenderer::save_pipeline_cache() {
+    if (!pipeline_cache_ || !unsaved_pipelines_ || config_.pipeline_cache.empty()) return;
+    size_t size = 0;
+    if (vkGetPipelineCacheData(device_, pipeline_cache_, &size, nullptr) != VK_SUCCESS || !size) return;
+    std::vector<char> data(size);
+    if (vkGetPipelineCacheData(device_, pipeline_cache_, &size, data.data()) != VK_SUCCESS) return;
+    const std::filesystem::path to(config_.pipeline_cache), tmp = to.string() + ".new";
+    std::error_code ec;
+    std::filesystem::create_directories(to.parent_path(), ec);
+    {
+        std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
+        if (!out.write(data.data(), std::streamsize(size))) return;
+    }
+    std::filesystem::rename(tmp, to, ec);
+    if (!ec) unsaved_pipelines_ = 0;
+}
+
 void VulkanRenderer::present() {
+    if (unsaved_pipelines_ && std::chrono::steady_clock::now() - last_pipeline_ > std::chrono::seconds(5)) save_pipeline_cache();
     end_pass();
     if (surface_) show(color_[back_]);
     else submit();
@@ -1131,7 +1207,7 @@ VkPipeline VulkanRenderer::present_pipeline() {
     info.pColorBlendState = &cb;
     info.pDynamicState = &dyn;
     info.layout = present_layout_;
-    check(vkCreateGraphicsPipelines(device_, VK_NULL_HANDLE, 1, &info, nullptr, &present_pipeline_), "vkCreateGraphicsPipelines");
+    check(vkCreateGraphicsPipelines(device_, pipeline_cache_, 1, &info, nullptr, &present_pipeline_), "vkCreateGraphicsPipelines");
     present_format_ = swap_format_;
     return present_pipeline_;
 }
@@ -1207,6 +1283,7 @@ void VulkanRenderer::present_through_pass(Target& frame, uint32_t index, int32_t
     info.pColorAttachments = &color;
     vkCmdBeginRendering(cmd_, &info);
     vkCmdBindPipeline(cmd_, VK_PIPELINE_BIND_POINT_GRAPHICS, pl);
+    drawn_.valid = false;
     vkCmdBindDescriptorSets(cmd_, VK_PIPELINE_BIND_POINT_GRAPHICS, present_layout_, 0, 1, &set, 0, nullptr);
     vkCmdBindVertexBuffers(cmd_, 0, 1, &ring_, &at);
     const VkViewport viewport{float(dx), float(dy), float(dw), float(dh), 0, 1};
@@ -1535,8 +1612,10 @@ VkPipeline VulkanRenderer::pipeline(const DrawCmd& c) {
     info.pDynamicState = &dyn;
     info.layout = pipeline_layout_;
     VkPipeline p = VK_NULL_HANDLE;
-    check(vkCreateGraphicsPipelines(device_, VK_NULL_HANDLE, 1, &info, nullptr, &p), "vkCreateGraphicsPipelines");
+    check(vkCreateGraphicsPipelines(device_, pipeline_cache_, 1, &info, nullptr, &p), "vkCreateGraphicsPipelines");
     pipelines_[k] = p;
+    ++unsaved_pipelines_;
+    last_pipeline_ = std::chrono::steady_clock::now();
     return p;
 }
 
@@ -1826,34 +1905,61 @@ void VulkanRenderer::draw(const DrawCmd& c) {
         slots_[slot_].sets.emplace(key, set);
     }
 
-    vkCmdBindPipeline(cmd_, VK_PIPELINE_BIND_POINT_GRAPHICS, pl);
+    // State the command buffer doesn't hold already.
+    DrawState& was = drawn_;
+    const bool all = !was.valid;
+    if (all || was.pipeline != pl) vkCmdBindPipeline(cmd_, VK_PIPELINE_BIND_POINT_GRAPHICS, pl), was.pipeline = pl;
     vkCmdBindDescriptorSets(cmd_, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_layout_, 0, 1, &set, 2, uniform_offsets);
-    for (uint32_t n = 0, k = 0; n < 16; ++n)
-        if (c.inputs & (1u << n)) vkCmdBindVertexBuffers(cmd_, n, 1, &buffers[k], &offsets[k]), ++k;
-    (void)first;
+    // The attributes' buffers in one call over the bindings they span (a
+    // binding in a gap gets the ring at 0, unread).
+    if (count) {
+        const uint32_t last = 31 - uint32_t(std::countl_zero(c.inputs));
+        VkBuffer span_buffers[16];
+        VkDeviceSize span_offsets[16];
+        for (uint32_t n = first, k = 0; n <= last; ++n) {
+            span_buffers[n - first] = ring_;
+            span_offsets[n - first] = (c.inputs & (1u << n)) ? offsets[k++] : 0;
+        }
+        vkCmdBindVertexBuffers(cmd_, first, last - first + 1, span_buffers, span_offsets);
+    }
+    (void)buffers;
     const int32_t tw = int32_t(target().width), th = int32_t(target().height);
     const VkViewport viewport{0, 0, float(tw), float(th), 0, 1};
-    vkCmdSetViewport(cmd_, 0, 1, &viewport);
+    if (all || std::memcmp(&was.viewport, &viewport, sizeof viewport) != 0) vkCmdSetViewport(cmd_, 0, 1, &viewport), was.viewport = viewport;
     const int32_t sx0 = std::clamp(c.scissor.x, 0, tw), sy0 = std::clamp(c.scissor.y, 0, th);
     const int32_t sx1 = std::clamp(int32_t(int64_t(c.scissor.x) + c.scissor.w), sx0, tw);
     const int32_t sy1 = std::clamp(int32_t(int64_t(c.scissor.y) + c.scissor.h), sy0, th);
     const VkRect2D scissor{{sx0, sy0}, {uint32_t(sx1 - sx0), uint32_t(sy1 - sy0)}};
-    vkCmdSetScissor(cmd_, 0, 1, &scissor);
+    if (all || std::memcmp(&was.scissor, &scissor, sizeof scissor) != 0) vkCmdSetScissor(cmd_, 0, 1, &scissor), was.scissor = scissor;
     // Culling a winding: screen space runs y down as in the framebuffer, so
     // "clockwise" is the same on both.
-    vkCmdSetCullMode(cmd_, c.cull == Cull::None ? VK_CULL_MODE_NONE : VK_CULL_MODE_BACK_BIT);
-    vkCmdSetFrontFace(cmd_, c.cull == Cull::Clockwise ? VK_FRONT_FACE_COUNTER_CLOCKWISE : VK_FRONT_FACE_CLOCKWISE);
+    const VkCullModeFlags cull = c.cull == Cull::None ? VK_CULL_MODE_NONE : VK_CULL_MODE_BACK_BIT;
+    const VkFrontFace front = c.cull == Cull::Clockwise ? VK_FRONT_FACE_COUNTER_CLOCKWISE : VK_FRONT_FACE_CLOCKWISE;
+    if (all || was.cull != cull) vkCmdSetCullMode(cmd_, cull), was.cull = cull;
+    if (all || was.front != front) vkCmdSetFrontFace(cmd_, front), was.front = front;
     const bool has_depth = target_has_depth();
-    vkCmdSetDepthTestEnable(cmd_, has_depth && (c.depth_test || c.depth_write));
-    vkCmdSetDepthWriteEnable(cmd_, has_depth && c.depth_write);
-    vkCmdSetDepthCompareOp(cmd_, c.depth_test ? VkCompareOp(c.depth_compare) : VK_COMPARE_OP_ALWAYS);
-    vkCmdSetStencilTestEnable(cmd_, has_depth && c.stencil_test);
-    vkCmdSetStencilOp(cmd_, VK_STENCIL_FACE_FRONT_AND_BACK, VkStencilOp(c.stencil_fail), VkStencilOp(c.stencil_pass),
-                      VkStencilOp(c.stencil_depth_fail), VkCompareOp(c.stencil_compare));
-    vkCmdSetStencilCompareMask(cmd_, VK_STENCIL_FACE_FRONT_AND_BACK, c.stencil_read_mask);
-    vkCmdSetStencilWriteMask(cmd_, VK_STENCIL_FACE_FRONT_AND_BACK, c.stencil_write_mask);
-    vkCmdSetStencilReference(cmd_, VK_STENCIL_FACE_FRONT_AND_BACK, c.stencil_ref);
-    vkCmdSetBlendConstants(cmd_, c.blend_constant);
+    const bool depth_test = has_depth && (c.depth_test || c.depth_write), depth_write = has_depth && c.depth_write;
+    const VkCompareOp depth_compare = c.depth_test ? VkCompareOp(c.depth_compare) : VK_COMPARE_OP_ALWAYS;
+    if (all || was.depth_test != depth_test) vkCmdSetDepthTestEnable(cmd_, depth_test), was.depth_test = depth_test;
+    if (all || was.depth_write != depth_write) vkCmdSetDepthWriteEnable(cmd_, depth_write), was.depth_write = depth_write;
+    if (all || was.depth_compare != depth_compare) vkCmdSetDepthCompareOp(cmd_, depth_compare), was.depth_compare = depth_compare;
+    const bool stencil_test = has_depth && c.stencil_test;
+    if (all || was.stencil_test != stencil_test) vkCmdSetStencilTestEnable(cmd_, stencil_test), was.stencil_test = stencil_test;
+    const VkStencilOp sf = VkStencilOp(c.stencil_fail), sp = VkStencilOp(c.stencil_pass), sd = VkStencilOp(c.stencil_depth_fail);
+    const VkCompareOp sc = VkCompareOp(c.stencil_compare);
+    if (all || was.stencil_fail != sf || was.stencil_pass != sp || was.stencil_depth_fail != sd || was.stencil_compare != sc) {
+        vkCmdSetStencilOp(cmd_, VK_STENCIL_FACE_FRONT_AND_BACK, sf, sp, sd, sc);
+        was.stencil_fail = sf, was.stencil_pass = sp, was.stencil_depth_fail = sd, was.stencil_compare = sc;
+    }
+    if (all || was.stencil_read != c.stencil_read_mask)
+        vkCmdSetStencilCompareMask(cmd_, VK_STENCIL_FACE_FRONT_AND_BACK, c.stencil_read_mask), was.stencil_read = c.stencil_read_mask;
+    if (all || was.stencil_write != c.stencil_write_mask)
+        vkCmdSetStencilWriteMask(cmd_, VK_STENCIL_FACE_FRONT_AND_BACK, c.stencil_write_mask), was.stencil_write = c.stencil_write_mask;
+    if (all || was.stencil_ref != c.stencil_ref)
+        vkCmdSetStencilReference(cmd_, VK_STENCIL_FACE_FRONT_AND_BACK, c.stencil_ref), was.stencil_ref = c.stencil_ref;
+    if (all || std::memcmp(was.blend, c.blend_constant, sizeof was.blend) != 0)
+        vkCmdSetBlendConstants(cmd_, c.blend_constant), std::memcpy(was.blend, c.blend_constant, sizeof was.blend);
+    was.valid = true;
     if (c.indices) {
         vkCmdBindIndexBuffer(cmd_, ring_, index_at, VK_INDEX_TYPE_UINT32);
         vkCmdDrawIndexed(cmd_, c.index_count, 1, 0, 0, 0);

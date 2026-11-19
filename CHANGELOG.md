@@ -11,6 +11,18 @@ Each release is a git tag (`vX.Y.Z`) with a matching GitHub release. The version
 
 ## [Unreleased]
 
+## [0.31.0] - 2026-11-19
+A draw costs the game's thread a quarter of what it did: 113 µs to 25 µs, measured on the attract sequence.
+
+### Changed
+- **A render target's memory is hashed once a frame, and after a lock, a destroy or a `CopyRects`**, instead of at every draw into it and every draw that samples it. D3D lets the CPU at a resource through `Lock2DSurface` and `D3D_DestroyResource`, both of which reach `D3D_BlockOnResource`, which now marks memory as possibly changed; the once-a-frame check catches writes without a lock, as it does for textures. Hashing a 640×480 target (1.2 MB) at every draw was 46 µs of a draw's 113.
+- **Textures are compared byte for byte with a copy of their texels** once a frame, instead of hashed: exact (no hash collision can hide a change) and faster (11 µs a draw to 6 µs). The hash that remains is four lanes wide.
+- **The renderer sets only state that changed** since the last draw in the command buffer, and binds the vertex attributes in one call (16 µs a draw to 10 µs).
+- **Vertices are converted a run at a time**, read in place after one bounds check, into buffers reused from the draw before.
+
+### Added
+- **A pipeline cache on disk**: `vulkan_pipelines.cache` in the data directory, outside the hard disk's partitions; loaded when its header names this GPU and driver, saved after new pipelines settle and at the end.
+
 ## [0.30.2] - 2026-11-19
 Speed and picture quality; a 25-minute play run with nothing stopping.
 

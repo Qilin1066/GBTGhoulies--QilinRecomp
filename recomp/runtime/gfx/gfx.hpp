@@ -21,6 +21,9 @@ struct Config {
     bool depth_stencil = true;           // a 24-bit depth, 8-bit stencil buffer
     int gpu = -1;                        // index among the Vulkan devices; -1 picks the best one
     bool validation = false;             // Vulkan validation layers, if installed (also QILIN_VK_VALIDATION=1)
+    // Where compiled pipelines are kept between runs (Vulkan's pipeline
+    // cache, saved as the driver gives it); empty for none.
+    std::string pipeline_cache;
 
     // A window to show frames in; without one (create empty) frames are
     // only kept, to read back. The renderer stays free of any windowing
