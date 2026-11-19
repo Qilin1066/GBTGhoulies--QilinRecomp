@@ -48,7 +48,7 @@ constexpr uint32_t kStatusSuccess = 0, kStatusTimeout = 0x102, kStatusAbandoned 
 enum : uint8_t { kNotificationEvent = 0, kSynchronizationEvent = 1, kMutant = 2, kSemaphore = 5, kThreadObject = 6,
                  kNotificationTimer = 8, kSynchronizationTimer = 9 };
 
-constexpr uint32_t kMutantOwner = 0x18, kSemaphoreLimit = 0x10;
+constexpr uint32_t kMutantOwner = 0x18;  // (the game imports no semaphore calls: no limit to keep)
 // KTHREAD/ETHREAD fields this keeps: the header, StackBase (+0x1C),
 // StackLimit (+0x20), TlsData (+0x28), Priority (+0x8C, the kernel's byte),
 // and ETHREAD.UniqueThread (+0x12C), which GetCurrentThreadId reads.

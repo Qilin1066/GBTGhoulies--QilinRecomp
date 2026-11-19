@@ -7,7 +7,7 @@ if(APPLE AND NOT CMAKE_OSX_DEPLOYMENT_TARGET)
     set(CMAKE_OSX_DEPLOYMENT_TARGET 10.15 CACHE STRING "oldest macOS the runtime runs on")
 endif()
 # The single source of the version number (see CHANGELOG.md for the scheme).
-project(GBTGQilincomp VERSION 0.34.0 LANGUAGES C CXX)
+project(GBTGQilincomp VERSION 0.35.0 LANGUAGES C CXX)
 
 # ---- Language: C++23 everywhere (recompiler, runtime, generated code) ----
 set(CMAKE_CXX_STANDARD 23)
@@ -213,4 +213,63 @@ if(QILIN_GEN_DIR)
             target_compile_options(qilin_run PRIVATE /MP)
         endif()
     endif()
+endif()
+
+# ---- The player kit: everything qilin_run needs but the code lifted from default.xbe ----
+# For the Windows download (tools/player-kit), as the APB and Punch-Out
+# recomps': the runtime's start-up and dispatch and every library they link
+# (the host layer, renderer, audio, platform, XBE loader, SDL3, volk), merged
+# into one archive, with the headers the lifted code includes, qilin, and the
+# flags and libraries to build the rest with (kit.ninja). A player's own PC
+# lifts their own default.xbe and compiles only that code, with the same
+# compiler, against the kit. Needs a MinGW toolchain
+# (tools/player-kit/mingw-cross.cmake) and SDL3 built statically (the
+# fetched one: -DQILIN_SYSTEM_SDL=OFF).
+option(QILIN_PLAYER_KIT "Build the player kit (tools/player-kit)" OFF)
+if(QILIN_PLAYER_KIT)
+    if(NOT TARGET SDL3-static)
+        message(FATAL_ERROR "the player kit needs SDL3 built statically (-DQILIN_SYSTEM_SDL=OFF)")
+    endif()
+    add_library(ghoulies_kit_main OBJECT recomp/runtime/host/run.cpp recomp/runtime/dispatch.cpp)
+    target_compile_definitions(ghoulies_kit_main PRIVATE QILIN_CHECKED_MEMORY)
+    target_link_libraries(ghoulies_kit_main PRIVATE qilin_host qilin_xbe qilin_warnings)
+    set(kit_libraries qilin_host qilin_gfx qilin_audio qilin_platform qilin_xbe qilin_volk SDL3-static)
+    set(kit_archive "${CMAKE_BINARY_DIR}/libghoulies_kit.a")
+    set(mri "CREATE ${kit_archive}\n")
+    foreach(library IN LISTS kit_libraries)
+        string(APPEND mri "ADDLIB $<TARGET_FILE:${library}>\n")
+    endforeach()
+    string(APPEND mri "ADDMOD $<JOIN:$<TARGET_OBJECTS:ghoulies_kit_main>,\nADDMOD >\nSAVE\nEND\n")
+    file(GENERATE OUTPUT "${CMAKE_BINARY_DIR}/ghoulies_kit.mri" CONTENT "${mri}")
+    add_custom_command(OUTPUT "${kit_archive}"
+        COMMAND "${CMAKE_COMMAND}" "-DAR=${CMAKE_AR}" "-DMRI=${CMAKE_BINARY_DIR}/ghoulies_kit.mri" "-DOUT=${kit_archive}"
+                -P "${CMAKE_SOURCE_DIR}/tools/player-kit/merge.cmake"
+        DEPENDS ghoulies_kit_main ${kit_libraries} $<TARGET_OBJECTS:ghoulies_kit_main> "${CMAKE_BINARY_DIR}/ghoulies_kit.mri"
+        COMMENT "Merging the player kit's libraries" VERBATIM)
+    add_custom_target(ghoulies_kit ALL DEPENDS "${kit_archive}")
+    # The system libraries SDL3 and the runtime need (MinGW names).
+    set(kit_system_libraries -lm -lkernel32 -luser32 -lgdi32 -lwinmm -limm32 -lole32 -loleaut32 -lversion -luuid -ladvapi32
+        -lsetupapi -lshell32 -ldinput8 -lwinspool -lcomdlg32 -lbcrypt)
+    string(JOIN " " kit_system_text ${kit_system_libraries})
+    # What the lifted code is compiled and linked with: kit.ninja, included by
+    # the build.ninja the player's script writes ($kit is the kit's folder).
+    # The same floating-point rules as qilin_runtime (bit-exact SSE), and the
+    # same checked guest memory as qilin_run. Lifted calls nest as deeply as
+    # the guest's: a 16 MB main stack.
+    file(WRITE "${CMAKE_BINARY_DIR}/kit.ninja"
+        "# Written by CMake for the player kit (QILIN_PLAYER_KIT).\n"
+        "cxxflags = -O2 -DNDEBUG -DQILIN_CHECKED_MEMORY -std=c++23 -ffp-contract=off -fno-fast-math -w -I$kit/include\n"
+        "ldflags = -static -O2 -Wl,--stack,16777216\n"
+        "libs = $kit/lib/libghoulies_kit.a ${kit_system_text}\n")
+    # Linked with stand-ins for the lifted code: the kit is complete.
+    add_executable(ghoulies_kit_link_check tools/player-kit/link_check.cpp)
+    target_include_directories(ghoulies_kit_link_check PRIVATE recomp/runtime)
+    target_link_libraries(ghoulies_kit_link_check PRIVATE "${kit_archive}" ${kit_system_libraries})
+    target_link_options(ghoulies_kit_link_check PRIVATE -static -Wl,--stack,16777216)
+    add_dependencies(ghoulies_kit_link_check ghoulies_kit)
+
+    install(TARGETS qilin RUNTIME DESTINATION kit COMPONENT player)
+    install(FILES "${kit_archive}" DESTINATION kit/lib COMPONENT player)
+    install(FILES "${CMAKE_BINARY_DIR}/kit.ninja" DESTINATION kit COMPONENT player)
+    install(FILES recomp/runtime/guest.hpp recomp/runtime/x87_math.hpp DESTINATION kit/include COMPONENT player)
 endif()

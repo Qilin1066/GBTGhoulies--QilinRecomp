@@ -218,7 +218,13 @@ std::optional<uint32_t> parse_hex(std::string_view s) {
     return v;
 }
 
+// A file whose text is unchanged is left alone, so a build after an update
+// recompiles only what the update changed.
 void write_file(const std::filesystem::path& path, std::string_view s) {
+    {
+        std::ifstream old(path, std::ios::binary);
+        if (old && std::string(std::istreambuf_iterator<char>(old), {}) == s) return;
+    }
     std::ofstream f(path, std::ios::binary);
     if (!f || !f.write(s.data(), std::streamsize(s.size()))) throw Failure{"cannot write " + path.string()};
 }
@@ -403,6 +409,19 @@ int cmd_lift(const Xbe& xbe, Decoder& dec, std::span<const std::string_view> arg
         std::ranges::sort(done);
     }
     flush();
+    // Chunks a bigger lift wrote before (into the same folder) go, or they'd be built too.
+    {
+        std::error_code ec;
+        std::vector<std::filesystem::path> stale;
+        for (const auto& e : std::filesystem::directory_iterator(dir, ec)) {
+            const std::string name = e.path().filename().string();
+            int k = 0;
+            if (name.size() == 14 && name.starts_with("lifted_") && name.ends_with(".cpp") &&
+                std::from_chars(name.data() + 7, name.data() + 10, k).ec == std::errc{} && k >= nchunk)
+                stale.push_back(e.path());
+        }
+        for (const auto& path : stale) std::filesystem::remove(path, ec);
+    }
 
     // Targets without a lifted body (library code, game code that doesn't
     // lift yet) get a stub that forwards to rt::call_unlifted, so every

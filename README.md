@@ -21,6 +21,17 @@ Roadmap step 2, **recompiler core**, is in progress.
 
 Releases are tagged `vX.Y.Z` on GitHub, and every release is recorded in [`CHANGELOG.md`](CHANGELOG.md). Past entries are kept, never rewritten. The version lives in one place, `project(... VERSION ...)` in `CMakeLists.txt`, and `qilin --version` prints it. While the recompiler is being built, a minor bump (0.**x**) marks a milestone and a patch bump (0.x.**y**) a fix. 1.0.0 will be the first build that plays the game.
 
+## Playing on Windows
+
+**The download (nothing to install).** `.github/workflows/player-kit.yml` builds `Ghoulies-QilinComp-<version>-windows-x64.zip` (about 80 MB) on every push, as the APB and Punch-Out recomps do (an artifact of the run; attached to a release when one is tagged). Unpack it and double-click **`Play Ghoulies.bat`**: the first time it asks for your extracted disc folder (the one holding `default.xbe`; the USA release, MS-083) and builds the game from it, with the compiler inside the download (LLVM-MinGW: Clang, free and open source); after that it starts the game at once. The game's messages go to `run.log` beside it. The download has everything but the game's own code, prebuilt: the recompiler, the runtime, the renderer, SDL3. The code made from the disc is made on the player's PC, from their own copy, and never distributed. See `tools/player-kit/` (`package.sh` builds the download on Linux; `play.ps1` is what Play runs).
+
+**From the source, double-click.** With Visual Studio 2022 (17.10 or newer, the free Community edition, with "Desktop development with C++") and Git installed, in the project's folder:
+
+- **`Play Ghoulies.bat`** starts the game. The first time it builds it (10 to 40 minutes), asking for your extracted disc folder with a folder picker.
+- **`Update Ghoulies.bat`** gets the latest code, rebuilds only what changed, and starts the game.
+
+Both run `tools/build-ghoulies.ps1`, which finds Visual Studio's CMake and Git itself; the game's messages go to `build-game\run.log`.
+
 ## Building
 
 The whole project (recompiler, runtime and generated code) is **C++23**. You need CMake ≥ 3.25 and one of:

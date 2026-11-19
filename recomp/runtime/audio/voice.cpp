@@ -373,16 +373,15 @@ bool Voice::process(const uint8_t* mem, size_t mem_size, uint32_t frames) {
         std::vector<float> ext(hist + frames);
         std::copy(hrtf_history_.begin(), hrtf_history_.end(), ext.begin());
         std::copy(scratch_.begin(), scratch_.begin() + frames, ext.begin() + hist);
-        float taps[2][31], energy[2] = {};
+        float taps[2][31];
         for (int e = 0; e < 2; ++e)
-            for (int k = 0; k < 31; ++k) taps[e][k] = hrtf_tap(three_d.taps[e][k]), energy[e] += taps[e][k] * taps[e][k];
+            for (int k = 0; k < 31; ++k) taps[e][k] = hrtf_tap(three_d.taps[e][k]);
         // The delay's sign names the ear, as DirectSound's lookup makes it
         // (the left table's delay past the azimuth split, else the right's
         // negated): positive delays the left ear. (Checked against the
         // filters over five minutes of play: in 7.96 million blocks with a
         // delay, the delayed ear's filter was the quieter one every time.)
         const int far = three_d.itd > 0 ? 0 : 1;
-        (void)energy;
         hrtf_out_.assign(size_t(frames) * 2, 0.0f);
         for (int e = 0; e < 2; ++e) {
             const uint32_t delay = e == far ? itd : 0;

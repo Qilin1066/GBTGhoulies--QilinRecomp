@@ -11,6 +11,19 @@ Each release is a git tag (`vX.Y.Z`) with a matching GitHub release. The version
 
 ## [Unreleased]
 
+## [0.35.0] - 2026-11-19
+
+### Added
+- **A Windows download that needs nothing installed**, as the APB and Punch-Out recomps have: `Ghoulies-QilinComp-<version>-windows-x64.zip`, built by `.github/workflows/player-kit.yml` on every push. Unpack it and double-click `Play Ghoulies.bat`: the first time it asks for the extracted disc folder (the one holding `default.xbe`), checks it's the supported build (the USA release, MS-083), lifts `default.xbe` and compiles it with the bundled LLVM-MinGW against the prebuilt runtime (`libghoulies_kit.a`), then starts the game; after that it starts at once. The game's messages go to `run.log` beside it. No game data, and nothing made from it, is in the download (`tools/player-kit/`).
+- **From the source, double-click**: `Play Ghoulies.bat` and `Update Ghoulies.bat` in the project's folder build (and update) the game through `tools/build-ghoulies.ps1` with Visual Studio's CMake and Git, asking for the disc folder once; the game's messages go to `build-game\run.log`.
+- The runtime builds with Clang for Windows (MinGW) with warnings as errors.
+
+### Changed
+- `qilin lift` leaves files whose text is unchanged alone, so a build after an update recompiles only what changed, and removes chunks an earlier, bigger lift left in the folder.
+
+### Removed
+- Two unused things Clang flagged: a voice's HRTF energy (computed, never read) and the semaphore limit constant (the game imports no semaphore calls).
+
 ## [0.34.0] - 2026-11-19
 
 ### Added

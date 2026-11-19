@@ -225,7 +225,6 @@ private:
     bool fresh_ = true;             // a new voice fades in over its first frame
     std::vector<float> scratch_;     // process(): channel rows
     std::vector<float> hrtf_history_;  // the last 30 + itd frames of a 3D voice's signal, for its filter
-    float hrtf_energy_[2] = {};
     std::vector<float> hrtf_out_;      // process(): the left and right ears' rows
 
     void decode_frame(const uint8_t* mem, size_t mem_size, uint64_t frame, float* lr);
