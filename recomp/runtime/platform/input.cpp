@@ -3,6 +3,7 @@
 #include <SDL3/SDL.h>
 
 #include <algorithm>
+#include <utility>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -89,39 +90,27 @@ int16_t flip(int16_t v) { return int16_t(v == -32768 ? 32767 : -v); }
 // Two inputs on one stick axis (controller and keyboard): the larger push wins.
 int16_t stronger(int16_t a, int16_t b) { return std::abs(int(a)) >= std::abs(int(b)) ? a : b; }
 
-// The keyboard, as a controller (the table is in docs/input.md).
-PadState keyboard() {
+// The keyboard, as a controller, by the settings' keys (docs/input.md has the defaults).
+PadState keyboard(const std::array<std::vector<int>, kControlCount>& keys) {
     PadState k;
     const bool* key = SDL_GetKeyboardState(nullptr);
     if (!key) return k;
-    auto down = [&](SDL_Scancode s) { return key[s]; };
-    auto axis = [&](SDL_Scancode neg, SDL_Scancode pos) {
-        return int16_t((down(pos) ? 32767 : 0) - (down(neg) ? 32767 : 0));
-    };
-    if (down(SDL_SCANCODE_UP)) k.buttons |= kPadUp;
-    if (down(SDL_SCANCODE_DOWN)) k.buttons |= kPadDown;
-    if (down(SDL_SCANCODE_LEFT)) k.buttons |= kPadLeft;
-    if (down(SDL_SCANCODE_RIGHT)) k.buttons |= kPadRight;
-    if (down(SDL_SCANCODE_RETURN)) k.buttons |= kPadStart;
-    if (down(SDL_SCANCODE_BACKSPACE) || down(SDL_SCANCODE_TAB)) k.buttons |= kPadBack;
-    if (down(SDL_SCANCODE_F)) k.buttons |= kPadLeftThumb;
-    if (down(SDL_SCANCODE_H)) k.buttons |= kPadRightThumb;
-    auto analog = [&](PadAnalog a, std::initializer_list<SDL_Scancode> keys) {
-        for (const SDL_Scancode s : keys)
-            if (down(s)) k.analog[a] = 255;
-    };
-    analog(kPadA, {SDL_SCANCODE_SPACE, SDL_SCANCODE_K});
-    analog(kPadB, {SDL_SCANCODE_L});
-    analog(kPadX, {SDL_SCANCODE_J});
-    analog(kPadY, {SDL_SCANCODE_I});
-    analog(kPadWhite, {SDL_SCANCODE_Q});
-    analog(kPadBlack, {SDL_SCANCODE_E});
-    analog(kPadLeftTrigger, {SDL_SCANCODE_LSHIFT});
-    analog(kPadRightTrigger, {SDL_SCANCODE_RSHIFT, SDL_SCANCODE_O});
-    k.thumbs[0] = axis(SDL_SCANCODE_A, SDL_SCANCODE_D);
-    k.thumbs[1] = axis(SDL_SCANCODE_S, SDL_SCANCODE_W);
-    k.thumbs[2] = axis(SDL_SCANCODE_KP_4, SDL_SCANCODE_KP_6);
-    k.thumbs[3] = axis(SDL_SCANCODE_KP_5, SDL_SCANCODE_KP_8);
+    auto down = [&](Control c) { return std::ranges::any_of(keys[c], [&](int s) { return key[s]; }); };
+    auto axis = [&](Control neg, Control pos) { return int16_t((down(pos) ? 32767 : 0) - (down(neg) ? 32767 : 0)); };
+    static constexpr std::pair<Control, uint16_t> kButtons[] = {
+        {kCtlUp, kPadUp}, {kCtlDown, kPadDown}, {kCtlLeft, kPadLeft}, {kCtlRight, kPadRight}, {kCtlStart, kPadStart},
+        {kCtlBack, kPadBack}, {kCtlLeftThumb, kPadLeftThumb}, {kCtlRightThumb, kPadRightThumb}};
+    for (const auto& [c, bit] : kButtons)
+        if (down(c)) k.buttons |= bit;
+    static constexpr std::pair<Control, PadAnalog> kAnalog[] = {
+        {kCtlA, kPadA}, {kCtlB, kPadB}, {kCtlX, kPadX}, {kCtlY, kPadY}, {kCtlWhite, kPadWhite}, {kCtlBlack, kPadBlack},
+        {kCtlLeftTrigger, kPadLeftTrigger}, {kCtlRightTrigger, kPadRightTrigger}};
+    for (const auto& [c, a] : kAnalog)
+        if (down(c)) k.analog[a] = 255;
+    k.thumbs[0] = axis(kCtlLeftStickLeft, kCtlLeftStickRight);
+    k.thumbs[1] = axis(kCtlLeftStickDown, kCtlLeftStickUp);
+    k.thumbs[2] = axis(kCtlRightStickLeft, kCtlRightStickRight);
+    k.thumbs[3] = axis(kCtlRightStickDown, kCtlRightStickUp);
     return k;
 }
 
@@ -284,7 +273,7 @@ PadState Input::state(uint32_t port) const {
     }
 #endif
     if (port == 0) {
-        const PadState k = keyboard();
+        const PadState k = keyboard(keys_);
         s.connected = true;
         s.buttons |= k.buttons;
         for (int i = 0; i < 8; ++i) s.analog[i] = std::max(s.analog[i], k.analog[i]);
@@ -293,7 +282,19 @@ PadState Input::state(uint32_t port) const {
     return s;
 }
 
+void Input::set_keys(const std::vector<std::string> (&names)[kControlCount]) {
+    for (uint32_t c = 0; c < kControlCount; ++c) {
+        keys_[c].clear();
+        for (const std::string& n : names[c]) {
+            const SDL_Scancode s = SDL_GetScancodeFromName(n.c_str());
+            if (s != SDL_SCANCODE_UNKNOWN) keys_[c].push_back(int(s));
+            else std::printf("qilin_run: no key is called \"%s\" (for %s)\n", n.c_str(), control_label(Control(c)));
+        }
+    }
+}
+
 void Input::rumble(uint32_t port, uint16_t left, uint16_t right) {
+    if (!rumble_on_) left = right = 0;
 #ifdef _WIN32
     if (port < kPorts && !any_sdl_pad() && xinput().set_state && xinput().present[port]) {
         XiVibration v{left, right};

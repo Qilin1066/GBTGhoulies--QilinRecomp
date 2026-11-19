@@ -36,6 +36,34 @@ struct Config {
     } surface;
 };
 
+// How the window shows the frame (the settings' [display] section).
+struct Picture {
+    // Whole multiples of the frame (the sharpest), the largest that keeps
+    // its shape, or the whole window.
+    enum class Scaling : uint8_t { Integer, Fit, Stretch } scaling = Scaling::Fit;
+    bool smooth = false;     // bilinear; off: sharp (whole texels as solid blocks, only the edges between them blended)
+    enum class Look : uint8_t { Plain, Crt } look = Look::Plain;
+    float scanlines = 0.6f;  // CRT: how dark the gaps between raster lines are, 0..1
+    float mask = 0.3f;       // CRT: the phosphor stripes' strength, 0..1
+    bool vsync = true;       // at the display's refresh, no tearing; off: the lowest latency
+    // The shape the frame is shown at, width over height: 4:3, or 16:9 for a
+    // game drawing for a widescreen TV (squeezed into the same frame).
+    float aspect = 4.0f / 3.0f;
+    bool operator==(const Picture&) const = default;
+};
+
+// What a UI drawn over the window (the settings menu) needs to draw with
+// Vulkan, as plain handles so this header stays free of Vulkan's.
+struct Overlay {
+    void* instance = nullptr;         // VkInstance
+    void* physical_device = nullptr;  // VkPhysicalDevice
+    void* device = nullptr;           // VkDevice
+    uint32_t queue_family = 0;
+    void* queue = nullptr;            // VkQueue
+    uint32_t format = 0;              // the window images' VkFormat
+    uint32_t min_images = 2, images = 2;
+};
+
 struct Rect {
     int32_t x = 0, y = 0;
     uint32_t w = 0, h = 0;
@@ -142,7 +170,23 @@ public:
     // Ends the frame: the back buffer becomes the front buffer (a flip, as
     // D3D's Swap), and the oldest buffer becomes the new back buffer.
     virtual void present() = 0;
+    // Shows the front buffer again, with the overlay (a paused game's
+    // frame under the menu); no flip.
+    virtual void present_again() = 0;
     virtual uint64_t frames_presented() const = 0;
+    // How the window shows frames, from the next one shown.
+    virtual void set_picture(const Picture& p) = 0;
+    // Anisotropic filtering for the game's textures: 1 (the console's: none)
+    // to max_anisotropy().
+    virtual void set_anisotropy(uint32_t level) = 0;
+    virtual uint32_t max_anisotropy() const = 0;
+    // The window's Vulkan objects for a UI drawn over it; false without a
+    // window (or before the first frame shown).
+    virtual bool overlay(Overlay& out) const = 0;
+    // Called with the command buffer (a VkCommandBuffer) inside the pass that
+    // draws the frame into the window, after the frame; empty for none.
+    virtual void set_overlay(std::function<void(void* command_buffer)> draw) = 0;
+
     // The frame buffers are numbered 0 … back_buffers; these say which is which now.
     virtual uint32_t back_index() const = 0;
     virtual uint32_t front_index() const = 0;

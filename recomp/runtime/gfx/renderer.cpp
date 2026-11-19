@@ -9,6 +9,7 @@
 // operation, which is what tile-based GPUs (Raspberry Pi, Apple) want; a
 // clear inside a pass, or of a rectangle, is a vkCmdClearAttachments.
 #include <algorithm>
+#include <cmath>
 #include <chrono>
 #include <filesystem>
 #include <fstream>
@@ -120,6 +121,29 @@ public:
     uint32_t create_depth_target(uint32_t width, uint32_t height) override;
     void set_render_target(uint32_t id, uint32_t depth) override;
     Image read_front_buffer() override { return read(color_[front_]); }
+    void present_again() override;
+    void set_picture(const Picture& p) override {
+        if (p.vsync != picture_.vsync) swap_stale_ = true;  // another present mode: a new swapchain
+        picture_ = p;
+    }
+    void set_anisotropy(uint32_t level) override { anisotropy_ = std::clamp<uint32_t>(level, 1, max_anisotropy_); }
+    uint32_t max_anisotropy() const override { return max_anisotropy_; }
+    bool overlay(Overlay& out) const override {
+        if (!surface_ || !swapchain_ || !present_pass_) return false;
+        out.instance = instance_;
+        out.physical_device = gpu_;
+        out.device = device_;
+        out.queue_family = queue_family_;
+        out.queue = queue_;
+        out.format = uint32_t(swap_format_);
+        out.images = uint32_t(swap_images_.size());
+        out.min_images = std::max<uint32_t>(2, out.images - 1);
+        return true;
+    }
+    void set_overlay(std::function<void(void*)> draw) override { overlay_ = std::move(draw); }
+    Picture picture_;
+    uint32_t anisotropy_ = 1, max_anisotropy_ = 1;
+    std::function<void(void*)> overlay_;
     Image read_back_buffer() override { return read(color_[back_]); }
     Image read_frame_buffer(uint32_t index) override { return read(color_.at(index)); }
     void write_frame_buffer(uint32_t index, const Image& image) override { write(color_.at(index), image); }
@@ -535,6 +559,13 @@ void VulkanRenderer::create_device() {
     f2.features.largePoints = have.largePoints;
     // Lines wider than a pixel (D3D's LineWidth), where the device has them.
     f2.features.wideLines = have.wideLines;
+    // Anisotropic filtering (a setting), where the device has it.
+    f2.features.samplerAnisotropy = have.samplerAnisotropy;
+    if (have.samplerAnisotropy) {
+        VkPhysicalDeviceProperties props{};
+        vkGetPhysicalDeviceProperties(gpu_, &props);
+        max_anisotropy_ = std::clamp<uint32_t>(uint32_t(props.limits.maxSamplerAnisotropy), 1, 16);
+    }
     wide_lines_ = have.wideLines;
     {
         VkPhysicalDeviceProperties props{};
@@ -907,6 +938,12 @@ void VulkanRenderer::save_pipeline_cache() {
     if (!ec) unsaved_pipelines_ = 0;
 }
 
+void VulkanRenderer::present_again() {
+    if (!surface_) return;
+    end_pass();
+    show(color_[front_]);
+}
+
 void VulkanRenderer::present() {
     if (unsaved_pipelines_ && std::chrono::steady_clock::now() - last_pipeline_ > std::chrono::seconds(5)) save_pipeline_cache();
     end_pass();
@@ -965,8 +1002,13 @@ bool VulkanRenderer::make_swapchain(uint32_t width, uint32_t height) {
     vkGetPhysicalDeviceSurfacePresentModesKHR(gpu_, surface_, &n, nullptr);
     std::vector<VkPresentModeKHR> modes(n);
     vkGetPhysicalDeviceSurfacePresentModesKHR(gpu_, surface_, &n, modes.data());
-    const VkPresentModeKHR mode = std::ranges::find(modes, VK_PRESENT_MODE_MAILBOX_KHR) != modes.end() ? VK_PRESENT_MODE_MAILBOX_KHR
-                                                                                                      : VK_PRESENT_MODE_FIFO_KHR;
+    // Vsync: FIFO, at the display's refresh. Off: MAILBOX (no tearing, the
+    // newest frame at each refresh), else IMMEDIATE (may tear), else FIFO.
+    auto has = [&](VkPresentModeKHR m) { return std::ranges::find(modes, m) != modes.end(); };
+    const VkPresentModeKHR mode = picture_.vsync                       ? VK_PRESENT_MODE_FIFO_KHR
+                                  : has(VK_PRESENT_MODE_MAILBOX_KHR)   ? VK_PRESENT_MODE_MAILBOX_KHR
+                                  : has(VK_PRESENT_MODE_IMMEDIATE_KHR) ? VK_PRESENT_MODE_IMMEDIATE_KHR
+                                                                       : VK_PRESENT_MODE_FIFO_KHR;
     uint32_t count = caps.minImageCount + 1;
     if (caps.maxImageCount && count > caps.maxImageCount) count = caps.maxImageCount;
 
@@ -1046,10 +1088,20 @@ void VulkanRenderer::show(Target& frame) {
     if (got == VK_SUBOPTIMAL_KHR) swap_stale_ = true;
     else check(got, "vkAcquireNextImageKHR");
 
-    const uint64_t fw0 = config_.width, fh0 = config_.height, sw0 = swap_extent_.width, sh0 = swap_extent_.height;
+    // The frame's shape on screen: its aspect (4:3, or 16:9 for a
+    // widescreen game), as a width over a height of 1000.
+    const uint64_t fh0 = config_.height, fw0 = config_.width, sw0 = swap_extent_.width, sh0 = swap_extent_.height;
+    const uint64_t aw = uint64_t(std::lround(std::clamp(picture_.aspect, 0.5f, 4.0f) * 1000.0f)), ah = 1000;
     uint64_t dw0 = sw0, dh0 = sh0;
-    if (sw0 * fh0 > sh0 * fw0) dw0 = std::max<uint64_t>(1, sh0 * fw0 / fh0);
-    else dh0 = std::max<uint64_t>(1, sw0 * fh0 / fw0);
+    if (picture_.scaling != Picture::Scaling::Stretch) {
+        if (sw0 * ah > sh0 * aw) dw0 = std::max<uint64_t>(1, sh0 * aw / ah);  // wider than the picture: bars at the sides
+        else dh0 = std::max<uint64_t>(1, sw0 * ah / aw);
+        if (picture_.scaling == Picture::Scaling::Integer && dh0 >= fh0) {  // whole multiples of the frame's lines
+            dh0 = fh0 * (dh0 / fh0);
+            dw0 = std::min<uint64_t>(sw0, std::max<uint64_t>(1, dh0 * aw / ah));
+        }
+    }
+    (void)fw0;
     if (present_pass_) return present_through_pass(frame, index, int32_t((sw0 - dw0) / 2), int32_t((sh0 - dh0) / 2), dw0, dh0);
 
     // Without a pass (images that can only be copied into): a scaled copy, no gamma ramp.
@@ -1082,17 +1134,15 @@ void VulkanRenderer::show(Target& frame) {
     barrier(VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT,
             VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
 
-    const uint64_t fw = config_.width, fh = config_.height, sw = swap_extent_.width, sh = swap_extent_.height;
-    uint64_t dw = sw, dh = sh;
-    if (sw * fh > sh * fw) dw = std::max<uint64_t>(1, sh * fw / fh);  // wider than the frame: bars at the sides
-    else dh = std::max<uint64_t>(1, sw * fh / fw);
-    const int32_t dx = int32_t((sw - dw) / 2), dy = int32_t((sh - dh) / 2);
+    const uint64_t fw = config_.width, fh = config_.height, dw = dw0, dh = dh0;
+    const int32_t dx = int32_t((sw0 - dw) / 2), dy = int32_t((sh0 - dh) / 2);
     VkImageBlit blit{};
     blit.srcSubresource = blit.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
     blit.srcOffsets[1] = {int32_t(fw), int32_t(fh), 1};
     blit.dstOffsets[0] = {dx, dy, 0};
     blit.dstOffsets[1] = {dx + int32_t(dw), dy + int32_t(dh), 1};
-    vkCmdBlitImage(cmd_, frame.image, frame.layout, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit, VK_FILTER_LINEAR);
+    vkCmdBlitImage(cmd_, frame.image, frame.layout, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit,
+                   picture_.smooth ? VK_FILTER_LINEAR : VK_FILTER_NEAREST);
     barrier(VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT,
             VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_2_NONE, 0);
     submit(acquired_, rendered_[index]);
@@ -1111,16 +1161,19 @@ void VulkanRenderer::show(Target& frame) {
 // ---- Presenting through the gamma ramp
 namespace {
 // A triangle over the destination rectangle: position xy, texture coordinate zw.
+// The picture's settings come in as a second attribute, the same at each
+// vertex: (smooth, CRT, scanlines, mask).
 std::vector<uint32_t> present_vs() {
     spv::Builder b{spv::Stage::Vertex};
     const spv::Id f = b.t_float(), v4 = b.t_vec(4);
-    const spv::Id in = b.input(v4, 0);
+    const spv::Id in = b.input(v4, 0), params_in = b.input(v4, 1);
     const spv::Id v = b.load(v4, in);
     const spv::Id pos = b.builtin_var(spv::Storage::Output, v4, spv::builtin::Position);
     b.store(pos, b.vec4(b.extract(f, v, 0), b.extract(f, v, 1), b.c_float(0), b.c_float(1)));
-    const spv::Id out = b.output(v4, 0);
+    const spv::Id out = b.output(v4, 0), params_out = b.output(v4, 1);
     b.store(out, b.vec4(b.extract(f, v, 2), b.extract(f, v, 3), b.c_float(0), b.c_float(0)));
-    return b.finish({in, pos, out});
+    b.store(params_out, b.load(v4, params_in));
+    return b.finish({in, params_in, pos, out, params_out});
 }
 // The frame, filtered, then each channel through its table (texel i at (i + 0.5) / 256).
 // The frame (width × height) scaled into the window: sharp bilinear. Each
@@ -1135,8 +1188,12 @@ std::vector<uint32_t> present_fs(uint32_t width, uint32_t height) {
     namespace glsl = spv::glsl;
     spv::Builder b{spv::Stage::Fragment};
     const spv::Id f = b.t_float(), v2 = b.t_vec(2), v4 = b.t_vec(4), s2 = b.t_sampler2d();
-    const spv::Id in = b.input(v4, 0);
-    const spv::Id uv = b.load(v4, in);
+    const spv::Id frag_coord = b.builtin_var(spv::Storage::Input, v4, spv::builtin::FragCoord);
+    const spv::Id in = b.input(v4, 0), params_in = b.input(v4, 1);
+    b.decorate(params_in, spv::deco::Flat);
+    const spv::Id uv = b.load(v4, in), params = b.load(v4, params_in);
+    const spv::Id smooth = b.extract(f, params, 0), crt = b.extract(f, params, 1);
+    const spv::Id scanlines = b.extract(f, params, 2), mask = b.extract(f, params, 3);
     const spv::Id frame = b.load(s2, b.sampler(s2, 0, 0)), ramp = b.load(s2, b.sampler(s2, 0, 1));
     auto axis = [&](uint32_t k, float size, uint16_t deriv) {
         const spv::Id texel = b.op(op::FMul, f, {b.extract(f, uv, k), b.c_float(size)});
@@ -1150,8 +1207,35 @@ std::vector<uint32_t> present_fs(uint32_t width, uint32_t height) {
         const spv::Id moved = b.op(op::FAdd, f, {b.op(op::FMul, f, {b.op(op::FSub, f, {centre, held}), scale}), b.c_float(0.5f)});
         return b.op(op::FDiv, f, {b.op(op::FAdd, f, {base, moved}), b.c_float(size)});
     };
-    const spv::Id at = b.op(op::CompositeConstruct, v2, {axis(0, float(width), op::DPdx), axis(1, float(height), op::DPdy)});
-    const spv::Id c = b.op(op::ImageSampleImplicitLod, v4, {frame, at});
+    const spv::Id sharp = b.op(op::CompositeConstruct, v2, {axis(0, float(width), op::DPdx), axis(1, float(height), op::DPdy)});
+    // Smooth: the frame's own position, bilinear. (CRT: sharp across, the raster lines below.)
+    const spv::Id plain = b.shuffle(v2, uv, uv, {0, 1});
+    const spv::Id at = b.ext(glsl::FMix, v2, {sharp, plain, b.splat(b.op(op::FMul, f, {smooth, b.op(op::FSub, f, {b.c_float(1), crt})}), 2)});
+    spv::Id c = b.op(op::ImageSampleImplicitLod, v4, {frame, at});
+    // A CRT: each of the frame's lines lit across its middle and dark at its
+    // edges (by `scanlines`), and the window's columns through red, green and
+    // blue phosphor stripes in turn (by `mask`), brightened back to the
+    // frame's average level.
+    {
+        const spv::Id line = b.op(op::FSub, f, {b.ext(glsl::Fract, f, {b.op(op::FMul, f, {b.extract(f, uv, 1), b.c_float(float(height))})}), b.c_float(0.5f)});
+        const spv::Id d2 = b.op(op::FMul, f, {b.c_float(4), b.op(op::FMul, f, {line, line})});
+        const spv::Id scan = b.op(op::FSub, f, {b.c_float(1), b.op(op::FMul, f, {scanlines, d2})});
+        const spv::Id coord = b.load(v4, frag_coord);
+        const spv::Id column = b.op(op::FSub, f, {b.extract(f, coord, 0), b.c_float(0.5f)});
+        const spv::Id third = b.op(op::FMul, f, {column, b.c_float(1.0f / 3.0f)});
+        const spv::Id phase = b.op(op::FMul, f, {b.ext(glsl::Fract, f, {third}), b.c_float(3)});  // 0, 1, 2
+        auto stripe = [&](float k) {  // 1 on its own column, 1 − mask on the others
+            const spv::Id on = b.ext(glsl::FClamp, f, {b.op(op::FSub, f, {b.c_float(1), b.ext(glsl::FAbs, f, {b.op(op::FSub, f, {phase, b.c_float(k)})})}), b.c_float(0), b.c_float(1)});
+            return b.op(op::FAdd, f, {b.op(op::FSub, f, {b.c_float(1), mask}), b.op(op::FMul, f, {mask, on})});
+        };
+        const spv::Id level = b.op(op::FMul, f, {b.op(op::FSub, f, {b.c_float(1), b.op(op::FDiv, f, {scanlines, b.c_float(3)})}),
+                                                 b.op(op::FSub, f, {b.c_float(1), b.op(op::FMul, f, {mask, b.c_float(2.0f / 3.0f)})})});
+        const spv::Id gain = b.op(op::FDiv, f, {scan, b.ext(glsl::FMax, f, {level, b.c_float(0.05f)})});
+        const spv::Id tv = b.vec4(b.op(op::FMul, f, {b.extract(f, c, 0), b.op(op::FMul, f, {gain, stripe(0)})}),
+                                  b.op(op::FMul, f, {b.extract(f, c, 1), b.op(op::FMul, f, {gain, stripe(1)})}),
+                                  b.op(op::FMul, f, {b.extract(f, c, 2), b.op(op::FMul, f, {gain, stripe(2)})}), b.extract(f, c, 3));
+        c = b.ext(glsl::FClamp, v4, {b.ext(glsl::FMix, v4, {c, tv, b.splat(crt)}), b.splat(b.c_float(0)), b.splat(b.c_float(1))});
+    }
     auto through = [&](uint32_t k) {
         const spv::Id x = b.op(op::FAdd, f, {b.op(op::FMul, f, {b.extract(f, c, k), b.c_float(255.0f / 256.0f)}), b.c_float(0.5f / 256.0f)});
         const spv::Id pos = b.op(op::CompositeConstruct, v2, {x, b.c_float(0.5f)});
@@ -1159,7 +1243,7 @@ std::vector<uint32_t> present_fs(uint32_t width, uint32_t height) {
     };
     const spv::Id out = b.output(v4, 0);
     b.store(out, b.vec4(through(0), through(1), through(2), b.c_float(1)));
-    return b.finish({in, out});
+    return b.finish({in, params_in, frag_coord, out});
 }
 }  // namespace
 
@@ -1215,13 +1299,13 @@ VkPipeline VulkanRenderer::present_pipeline() {
         stages[i].module = present_shaders_[i];
         stages[i].pName = "main";
     }
-    const VkVertexInputBindingDescription binding{0, 16, VK_VERTEX_INPUT_RATE_VERTEX};
-    const VkVertexInputAttributeDescription attribute{0, 0, VK_FORMAT_R32G32B32A32_SFLOAT, 0};
+    const VkVertexInputBindingDescription binding{0, 32, VK_VERTEX_INPUT_RATE_VERTEX};
+    const VkVertexInputAttributeDescription attributes[2] = {{0, 0, VK_FORMAT_R32G32B32A32_SFLOAT, 0}, {1, 0, VK_FORMAT_R32G32B32A32_SFLOAT, 16}};
     VkPipelineVertexInputStateCreateInfo vi{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
     vi.vertexBindingDescriptionCount = 1;
     vi.pVertexBindingDescriptions = &binding;
-    vi.vertexAttributeDescriptionCount = 1;
-    vi.pVertexAttributeDescriptions = &attribute;
+    vi.vertexAttributeDescriptionCount = 2;
+    vi.pVertexAttributeDescriptions = attributes;
     VkPipelineInputAssemblyStateCreateInfo ia{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
     ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
     VkPipelineViewportStateCreateInfo vp{VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
@@ -1273,7 +1357,9 @@ void VulkanRenderer::present_through_pass(Target& frame, uint32_t index, int32_t
     }
     const VkPipeline pl = present_pipeline();
     // The vertices first: a full ring submits, which must come before the window's image is touched.
-    const float tri[12] = {-1, -1, 0, 0, 3, -1, 2, 0, -1, 3, 0, 2};
+    const float smooth = picture_.smooth ? 1.0f : 0.0f, crt = picture_.look == Picture::Look::Crt ? 1.0f : 0.0f;
+    const float sl = std::clamp(picture_.scanlines, 0.0f, 1.0f), mk = std::clamp(picture_.mask, 0.0f, 1.0f);
+    const float tri[24] = {-1, -1, 0, 0, smooth, crt, sl, mk, 3, -1, 2, 0, smooth, crt, sl, mk, -1, 3, 0, 2, smooth, crt, sl, mk};
     const VkDeviceSize at = ring_alloc(sizeof tri, 16, tri);
     record();
     transition(frame, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
@@ -1306,6 +1392,7 @@ void VulkanRenderer::present_through_pass(Target& frame, uint32_t index, int32_t
     check(vkAllocateDescriptorSets(device_, &ai, &set), "vkAllocateDescriptorSets");
     SamplerDesc linear, nearest;
     linear.u = linear.v = nearest.u = nearest.v = Address::Clamp;
+    linear.anisotropy = nearest.anisotropy = 0;  // the present pass's own: never anisotropic
     nearest.mag = nearest.min = Filter::Nearest;
     const VkDescriptorImageInfo images[2] = {{sampler(linear), frame.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
                                              {sampler(nearest), textures_.at(gamma_texture_).view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL}};
@@ -1341,6 +1428,13 @@ void VulkanRenderer::present_through_pass(Target& frame, uint32_t index, int32_t
     const VkRect2D scissor{{dx, dy}, {uint32_t(dw), uint32_t(dh)}};
     vkCmdSetScissor(cmd_, 0, 1, &scissor);
     vkCmdDraw(cmd_, 3, 1, 0, 0);
+    if (overlay_) {  // the menu over it, on the whole window
+        const VkViewport whole{0, 0, float(swap_extent_.width), float(swap_extent_.height), 0, 1};
+        vkCmdSetViewport(cmd_, 0, 1, &whole);
+        const VkRect2D all{{0, 0}, swap_extent_};
+        vkCmdSetScissor(cmd_, 0, 1, &all);
+        overlay_(cmd_);
+    }
     vkCmdEndRendering(cmd_);
     barrier(VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
             VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT, VK_PIPELINE_STAGE_2_NONE, 0);
@@ -1745,7 +1839,10 @@ VkPipeline VulkanRenderer::pipeline(const DrawCmd& c) {
     return p;
 }
 
-VkSampler VulkanRenderer::sampler(const SamplerDesc& d) {
+VkSampler VulkanRenderer::sampler(const SamplerDesc& wanted) {
+    SamplerDesc d = wanted;
+    if (d.anisotropy == 0) d.anisotropy = 1;  // (the present pass's: never)
+    else d.anisotropy = d.min == Filter::Linear ? anisotropy_ : 1;
     for (auto& [desc, s] : samplers_)
         if (desc == d) return s;
     static constexpr VkSamplerAddressMode kAddress[] = {VK_SAMPLER_ADDRESS_MODE_REPEAT, VK_SAMPLER_ADDRESS_MODE_MIRRORED_REPEAT,
@@ -1758,6 +1855,7 @@ VkSampler VulkanRenderer::sampler(const SamplerDesc& d) {
     info.addressModeV = kAddress[size_t(d.v)];
     info.addressModeW = kAddress[size_t(d.w)];
     info.mipLodBias = d.lod_bias;
+    if (d.anisotropy > 1) info.anisotropyEnable = VK_TRUE, info.maxAnisotropy = float(d.anisotropy);
     info.minLod = 0;
     info.maxLod = d.mipmaps ? float(d.max_level) : 0.25f;
     // Core Vulkan has only black or white borders: the nearest of the two.

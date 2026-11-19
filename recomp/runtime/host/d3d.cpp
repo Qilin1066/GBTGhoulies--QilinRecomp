@@ -40,6 +40,9 @@
 #include "host.hpp"
 #include "sched.hpp"
 #include "window.hpp"
+#include "input.hpp"
+#include "menu.hpp"
+#include "settings.hpp"
 #include "strf.hpp"
 
 namespace qilin::host {
@@ -83,6 +86,7 @@ void st(const rt::Context& c, uint32_t a, uint32_t v) { rt::st32(mem(c), a, v, 0
 // ---------------------------------------------------------------- device state
 struct Device {
     std::unique_ptr<gfx::Renderer> renderer;
+    std::unique_ptr<ui::Menu> menu;  // the settings menu, once the window has shown a frame
     D3dConfig config;
     uint32_t width = 0, height = 0, interval = 1;
     std::vector<uint32_t> frame_buffers;  // guest surfaces; frame_buffers[i] is the renderer's buffer i
@@ -172,6 +176,7 @@ struct Device {
     std::vector<std::string> said;  // notices given once
 };
 Device* g_device = nullptr;
+void apply_settings(Device& d, const platform::Settings& s);
 
 Device& device(const char* fn) {
     if (!g_device) unmodelled(fn, "a call before Direct3D_CreateDevice");
@@ -365,6 +370,7 @@ void create_device(rt::Context& c) {
     }
     for (int k = 0; k < 3; ++k)
         for (int i = 0; i < 256; ++i) d->gamma[k][i] = uint8_t(i);
+    if (d->config.settings) apply_settings(*d, *d->config.settings);
 
     // The frame buffers as guest surfaces (linear A8R8G8B8 / X8R8G8B8, as the
     // original makes them), and the depth buffer (linear D24S8).
@@ -539,8 +545,11 @@ void block_until_idle(rt::Context& c) {
 }
 
 // HRESULT D3DDevice_Clear(DWORD Count, CONST D3DRECT*, DWORD Flags, D3DCOLOR,
-//     float Z, DWORD Stencil): the render target and depth buffer, all of
-//     them or the rectangles given (D3DRECT: x1, y1, x2, y2).
+//     float Z, DWORD Stencil): the render target and depth buffer within the
+//     viewport, as the original (0x176970) clears them: each rectangle given
+//     (D3DRECT: x1, y1, x2, y2) clipped to the viewport, or with none, the
+//     viewport itself. The game packs its characters' shadows into tiles of
+//     one 256×256 texture and clears each tile through its viewport.
 std::pair<uint32_t, uint32_t> apply_target(rt::Context& c, Device& d, const char* fn);
 void hand_back_target(rt::Context& c, Device& d, uint32_t data);
 void clear(rt::Context& c) {
@@ -552,13 +561,19 @@ void clear(rt::Context& c) {
     if ((flags & kClearTarget) && (flags & kClearTarget) != kClearTarget)
         unmodelled("D3DDevice_Clear", strf("clearing some colour channels only (flags %#x)", flags));
     if (flags & ~(kClearTarget | kClearZBuffer | kClearStencil)) unmodelled("D3DDevice_Clear", strf("flags %#x", flags));
+    const int32_t vx1 = int32_t(ld(c, kDeviceStorage + kDevViewport)), vy1 = int32_t(ld(c, kDeviceStorage + kDevViewport + 4));
+    const int32_t vx2 = vx1 + int32_t(ld(c, kDeviceStorage + kDevViewport + 8)), vy2 = vy1 + int32_t(ld(c, kDeviceStorage + kDevViewport + 12));
     std::vector<gfx::Rect> list;
-    for (uint32_t i = 0; rects && i < count; ++i) {
-        const int32_t x1 = int32_t(ld(c, rects + 16 * i)), y1 = int32_t(ld(c, rects + 16 * i + 4));
-        const int32_t x2 = int32_t(ld(c, rects + 16 * i + 8)), y2 = int32_t(ld(c, rects + 16 * i + 12));
+    const uint32_t n = rects && count ? count : 1;
+    for (uint32_t i = 0; i < n; ++i) {
+        int32_t x1 = vx1, y1 = vy1, x2 = vx2, y2 = vy2;
+        if (rects && count) {
+            x1 = std::max(vx1, int32_t(ld(c, rects + 16 * i))), y1 = std::max(vy1, int32_t(ld(c, rects + 16 * i + 4)));
+            x2 = std::min(vx2, int32_t(ld(c, rects + 16 * i + 8))), y2 = std::min(vy2, int32_t(ld(c, rects + 16 * i + 12)));
+        }
         if (x2 > x1 && y2 > y1) list.push_back({x1, y1, uint32_t(x2 - x1), uint32_t(y2 - y1)});
     }
-    if (rects && count && list.empty()) {  // only empty rectangles: nothing to do
+    if (list.empty()) {  // nothing inside the viewport: nothing to do
         ret(c, 0, 24);
         return;
     }
@@ -573,12 +588,34 @@ void clear(rt::Context& c) {
     ret(c, 0, 24);
 }
 
-// The window's events; closing it stops the runtime.
+// The settings in effect: the picture and texture filtering, the volume,
+// the keyboard's keys and rumble (the settings menu calls it as they change).
+void apply_settings(Device& d, const platform::Settings& s) {
+    gfx::Picture p;
+    p.scaling = gfx::Picture::Scaling(uint8_t(s.scaling));
+    p.smooth = s.smooth;
+    p.look = gfx::Picture::Look(uint8_t(s.look));
+    p.scanlines = float(s.scanlines) / 100.0f;
+    p.mask = float(s.mask) / 100.0f;
+    p.vsync = s.vsync;
+    p.aspect = d.config.widescreen ? 16.0f / 9.0f : 4.0f / 3.0f;  // as the game draws (the setting at start)
+    d.renderer->set_picture(p);
+    d.renderer->set_anisotropy(s.anisotropy);
+    set_output_volume(float(s.volume) / 100.0f);
+    if (platform::Input* in = d.config.input) {
+        in->set_keys(s.keys);
+        in->set_rumble(s.rumble);
+    }
+}
+
+// The window's events (the settings menu's first); closing the window, or
+// the menu's Quit, stops the runtime.
 void pump_window(const Device& d) {
     platform::Window* w = d.config.window;
     if (!w || !host::sched::on_main_thread()) return;  // SDL's events belong to the first thread (macOS)
-    w->pump(d.config.input);
-    if (w->quit_requested()) {
+    if (ui::Menu* m = d.menu.get()) w->pump(d.config.input, [m](const SDL_Event& e) { return m->handle(e); });
+    else w->pump(d.config.input);
+    if (w->quit_requested() || (d.menu && d.menu->quit_requested())) {
         std::fflush(stderr);
         std::printf("qilin_run: the window was closed after %u frames\n", d.swaps);
         std::fflush(stdout);
@@ -595,8 +632,30 @@ void swap(rt::Context& c) {
     const uint32_t old_back = d.frame_buffers[d.renderer->back_index()];
     if (!d.cpu_frames.empty()) flush_cpu_frames(c, d);
     d.cpu_frames.clear();  // a lock lasts until the next Swap
+    if (d.menu) d.menu->tick();  // what's drawn over this frame (the hint)
     d.renderer->present();
     ++d.swaps;
+    // The settings menu, once the window has shown a frame (it draws with the window's images).
+    if (!d.menu && d.config.window && d.config.settings) {
+        auto m = std::make_unique<ui::Menu>(*d.config.window, *d.renderer, *d.config.settings, d.config.settings_folder,
+                                            [&d](const platform::Settings& s) { apply_settings(d, s); });
+        if (m->ok()) d.menu = std::move(m);
+    }
+    // The menu open: the game stands still under it. Its frame is shown again
+    // with the menu over it until it closes; the time it was open is taken off
+    // the game's clock (its vblanks) and the sound's, so nothing jumps.
+    if (d.menu && d.menu->open()) {
+        const auto paused = std::chrono::steady_clock::now();
+        pause_audio(true);
+        while (d.menu->open()) {
+            pump_window(d);
+            d.menu->tick();
+            d.renderer->present_again();
+            std::this_thread::sleep_for(std::chrono::milliseconds(15));
+        }
+        pause_audio(false);
+        d.epoch += std::chrono::steady_clock::now() - paused;
+    }
     if (d.swaps % 64 == 0) sweep_vertex_runs(d, 120);  // runs not drawn for 4 seconds leave the vertex arena
     // A render target that was the back buffer becomes the new one (the
     // device's internal reference moves with it).

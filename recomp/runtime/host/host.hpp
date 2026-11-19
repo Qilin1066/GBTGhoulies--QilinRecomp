@@ -24,6 +24,7 @@ namespace qilin::platform {
 class Window;
 class Input;
 class AudioOut;
+struct Settings;
 }
 
 namespace qilin::host {
@@ -143,6 +144,9 @@ struct D3dConfig {
     std::string pipeline_cache;  // the renderer's compiled pipelines between runs, in the data directory
     platform::Window* window = nullptr;  // where frames are shown; none with --headless
     platform::Input* input = nullptr;    // controllers, whose events the window's pump passes on
+    platform::Settings* settings = nullptr;  // ghoulies.ini (the settings menu changes and saves it)
+    std::string settings_folder;             // where it's kept
+    bool widescreen = false;                 // the game draws for 16:9 (the console's setting at start): shown at 16:9
 };
 void register_d3d(const D3dConfig& config);
 const D3dConfig& d3d_config();
@@ -150,6 +154,15 @@ const D3dConfig& d3d_config();
 // The console's audio setting the game reads (ExQueryNonVolatileSetting):
 // surround with Dolby Digital when the output is 5.1, else stereo.
 void set_audio_surround(bool surround);
+// The console's language the game reads (XC_LANGUAGE: 1 English, 3 German,
+// 4 French, 5 Spanish, 6 Italian).
+void set_console_language(uint32_t language);
+// The console's widescreen setting (16:9) the game reads.
+void set_console_widescreen(bool widescreen);
+// The volume of what's played (0 to 1), and pausing the sound with the game
+// (the settings menu): nothing is mixed and the audio clock stands still.
+void set_output_volume(float volume);
+void pause_audio(bool paused);
 
 // DirectSound (dsound.cpp), over the software mixer; dump_wav non-empty
 // writes everything mixed there (--dump-audio).

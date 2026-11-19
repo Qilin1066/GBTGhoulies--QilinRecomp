@@ -16,6 +16,10 @@
 
 #include <array>
 #include <cstdint>
+#include <string>
+#include <vector>
+
+#include "settings.hpp"
 
 union SDL_Event;
 struct SDL_Gamepad;
@@ -55,6 +59,9 @@ public:
     // Rumble, the two motors' speeds from 0 to 65535 (the Xbox's left motor
     // is the low-frequency one). Lasts until changed.
     void rumble(uint32_t port, uint16_t left, uint16_t right);
+    void set_rumble(bool on) { rumble_on_ = on; }
+    // The keyboard's keys for each control (SDL's key names).
+    void set_keys(const std::vector<std::string> (&names)[kControlCount]);
 
 private:
     struct Port {
@@ -64,6 +71,8 @@ private:
     };
     std::array<Port, kPorts> ports_{};
     bool started_ = false;
+    bool rumble_on_ = true;
+    std::array<std::vector<int>, kControlCount> keys_;  // SDL scancodes
     void attach(uint32_t id);
     void detach(uint32_t id);
     bool any_sdl_pad() const;  // a gamepad is open through SDL (Windows' XInput is read directly only when none is)

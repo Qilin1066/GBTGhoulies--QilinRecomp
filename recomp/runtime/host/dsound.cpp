@@ -116,6 +116,9 @@ struct DirectSound {
     std::vector<float> speakers, stereo;
     std::thread mixer;
     std::atomic<bool> quit{false};
+    float volume = 1.0f;                                 // the settings' volume, on what goes to the device
+    bool paused = false;                                 // the settings menu is up: nothing mixed, the clock stopped
+    std::chrono::steady_clock::time_point paused_at;
     std::condition_variable wake;
     ~DirectSound() {
         if (mixer.joinable()) {
@@ -161,6 +164,7 @@ Buffer& buffer(rt::Context& c, uint32_t a, const char* fn) {
 uint64_t audio_now() {
     const DirectSound& d = ds();
     if (!d.object) return 0;
+    if (d.paused) return uint64_t(std::chrono::duration<double>(d.paused_at - d.epoch).count() * audio::kOutputRate);
     return uint64_t(std::chrono::duration<double>(std::chrono::steady_clock::now() - d.epoch).count() * audio::kOutputRate);
 }
 
@@ -211,14 +215,17 @@ void mix_block(DirectSound& d, uint32_t n) {
     }
     d.limiter.process(d.stereo.data(), n);
     if (d.wav) d.wav->write(d.stereo.data(), n);
+    const float v = d.volume;
     if (d.out && d.out->channels() == 6) {
         d.speakers.resize(size_t(n) * 6);
         for (uint32_t i = 0; i < n; ++i) {
             float* o = &d.speakers[size_t(i) * 6];
-            o[0] = fl[i], o[1] = fr[i], o[2] = fc[i], o[3] = lfe[i], o[4] = bl[i], o[5] = br[i];
+            o[0] = fl[i] * v, o[1] = fr[i] * v, o[2] = fc[i] * v, o[3] = lfe[i] * v, o[4] = bl[i] * v, o[5] = br[i] * v;
         }
         d.out->push(d.speakers.data(), n);
     } else if (d.out) {
+        if (v != 1.0f)
+            for (float& x : d.stereo) x *= v;
         d.out->push(d.stereo.data(), n);
     }
 }
@@ -1064,6 +1071,28 @@ constexpr DsFn kDs[] = {
 };
 
 }  // namespace
+
+void set_output_volume(float volume) {
+    Lock lock_(ds().m);
+    ds().volume = std::clamp(volume, 0.0f, 1.0f);
+}
+
+// The game paused (the settings menu): the mix brought up to now, then
+// nothing more until it resumes, when the audio clock takes up where it
+// stopped, as if no time had passed.
+void pause_audio(bool paused) {
+    Lock lock_(ds().m);
+    DirectSound& d = ds();
+    if (paused == d.paused || !d.object) return;
+    if (paused) {
+        catch_up_locked();
+        d.paused_at = std::chrono::steady_clock::now();
+        d.paused = true;
+    } else {
+        d.epoch += std::chrono::steady_clock::now() - d.paused_at;
+        d.paused = false;
+    }
+}
 
 void pump_audio(rt::Context& c) {
     {

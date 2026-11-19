@@ -7,7 +7,7 @@ if(APPLE AND NOT CMAKE_OSX_DEPLOYMENT_TARGET)
     set(CMAKE_OSX_DEPLOYMENT_TARGET 10.15 CACHE STRING "oldest macOS the runtime runs on")
 endif()
 # The single source of the version number (see CHANGELOG.md for the scheme).
-project(GBTGQilincomp VERSION 0.35.0 LANGUAGES C CXX)
+project(GBTGQilincomp VERSION 0.36.0 LANGUAGES C CXX)
 
 # ---- Language: C++23 everywhere (recompiler, runtime, generated code) ----
 set(CMAKE_CXX_STANDARD 23)
@@ -177,10 +177,28 @@ if(NOT TARGET SDL3::SDL3)
         EXCLUDE_FROM_ALL)
     FetchContent_MakeAvailable(SDL3)
 endif()
-add_library(qilin_platform STATIC recomp/runtime/platform/window.cpp recomp/runtime/platform/input.cpp
+add_library(qilin_platform STATIC recomp/runtime/platform/window.cpp recomp/runtime/platform/input.cpp recomp/runtime/platform/settings.cpp
     recomp/runtime/platform/audio_out.cpp)
 target_include_directories(qilin_platform PUBLIC recomp/runtime/platform)
 target_link_libraries(qilin_platform PUBLIC SDL3::SDL3 PRIVATE qilin_warnings)
+
+# ---- The settings menu: Dear ImGui (MIT, vendored as the APB recomp has it) over the window ----
+add_library(qilin_imgui STATIC
+    third_party/imgui/imgui.cpp third_party/imgui/imgui_draw.cpp third_party/imgui/imgui_tables.cpp
+    third_party/imgui/imgui_widgets.cpp third_party/imgui/backends/imgui_impl_sdl3.cpp
+    third_party/imgui/backends/imgui_impl_vulkan.cpp)
+target_include_directories(qilin_imgui PUBLIC third_party/imgui third_party/imgui/backends)
+target_compile_definitions(qilin_imgui PUBLIC IMGUI_IMPL_VULKAN_USE_VOLK IMGUI_DISABLE_OBSOLETE_FUNCTIONS)
+target_link_libraries(qilin_imgui PUBLIC qilin_volk SDL3::SDL3)
+if(MSVC)
+    target_compile_options(qilin_imgui PRIVATE /W0)
+else()
+    target_compile_options(qilin_imgui PRIVATE -w)
+endif()
+add_library(qilin_ui STATIC recomp/runtime/ui/menu.cpp)
+target_include_directories(qilin_ui PUBLIC recomp/runtime/ui)
+target_link_libraries(qilin_ui PUBLIC qilin_gfx qilin_platform qilin_imgui PRIVATE qilin_warnings)
+target_compile_definitions(qilin_ui PRIVATE QILIN_VERSION="${PROJECT_VERSION}")
 
 # ---- Runtime host side: native replacements (HLE) for code that isn't lifted ----
 add_library(qilin_host STATIC recomp/runtime/host/host.cpp recomp/runtime/host/xapi.cpp recomp/runtime/host/kernel.cpp recomp/runtime/host/kernel_crypto.cpp recomp/runtime/host/sched.cpp
@@ -188,7 +206,7 @@ add_library(qilin_host STATIC recomp/runtime/host/host.cpp recomp/runtime/host/x
                               recomp/runtime/host/call_guest.cpp recomp/runtime/host/d3d.cpp
                               recomp/runtime/host/dsound.cpp recomp/runtime/host/guest_ram.cpp)
 target_include_directories(qilin_host PUBLIC recomp/runtime/host)
-target_link_libraries(qilin_host PUBLIC qilin_runtime qilin_gfx qilin_audio qilin_platform PRIVATE qilin_warnings)
+target_link_libraries(qilin_host PUBLIC qilin_runtime qilin_gfx qilin_audio qilin_platform qilin_ui PRIVATE qilin_warnings)
 add_executable(qilin_host_tests recomp/runtime/host/host_tests.cpp)
 target_link_libraries(qilin_host_tests PRIVATE qilin_host qilin_warnings)
 add_test(NAME qilin_host_tests COMMAND qilin_host_tests)
@@ -233,7 +251,7 @@ if(QILIN_PLAYER_KIT)
     add_library(ghoulies_kit_main OBJECT recomp/runtime/host/run.cpp recomp/runtime/dispatch.cpp)
     target_compile_definitions(ghoulies_kit_main PRIVATE QILIN_CHECKED_MEMORY)
     target_link_libraries(ghoulies_kit_main PRIVATE qilin_host qilin_xbe qilin_warnings)
-    set(kit_libraries qilin_host qilin_gfx qilin_audio qilin_platform qilin_xbe qilin_volk SDL3-static)
+    set(kit_libraries qilin_host qilin_ui qilin_imgui qilin_gfx qilin_audio qilin_platform qilin_xbe qilin_volk SDL3-static)
     set(kit_archive "${CMAKE_BINARY_DIR}/libghoulies_kit.a")
     set(mri "CREATE ${kit_archive}\n")
     foreach(library IN LISTS kit_libraries)

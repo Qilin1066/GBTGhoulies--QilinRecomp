@@ -1,6 +1,6 @@
 # Input: controllers and the keyboard
 
-Last updated 2026-11-19 (v0.34.0: Windows' own XInput read directly when SDL lists no controller; v0.24.0: controllers through SDL3, the keyboard as controller 1).
+Last updated 2026-11-19 (v0.36.0: the keyboard's keys set in the settings menu and ghoulies.ini, rumble switch; v0.34.0: Windows' own XInput read directly when SDL lists no controller; v0.24.0: controllers through SDL3, the keyboard as controller 1).
 
 The game reads the Xbox's four controller ports through XInput (the XDK's XPP library), which the runtime replaces natively (`recomp/runtime/host/xinput.cpp`) over SDL3's gamepad API (`recomp/runtime/platform/input.*`).
 
@@ -38,6 +38,8 @@ Rumble: the Xbox's left motor is the low-frequency one, as SDL's. SDL's rumble r
 
 ## The keyboard
 
+Since v0.36.0 the keys are settings ([controls] in `ghoulies.ini`, SDL's key names, several to a control), set in the settings menu by pressing them; Escape, F1 and F11 are kept for the program. The table is the defaults. Rumble can be switched off there too.
+
 The keyboard is controller 1 (port 0): merged with the controller there, and on its own when none is connected, so the game can be played without one. Port 1 always has a device, as a console with a controller in its first port.
 
 | Keyboard | Controller |
@@ -57,7 +59,7 @@ The keyboard is controller 1 (port 0): merged with the controller there, and on 
 | Backspace, Tab | Back |
 | F, H | Left, right stick click |
 
-F11 and Alt+Enter switch fullscreen (the window, not the game).
+F11 and Alt+Enter switch fullscreen (the window, not the game). F1 or Esc, or Back and Start together on a controller, open the settings menu.
 
 ## Not modelled yet
 

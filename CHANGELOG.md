@@ -11,6 +11,16 @@ Each release is a git tag (`vX.Y.Z`) with a matching GitHub release. The version
 
 ## [Unreleased]
 
+## [0.36.0] - 2026-11-19
+
+### Added
+- **A settings menu** (Dear ImGui, as the APB and Punch-Out recomps have): F1 or Esc, or Back and Start together on a controller, open it, and the game pauses under it (its clock and the sound's stop, so nothing jumps when it closes). A hint names the keys for the first ten seconds. Display: full screen; whole multiples, fit or fill the window; smooth or sharp pixels; a CRT television look (scanlines and phosphor stripes, adjustable); vsync; anisotropic texture filtering (an enhancement: up to 16x where the GPU has it). Controls: rumble, and every keyboard key, set by pressing it. Game: volume, stereo or 5.1, the game's language (English, German, French, Spanish, Italian), widescreen, quit.
+- **Widescreen**: the console's 16:9 setting, which the game honours (it draws its 3D for a 16:9 TV, squeezed into its frame, and pillarboxes its 4:3 comic pages itself), on by default; the window shows the frame at 16:9. Off: 4:3, as before.
+- **`ghoulies.ini`** in the data folder holds the settings, written with comments the first time the game runs ([display], [controls], [sound], [console]); a line that doesn't read is named in the log and left at its default.
+
+### Fixed
+- **Shadows**: the game draws every character's shadow into a tile of one 256×256 texture and clears each tile through its viewport. `Clear` now clears within the viewport, as the original (`0x176970`) does (each rectangle clipped to it, or the viewport itself with none); it cleared the whole texture, so each shadow wiped out the others, shadows flickered as characters moved, and the last thing drawn into a tile (a dead imp, an effect) stayed on the floor.
+
 ## [0.35.0] - 2026-11-19
 
 ### Added

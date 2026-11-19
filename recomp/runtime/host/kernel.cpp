@@ -293,6 +293,10 @@ struct Setting {
 // Digital (2 | 0x10000) when the sound device takes 5.1, so the game and
 // DirectSound's 3D calculator pan to the back speakers (set_audio_surround).
 uint32_t g_audio_flags = 0;
+uint32_t g_language = 1;  // XC_LANGUAGE_ENGLISH; the settings' [console] language
+// XC_VIDEO_FLAGS_WIDESCREEN (0x10000) beside the 60 Hz flag: the game draws
+// for a 16:9 screen (squeezed into its 640×480 frame, as on a 16:9 TV).
+bool g_widescreen = false;
 Setting kSettings[] = {
     {0x002, 0, "time zone bias"},        {0x007, 1, "language: English"},
     {0x008, 0x00400000, "video: 60 Hz"}, {0x009, 0, "audio: stereo"},
@@ -305,6 +309,8 @@ void ex_query_non_volatile_setting(rt::Context& c) {
     const uint32_t index = arg(c, 0), ptype = arg(c, 1), value = arg(c, 2), len = arg(c, 3), plen = arg(c, 4);
     const auto it = std::ranges::find(kSettings, index, &Setting::index);
     if (index == 0x009 && it != std::end(kSettings)) it->value = g_audio_flags;
+    if (index == 0x007 && it != std::end(kSettings)) it->value = g_language;
+    if (index == 0x008 && it != std::end(kSettings)) it->value = g_widescreen ? 0x00410000u : 0x00400000u;
     if (it == std::end(kSettings)) {
         static std::string why;
         why = strf("ExQueryNonVolatileSetting: setting %#x isn't modelled yet", index);
@@ -610,6 +616,8 @@ void preload_section(rt::Context& c, uint32_t header) {
 }
 
 void set_audio_surround(bool surround) { g_audio_flags = surround ? 0x00010002u : 0u; }
+void set_console_language(uint32_t language) { g_language = language; }
+void set_console_widescreen(bool widescreen) { g_widescreen = widescreen; }
 
 void register_kernel() {
     for (const KernelFn& k : kKernel) {

@@ -51,9 +51,16 @@ as the Xbox controller, or the keyboard as controller 1:
   Start, Back          Enter, Backspace or Tab
   stick clicks         F, H
 
-F11 or Alt+Enter: full screen.
+F1 or Esc, or Back and Start together on a controller: the settings menu
+(the game pauses). Display: full screen, how the picture fills the window,
+smooth or sharp pixels, a CRT television look, vsync, anisotropic texture
+filtering. Controls: rumble, and the keyboard's keys (set by pressing them).
+Game: volume, stereo or 5.1, the game's language, widescreen (16:9) or 4:3.
+F11 or Alt+Enter: full screen. The window can be resized: the picture keeps
+its shape.
 
-Saves and settings are kept in %LOCALAPPDATA%\qilin\ghoulies.
+Saves and settings are kept in %LOCALAPPDATA%\qilin\ghoulies (the settings
+in ghoulies.ini, which can be edited by hand too).
 
 
 What's in here
@@ -62,7 +69,8 @@ Play Ghoulies.bat   builds (once) and starts the game
 kit\qilin.exe       the recompiler: turns the disc's default.xbe into C++
 kit\lib, include    the prebuilt rest of the game: its runtime, the Xbox's
                     kernel, Direct3D and DirectSound replaced natively, the
-                    renderer (Vulkan), the window, controls and sound (SDL3)
+                    renderer (Vulkan), the window, controls and sound (SDL3),
+                    the settings menu (Dear ImGui)
 kit\toolchain       LLVM-MinGW, a C++ compiler for Windows (Clang)
 kit\ninja.exe       Ninja, which drives the compiler
 work\               made when building: the recompiled code (from your disc)

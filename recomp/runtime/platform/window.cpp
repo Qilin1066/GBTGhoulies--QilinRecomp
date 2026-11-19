@@ -82,10 +82,16 @@ void Window::pixel_size(uint32_t* width, uint32_t* height) const {
 
 bool Window::minimized() const { return (SDL_GetWindowFlags(window_) & SDL_WINDOW_MINIMIZED) != 0; }
 
-void Window::pump(Input* input) {
+bool Window::fullscreen() const { return (SDL_GetWindowFlags(window_) & SDL_WINDOW_FULLSCREEN) != 0; }
+void Window::set_fullscreen(bool on) {
+    if (on != fullscreen()) SDL_SetWindowFullscreen(window_, on);
+}
+
+void Window::pump(Input* input, const std::function<bool(const SDL_Event&)>& hook) {
     SDL_Event e;
     while (SDL_PollEvent(&e)) {
-        if (input) input->on_event(e);
+        if (input) input->on_event(e);  // controllers coming and going, whatever else sees it
+        if (hook && hook(e)) continue;
         switch (e.type) {
         case SDL_EVENT_QUIT:
         case SDL_EVENT_WINDOW_CLOSE_REQUESTED: quit_ = true; break;

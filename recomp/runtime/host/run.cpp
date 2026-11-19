@@ -21,6 +21,7 @@
 
 #include "regions.hpp"
 #include "host.hpp"
+#include "settings.hpp"
 #include "sched.hpp"
 #include "xbe.hpp"
 #include "audio.hpp"
@@ -275,6 +276,16 @@ int main(int argc, char** argv) {
     // And the title's virtual memory, above it.
     host::virtual_memory().init(c.mem, mm.ram_size, rt::kVirtualLimit, true);
     host::register_xapi();
+    // The settings (ghoulies.ini in the data folder): written with the defaults the first time.
+    const std::filesystem::path data_folder = data_dir ? std::filesystem::path(data_dir) : default_data_dir();
+    static platform::Settings settings = platform::load_settings(data_folder);
+    fullscreen = fullscreen || settings.fullscreen;
+    if (!audio_channels) audio_channels = settings.channels;
+    host::set_console_language(settings.language);
+    host::set_console_widescreen(settings.widescreen);
+    d3d.widescreen = settings.widescreen;
+    d3d.settings = &settings;
+    d3d.settings_folder = data_folder.string();
     // The window: where there's no display, the game still runs and draws.
     std::unique_ptr<platform::Window> window;
     if (!headless) {
@@ -287,6 +298,8 @@ int main(int argc, char** argv) {
     if (window) {
         input = std::make_unique<platform::Input>();
         input->start();
+        input->set_keys(settings.keys);
+        input->set_rumble(settings.rumble);
     }
     d3d.window = window.get();
     d3d.input = input.get();

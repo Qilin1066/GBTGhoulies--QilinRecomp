@@ -8,11 +8,13 @@
 #pragma once
 
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <string>
 #include <vector>
 
 struct SDL_Window;
+union SDL_Event;
 
 namespace qilin::platform {
 
@@ -41,7 +43,12 @@ public:
     // Handles what happened since the last call: closing the window asks the
     // runtime to stop (`quit_requested`), F11 and Alt+Enter switch fullscreen;
     // every event goes on to `input` too, if given (controllers coming and going).
-    void pump(Input* input = nullptr);
+    // `hook`, if given, sees each event first (the settings menu) and takes
+    // it with true: keys and buttons it takes go no further.
+    void pump(Input* input = nullptr, const std::function<bool(const SDL_Event&)>& hook = {});
+    bool fullscreen() const;
+    void set_fullscreen(bool on);
+    ::SDL_Window* sdl() const { return window_; }
     bool quit_requested() const { return quit_; }
 
 private:
