@@ -141,7 +141,7 @@ mad oPos.xyz, oPos.xyzz, r1.x, c-37.xyzz
                 for (uint32_t map = 0; map < 8; ++map) {
                     gfx::nv2a::CombinerSetup m = cs;
                     m.texture_modes = k.modes, m.input_texture = k.inputs, m.dot_mapping = map | map << 4 | map << 8;
-                    std::copy_n(k.dims, 4, m.texture_dims);
+                    for (int d = 0; d < 4; ++d) m.texture_dims[d] = uint8_t(k.dims[d]);
                     const char* why = gfx::nv2a::combiners_unsupported(m);
                     if (why) std::fprintf(stderr, "case %d: %s\n", n, why);
                     CHECK(why == nullptr);
@@ -315,8 +315,10 @@ mad oPos.xyz, oPos.xyzz, r1.x, c-37.xyzz
             // Both colour orders and, for DXT5, both alpha orders.
             for (uint32_t b = 0; b < 4; ++b) {
                 uint8_t* c = &blocks[b * kd.block + (kd.block == 16 ? 8 : 0)];
-                if ((b & 1) != (c[1] > c[3] || (c[1] == c[3] && c[0] > c[2]))) std::swap(c[0], c[2]), std::swap(c[1], c[3]);
-                if (kd.code == 0x0F && ((b >> 1) & 1) != (blocks[b * 16] > blocks[b * 16 + 1])) std::swap(blocks[b * 16], blocks[b * 16 + 1]);
+                const bool c0_first = c[1] > c[3] || (c[1] == c[3] && c[0] > c[2]);
+                if (((b & 1) != 0) != c0_first) std::swap(c[0], c[2]), std::swap(c[1], c[3]);
+                const bool a0_first = blocks[b * 16] > blocks[b * 16 + 1];
+                if (kd.code == 0x0F && (((b >> 1) & 1) != 0) != a0_first) std::swap(blocks[b * 16], blocks[b * 16 + 1]);
             }
             // Draws the texture over the square and returns how far its pixels are from `want`.
             auto drawn = [&](uint32_t tex, const gfx::TextureData& want) {

@@ -262,7 +262,7 @@ int main() {
                                  0x0b, 0x0b, 0x0b, 0x0b, 0x0b, 0x0b, 0x0b, 0x0b, 0x0b, 0x0b};
         CHECK(hex(host::hmac_sha1(key, 20, reinterpret_cast<const uint8_t*>("Hi "), 3, reinterpret_cast<const uint8_t*>("There"), 5)) ==
               "b617318655057264e28bc0b6fb378c8ef146be00");
-        const std::string big(80, char(0xaa));  // a key longer than a block is hashed first
+        const std::string big(80, '\xaa');  // a key longer than a block is hashed first
         CHECK(hex(host::hmac_sha1(reinterpret_cast<const uint8_t*>(big.data()), 80,
                                   reinterpret_cast<const uint8_t*>("Test Using Larger Than Block-Size Key - Hash Key First"), 54)) ==
               "aa4ae5e15272d00e95705637ce8a3b55ed402112");
