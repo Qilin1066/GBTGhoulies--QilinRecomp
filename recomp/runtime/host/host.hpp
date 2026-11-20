@@ -136,6 +136,8 @@ void out_of_memory(const char* what, uint32_t bytes);
 
 // The replacements for Ghoulies' XAPI, registered by address (xapi.cpp).
 void register_xapi();
+// Natively replaced game functions with latent bugs (game_fixes.cpp).
+void register_game_fixes();
 // Direct3D (d3d.cpp), over the Vulkan renderer.
 struct D3dConfig {
     std::string dump_dir;     // write each presented frame there as frame_NNNNN.png (--dump-frames)
@@ -181,6 +183,9 @@ void pump_audio(rt::Context& c);
 // loops read QueryPerformanceCounter), at most every 16 ms: what each
 // library added (D3D the window's events, DirectSound the mix).
 void idle(rt::Context& c);
+// The Xbox's time-stamp counter (rdtsc, 733 MHz), from the host's clock: what
+// XAPI's QueryPerformanceCounter reads.
+uint64_t tsc_now();
 void add_idle_hook(void (*hook)(rt::Context&));
 
 // XInput (xinput.cpp): the controller ports, over `input` (null: nothing plugged in).

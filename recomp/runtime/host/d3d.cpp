@@ -92,6 +92,14 @@ struct Device {
     float aspect = 0;                // the shape the game draws for and frames are shown at (0: not yet set)
     D3dConfig config;
     uint32_t width = 0, height = 0, interval = 1;
+    // The frame rate (the settings'): original (the game's interval) and 60
+    // keep the console's vblank clock; display and unlimited give the game
+    // its time step from the host's clock (frame_clock) and pace frames by
+    // the display (frame_pacing).
+    platform::Settings::FrameRate frame_rate = platform::Settings::FrameRate::Original;
+    std::chrono::steady_clock::time_point clock_last{};  // the frame clock's last call (unlocked rates)
+    std::chrono::steady_clock::time_point next_frame{};  // the next frame's time, pacing without vsync
+    std::chrono::steady_clock::time_point last_refresh{};  // when the last early acquire returned (the display's refresh)
     std::vector<uint32_t> frame_buffers;  // guest surfaces; frame_buffers[i] is the renderer's buffer i
     // Frame buffers the CPU locked (cpu_frames.cpp below): the renderer's
     // buffer index and the hash of guest memory as the image was copied there.
@@ -286,6 +294,104 @@ void run_vblanks(rt::Context& c, Device& d, uint32_t until, bool swap_done) {
         st(c, d.vblank_data + 8, swap_done && d.vblanks == until ? 1u : 0u);
         call_guest(c, d.vblank_callback, {d.vblank_data});
     }
+}
+
+// The game's frame clock at 0xFC030 (its per-frame function's first call):
+// the time step in seconds (0x5096C0) and the 300 Hz ticks it makes (count
+// 0x5096C4, carry 0x5096C8), as the original computes them: the vblanks
+// since the last present (0x5096D0, the vblank callback's) over the rate
+// (50 for PAL, else 60), the unclamped value at 0x5096B8, clamped to five
+// vblanks (5.0 at 0x32B184 over the rate), times 300 (0x32B180) plus the
+// carry, truncated; and the performance counter since start-up's low word
+// at 0x5096BC. With the frame rate unlocked (60, display, unlimited) the
+// time since its last call stands in for the vblanks, so the game moves by
+// the time that passed at any frame rate (it was written for a varying step;
+// the console never gave it less than 1/30 s, and the few places that
+// assumed so are fixed in game_fixes.cpp). Its ticks then run as they would:
+// whatever is done per tick happens as often as before.
+void frame_clock(rt::Context& c) {
+    Device* dp = g_device;
+    const rt::Mem m = mem(c);
+    auto f32 = [&](uint32_t a) { return std::bit_cast<float>(rt::ld32(m, a, 0)); };
+    auto put = [&](uint32_t a, float v) { rt::st32(m, a, std::bit_cast<uint32_t>(v), 0); };
+    const int rate = rt::ld32(m, 0x5096E0, 0) && !rt::ld32(m, 0x5096E4, 0) ? 50 : 60;
+    const float most = f32(0x32B184) / float(rate);
+    rt::st32(m, 0x5096BC, uint32_t(tsc_now()) - rt::ld32(m, 0x50E0D8, 0), 0);
+    float step;
+    const bool unlocked = dp && dp->frame_rate != platform::Settings::FrameRate::Original;
+    if (unlocked) {
+        const auto now = std::chrono::steady_clock::now();
+        const auto last = std::exchange(dp->clock_last, now);
+        // The first frame: two vblanks, as the console's first.
+        step = last.time_since_epoch().count() ? std::chrono::duration<float>(now - last).count() : 2.0f / float(rate);
+    } else {
+        // fild of the count (unsigned: 2^32 added to a negative one, 0x32B144), over the rate.
+        const uint32_t vblanks = rt::ld32(m, 0x5096D0, 0);
+        step = float(double(vblanks) / double(rate));
+    }
+    put(0x5096B8, step);
+    const float dt = step > most ? most : step;
+    put(0x5096C0, dt);
+    const float x = dt * f32(0x32B180) + f32(0x5096C8);
+    const int32_t ticks = int32_t(x);  // cvttss2si
+    rt::st32(m, 0x5096C4, uint32_t(ticks), 0);
+    put(0x5096C8, x - float(ticks));
+    ret(c, c.eax, 0);
+}
+
+// Waiting for the next frame, at the end of Swap. Original: the console's
+// vblank after the game's presentation interval, by the clock, as the
+// console's Swap waits. 60: sixty frames a second by the clock (fewer on a
+// slower display). Display and unlimited, with vsync and a window: the
+// window's next image is taken here
+// (acquire_early), which waits for the display's refresh when it has no
+// free one, so the game reads its input for the next frame just after the
+// refresh. Without vsync, the display's refresh rate is kept by the clock
+// (display), or there's no wait (unlimited). The vblank callback then runs
+// for each vblank that went by.
+//
+// The guest's other threads run only while this one waits (one processor:
+// the game's loader has a lower priority than its main thread, and on the
+// console ran in Swap's wait for the vblank), so a frame always gives up the
+// processor for kYield at least, and the wait for the display is a sleep
+// until just before the refresh (from when the last acquire returned), then
+// the acquire: the processor is held a millisecond or so at most.
+constexpr auto kYield = std::chrono::milliseconds(2);
+void frame_pacing(rt::Context& c, Device& d) {
+    using Rate = platform::Settings::FrameRate;
+    using Clock = std::chrono::steady_clock;
+    if (d.frame_rate == Rate::Original) {
+        const uint32_t target = std::max(d.vblanks + d.interval, vblanks_elapsed(d) + 1);
+        // The thread blocks until then, as on the console: other guest threads run.
+        host::sched::sleep_until(d.epoch + std::chrono::duration_cast<Clock::duration>(
+                                               std::chrono::duration<double>(double(target) / kVblankHz)));
+        mirror_device(c, d);
+        run_vblanks(c, d, target, true);
+        return;
+    }
+    float hz = d.config.window ? d.config.window->refresh_rate() : 0.0f;
+    if (hz < 24.0f || hz > 1000.0f) hz = float(kVblankHz);
+    if (d.frame_rate == Rate::Sixty) hz = std::min(hz, float(kVblankHz));
+    const auto period = std::chrono::duration_cast<Clock::duration>(std::chrono::duration<double>(1.0 / hz));
+    const auto now = Clock::now();
+    bool by_display = false;
+    if (d.picture.vsync && d.config.window && d.frame_rate != Rate::Sixty) {
+        const auto before_refresh = d.last_refresh + period - std::chrono::microseconds(1500);
+        host::sched::sleep_until(std::max(now + kYield, before_refresh));
+        by_display = d.renderer->acquire_early();
+        if (by_display) d.last_refresh = Clock::now();
+    }
+    if (!by_display) {
+        auto wake = now + kYield;
+        if (d.frame_rate == Rate::Display || d.frame_rate == Rate::Sixty) {
+            d.next_frame += period;
+            if (d.next_frame < now - period || d.next_frame > now + 2 * period) d.next_frame = now;  // fell behind, or a new start
+            wake = std::max(wake, d.next_frame);
+        }
+        if (wake > Clock::now()) host::sched::sleep_until(wake);
+    }
+    mirror_device(c, d);
+    run_vblanks(c, d, std::max(d.vblanks, vblanks_elapsed(d)), true);
 }
 
 // ---------------------------------------------------------------- frames out
@@ -657,6 +763,8 @@ void apply_settings(Device& d, const platform::Settings& s) {
     p.scanlines = float(s.scanlines) / 100.0f;
     p.mask = float(s.mask) / 100.0f;
     p.vsync = s.vsync;
+    p.low_latency = s.low_latency;
+    d.frame_rate = s.frame_rate;
     p.aspect = d.aspect ? d.aspect : 16.0f / 9.0f;  // a new shape comes with the game's next frame (update_aspect)
     d.renderer->set_picture(p);
     d.renderer->set_anisotropy(s.anisotropy);
@@ -746,6 +854,7 @@ void swap(rt::Context& c) {
         }
         pause_audio(false);
         d.epoch += std::chrono::steady_clock::now() - paused;
+        d.clock_last += std::chrono::steady_clock::now() - paused;  // the unlocked clock too
     }
     update_aspect(c, d, std::exchange(d.settings_changed, false));
     if (d.swaps % 64 == 0) sweep_vertex_runs(d, 120);  // runs not drawn for 4 seconds leave the vertex arena
@@ -758,13 +867,23 @@ void swap(rt::Context& c) {
         host::call_guest(c, 0x175B90, {old_back});
         st(c, kDeviceStorage + kDevRenderTarget, now);
     }
-    // Wait for the vblank the interval asks for, counted from the last swap's.
-    const uint32_t target = std::max(d.vblanks + d.interval, vblanks_elapsed(d) + 1);
-    // The thread blocks until then, as on the console: other guest threads run.
-    host::sched::sleep_until(d.epoch + std::chrono::duration_cast<std::chrono::steady_clock::duration>(
-                                           std::chrono::duration<double>(double(target) / kVblankHz)));
-    mirror_device(c, d);
-    run_vblanks(c, d, target, true);
+    frame_pacing(c, d);
+    // QILIN_FPS=1: frames per second, and the game's time step, once a second.
+    static const bool fps = std::getenv("QILIN_FPS") != nullptr;
+    if (fps) {
+        static auto since = std::chrono::steady_clock::now();
+        static uint32_t from = d.swaps;
+        const auto now = std::chrono::steady_clock::now();
+        static float lo = 1e9f, hi = 0.0f;
+        const float step = std::bit_cast<float>(ld(c, 0x5096C0));
+        lo = std::min(lo, step), hi = std::max(hi, step);
+        if (now - since >= std::chrono::seconds(1)) {
+            const double s = std::chrono::duration<double>(now - since).count();
+            std::fprintf(stderr, "qilin: %.1f frames a second, time step %.4f s (%.5f to %.5f)\n", (d.swaps - from) / s, double(step),
+                         double(lo), double(hi));
+            since = now, from = d.swaps, lo = 1e9f, hi = 0.0f;
+        }
+    }
     deliver_frame(d);
     pump_audio(c);
     pump_window(d);
@@ -3435,6 +3554,7 @@ void register_d3d(const D3dConfig& config) {
             flush_cpu_frames(c, d);
         }
     });
+    register_hle(0x0FC030, "the game's frame clock", frame_clock);
     for (const D3dFn& f : kD3d) {
         const XdkSymbol* s = xdk_symbol(f.name);
         if (!s) {
@@ -3454,3 +3574,4 @@ void register_d3d(const D3dConfig& config) {
 }
 
 }  // namespace qilin::host
+

@@ -161,8 +161,9 @@ public:
     bool pack_depth(uint32_t depth_target, uint32_t render_target) override;
     Image read_front_buffer() override { return read(color_[front_]); }
     void present_again() override;
+    bool acquire_early() override;
     void set_picture(const Picture& p) override {
-        if (p.vsync != picture_.vsync) swap_stale_ = true;  // another present mode: a new swapchain
+        if (p.vsync != picture_.vsync || p.low_latency != picture_.low_latency) swap_stale_ = true;  // a new swapchain
         picture_ = p;
     }
     void set_anisotropy(uint32_t level) override { anisotropy_ = std::clamp<uint32_t>(level, 1, max_anisotropy_); }
@@ -287,6 +288,11 @@ private:
     std::vector<VkImageView> swap_views_;  // when the window's images can be drawn into (present_pass_)
     bool present_pass_ = false;
     VkSemaphore acquired_ = VK_NULL_HANDLE;
+    // The window image acquire_early took, with the semaphore its acquire
+    // signals (the next present uses both; none: -1).
+    int64_t early_index_ = -1;
+    VkSemaphore early_signal_ = VK_NULL_HANDLE;
+    VkSemaphore present_wait_ = VK_NULL_HANDLE;  // what the present's submission waits on
     std::vector<VkSemaphore> rendered_;  // one for each swapchain image, which its presentation waits for
     bool swap_stale_ = false;            // out of date or suboptimal: made again before the next frame
 
@@ -434,6 +440,7 @@ private:
     uint8_t gamma_[3][256] = {};
     bool gamma_set_ = false;
     void present_through_pass(Target& frame, uint32_t index, int32_t dx, int32_t dy, uint64_t dw, uint64_t dh);
+    void drop_early_image();
     VkPipeline present_pipeline();
     VkBuffer staging_buffer(const void* data, VkDeviceSize bytes);
 };
@@ -1040,6 +1047,40 @@ void VulkanRenderer::present_again() {
     show(color_[front_]);
 }
 
+// The image acquire_early took isn't wanted (the swapchain is made again):
+// its semaphore will be signalled, and a semaphore must be waited on before
+// it's signalled again, so a submission of nothing waits on it.
+void VulkanRenderer::drop_early_image() {
+    if (early_index_ < 0) return;
+    VkSemaphoreSubmitInfo w{VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO};
+    w.semaphore = early_signal_;
+    w.stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+    VkSubmitInfo2 info{VK_STRUCTURE_TYPE_SUBMIT_INFO_2};
+    info.waitSemaphoreInfoCount = 1;
+    info.pWaitSemaphoreInfos = &w;
+    check(vkQueueSubmit2(queue_, 1, &info, VK_NULL_HANDLE), "vkQueueSubmit2");
+    early_index_ = -1;
+    early_signal_ = VK_NULL_HANDLE;
+}
+
+bool VulkanRenderer::acquire_early() {
+    if (!surface_ || !swapchain_ || swap_stale_ || early_index_ >= 0) return false;
+    uint32_t w = 0, h = 0;
+    if (config_.surface.size) config_.surface.size(&w, &h);
+    if (w != swap_extent_.width || h != swap_extent_.height) return false;  // the next present makes the swapchain again
+    uint32_t index = 0;
+    const VkResult got = vkAcquireNextImageKHR(device_, swapchain_, UINT64_MAX, acquired_, VK_NULL_HANDLE, &index);
+    if (got == VK_ERROR_OUT_OF_DATE_KHR) {
+        swap_stale_ = true;
+        return false;
+    }
+    if (got == VK_SUBOPTIMAL_KHR) swap_stale_ = true;
+    else check(got, "vkAcquireNextImageKHR");
+    early_index_ = index;
+    early_signal_ = acquired_;
+    return true;
+}
+
 void VulkanRenderer::present() {
     if (unsaved_pipelines_ && std::chrono::steady_clock::now() - last_pipeline_ > std::chrono::seconds(5)) save_pipeline_cache();
     end_pass();
@@ -1105,9 +1146,17 @@ bool VulkanRenderer::make_swapchain(uint32_t width, uint32_t height) {
                                   : has(VK_PRESENT_MODE_MAILBOX_KHR)   ? VK_PRESENT_MODE_MAILBOX_KHR
                                   : has(VK_PRESENT_MODE_IMMEDIATE_KHR) ? VK_PRESENT_MODE_IMMEDIATE_KHR
                                                                        : VK_PRESENT_MODE_FIFO_KHR;
+    // One more image than the least the surface takes lets the CPU run a
+    // frame ahead of the display. With vsync and low latency, the least
+    // (two at least): acquiring an image then waits for the display, so at
+    // most one finished frame waits to be shown, and the game reads its
+    // input just after a refresh. MAILBOX keeps the extra one, to have an
+    // image to replace.
     uint32_t count = caps.minImageCount + 1;
+    if (mode == VK_PRESENT_MODE_FIFO_KHR && picture_.low_latency) count = std::max(caps.minImageCount, 2u);
     if (caps.maxImageCount && count > caps.maxImageCount) count = caps.maxImageCount;
 
+    drop_early_image();
     check(vkDeviceWaitIdle(device_), "vkDeviceWaitIdle");  // the old swapchain's images may still be presenting
     VkSwapchainCreateInfoKHR info{VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR};
     info.surface = surface_;
@@ -1176,13 +1225,21 @@ void VulkanRenderer::show(Target& frame) {
     if (!swapchain_ || swap_stale_ || (w != swap_extent_.width || h != swap_extent_.height))
         if (!make_swapchain(w, h)) return submit();
     uint32_t index = 0;
-    const VkResult got = vkAcquireNextImageKHR(device_, swapchain_, UINT64_MAX, acquired_, VK_NULL_HANDLE, &index);
-    if (got == VK_ERROR_OUT_OF_DATE_KHR) {
-        swap_stale_ = true;
-        return submit();
+    if (early_index_ >= 0) {  // taken already (acquire_early)
+        index = uint32_t(early_index_);
+        present_wait_ = early_signal_;
+        early_index_ = -1;
+        early_signal_ = VK_NULL_HANDLE;
+    } else {
+        const VkResult got = vkAcquireNextImageKHR(device_, swapchain_, UINT64_MAX, acquired_, VK_NULL_HANDLE, &index);
+        if (got == VK_ERROR_OUT_OF_DATE_KHR) {
+            swap_stale_ = true;
+            return submit();
+        }
+        if (got == VK_SUBOPTIMAL_KHR) swap_stale_ = true;
+        else check(got, "vkAcquireNextImageKHR");
+        present_wait_ = acquired_;
     }
-    if (got == VK_SUBOPTIMAL_KHR) swap_stale_ = true;
-    else check(got, "vkAcquireNextImageKHR");
 
     // The frame's shape on screen: its aspect (4:3, or 16:9 for a
     // widescreen game), as a width over a height of 1000.
@@ -1241,7 +1298,7 @@ void VulkanRenderer::show(Target& frame) {
                    picture_.smooth ? VK_FILTER_LINEAR : VK_FILTER_NEAREST);
     barrier(VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT,
             VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, 0);  // before the semaphore present waits on
-    submit(acquired_, rendered_[index]);
+    submit(present_wait_, rendered_[index]);
 
     VkPresentInfoKHR info{VK_STRUCTURE_TYPE_PRESENT_INFO_KHR};
     info.waitSemaphoreCount = 1;
@@ -1557,7 +1614,7 @@ void VulkanRenderer::present_through_pass(Target& frame, uint32_t index, int32_t
     vkCmdEndRendering(cmd_);
     barrier(VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
             VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, 0);  // before the semaphore present waits on
-    submit(acquired_, rendered_[index]);
+    submit(present_wait_, rendered_[index]);
 
     VkPresentInfoKHR pi{VK_STRUCTURE_TYPE_PRESENT_INFO_KHR};
     pi.waitSemaphoreCount = 1;

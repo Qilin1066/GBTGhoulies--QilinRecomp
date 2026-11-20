@@ -153,9 +153,12 @@ constexpr uint32_t kLiftedD3d[] = {
 // the fixed-function shader object for an FVF).
 constexpr uint32_t kStartupRoots[] = {0x151011, 0x179FE0, 0x172DA0, 0x1731A0, 0x173000, 0x172F90, 0x172EE0, 0x1C8D48, 0x1C8D53, 0x1CBAD6, 0x1CBAE1, 0x175890, 0x1C8E42, 0x1C8E8B, 0x1C8FEE, 0x1C9084, 0x1C90CF, 0x1C91E0, 0x1C9270, 0x1C933F, 0x1C93E1, 0x1C945A, 0x175970, 0x175B90, 0x17B080, 0x174080, 0x17AF60, 0x171F40};
 
-// Library functions the runtime replaces natively instead: never lifted, and
-// the closure doesn't follow them. Each needs a registered replacement.
+// Functions the runtime replaces natively instead: never lifted, and the
+// closure doesn't follow them. Each needs a registered replacement.
 constexpr Replaced kNative[] = {
+    {0x12BC80, "a screen transition's update: a timer landing on exactly zero stalled it (game_fixes.cpp)"},
+    {0x12BDD0, "another screen transition type's update, with the same countdown (game_fixes.cpp)"},
+    {0x0FC030, "the game's frame clock (first thing each frame): its time step from the vblanks since the last present, or with the frame rate unlocked, from the host's clock"},
     {0x1517B9, "XAPI start-up patch of kernel code for known kernel builds (cli; mov [kernel], …; sti)"},
     {0x151B45, "XAPI's shutdown notification (registered with HalRegisterShutdownNotification at 0x32CF18): reloads the GDT; the runtime never shuts the console down"},
     {0x14B924, "OutputDebugStringA: int 0x2D, the kernel debugger's print service; the runtime prints the string"},

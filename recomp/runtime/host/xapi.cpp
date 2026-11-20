@@ -13,6 +13,8 @@ namespace {
 
 constexpr uint64_t kTscHz = 733333333;  // the Xbox's Pentium III clock, what XAPI's counter counts
 
+}  // namespace
+
 // BOOL QueryPerformanceCounter(LARGE_INTEGER*) at 0x14C29C: XAPI reads rdtsc.
 // Host time, scaled to the Xbox's 733 MHz.
 uint64_t tsc_now() {
@@ -20,6 +22,8 @@ uint64_t tsc_now() {
     const uint64_t ns = uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count());
     return ns / 1000000000u * kTscHz + ns % 1000000000u * kTscHz / 1000000000u;
 }
+
+namespace {
 
 void query_performance_counter(rt::Context& c) {
     idle(c);

@@ -129,6 +129,14 @@ std::string settings_text(const Settings& s) {
          "mask = " << s.mask << "\n"
          "# on: at the display's refresh, no tearing; off: the lowest latency.\n"
          "vsync = " << on(s.vsync) << "\n"
+         "# Frames per second: original (30, as the console), 60, display (the\n"
+         "# screen's refresh rate), or unlimited (capped at the refresh rate with vsync).\n"
+         "frame_rate = " << (s.frame_rate == Settings::FrameRate::Original ? "original"
+                             : s.frame_rate == Settings::FrameRate::Sixty  ? "60"
+                             : s.frame_rate == Settings::FrameRate::Display ? "display"
+                                                                            : "unlimited") << "\n"
+         "# on: with vsync, at most one frame waiting for the screen (the least lag).\n"
+         "low_latency = " << on(s.low_latency) << "\n"
          "# Texture filtering: 1 (the console's), 2, 4, 8 or 16.\n"
          "anisotropy = " << s.anisotropy << "\n"
          "# The picture's shape, width:height: auto (the screen's own), 4:3 (the\n"
@@ -207,6 +215,13 @@ Settings parse_settings(const std::string& text, std::vector<std::string>& warni
             } else if (key == "scanlines") ok = read_uint(v, 0, 100, &s.scanlines);
             else if (key == "mask") ok = read_uint(v, 0, 100, &s.mask);
             else if (key == "vsync") ok = read_bool(v, &s.vsync);
+            else if (key == "frame_rate") {
+                if (v == "original" || v == "30") s.frame_rate = Settings::FrameRate::Original;
+                else if (v == "60") s.frame_rate = Settings::FrameRate::Sixty;
+                else if (v == "display") s.frame_rate = Settings::FrameRate::Display;
+                else if (v == "unlimited") s.frame_rate = Settings::FrameRate::Unlimited;
+                else ok = false;
+            } else if (key == "low_latency") ok = read_bool(v, &s.low_latency);
             else if (key == "anisotropy") ok = read_uint(v, 1, 16, &s.anisotropy);
             else if (key == "aspect") ok = aspect_given = read_aspect(v, &s.aspect_w, &s.aspect_h);
             else if (key == "hud") {

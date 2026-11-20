@@ -50,6 +50,7 @@ struct Picture {
     float scanlines = 0.6f;  // CRT: how dark the gaps between raster lines are, 0..1
     float mask = 0.3f;       // CRT: the phosphor stripes' strength, 0..1
     bool vsync = true;       // at the display's refresh, no tearing; off: the lowest latency
+    bool low_latency = true; // with vsync, the fewest swapchain images: at most one frame queued
     // The shape the frame is shown at, width over height: 4:3, or 16:9 for a
     // game drawing for a widescreen TV (squeezed into the same frame).
     float aspect = 4.0f / 3.0f;
@@ -183,6 +184,11 @@ public:
     // Shows the front buffer again, with the overlay (a paused game's
     // frame under the menu); no flip.
     virtual void present_again() = 0;
+    // Takes the window's next image now, for the next present: with vsync
+    // that waits until the display has a free one (its refresh), so the game
+    // reads its input for the next frame just after it. False where there's
+    // no window or nothing was waited for.
+    virtual bool acquire_early() = 0;
     virtual uint64_t frames_presented() const = 0;
     // How the window shows frames, from the next one shown.
     virtual void set_picture(const Picture& p) = 0;

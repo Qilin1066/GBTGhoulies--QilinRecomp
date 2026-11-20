@@ -42,6 +42,8 @@ public:
     // The shape (width / height) of the desktop on the display the window is
     // on, or of the main display before there's a window; 0 if unknown.
     float screen_aspect() const;
+    // The refresh rate of the screen the window is on, in Hz (0: not known).
+    float refresh_rate() const;
     static float main_screen_aspect();
 
     // Handles what happened since the last call: closing the window asks the

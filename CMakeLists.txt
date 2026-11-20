@@ -7,7 +7,7 @@ if(APPLE AND NOT CMAKE_OSX_DEPLOYMENT_TARGET)
     set(CMAKE_OSX_DEPLOYMENT_TARGET 10.15 CACHE STRING "oldest macOS the runtime runs on")
 endif()
 # The single source of the version number (see CHANGELOG.md for the scheme).
-project(GBTGhoulies-QilinRecomp VERSION 0.39.1 LANGUAGES C CXX)
+project(GBTGhoulies-QilinRecomp VERSION 0.40.0 LANGUAGES C CXX)
 
 # ---- Language: C++23 everywhere (recompiler, runtime, generated code) ----
 set(CMAKE_CXX_STANDARD 23)
@@ -201,7 +201,7 @@ target_link_libraries(qilin_ui PUBLIC qilin_gfx qilin_platform qilin_imgui PRIVA
 target_compile_definitions(qilin_ui PRIVATE QILIN_VERSION="${PROJECT_VERSION}")
 
 # ---- Runtime host side: native replacements (HLE) for code that isn't lifted ----
-add_library(qilin_host STATIC recomp/runtime/host/host.cpp recomp/runtime/host/xapi.cpp recomp/runtime/host/kernel.cpp recomp/runtime/host/kernel_crypto.cpp recomp/runtime/host/sched.cpp
+add_library(qilin_host STATIC recomp/runtime/host/host.cpp recomp/runtime/host/xapi.cpp recomp/runtime/host/game_fixes.cpp recomp/runtime/host/kernel.cpp recomp/runtime/host/kernel_crypto.cpp recomp/runtime/host/sched.cpp
                               recomp/runtime/host/kernel_io.cpp recomp/runtime/host/xinput.cpp
                               recomp/runtime/host/call_guest.cpp recomp/runtime/host/d3d.cpp
                               recomp/runtime/host/dsound.cpp recomp/runtime/host/guest_ram.cpp recomp/runtime/host/aspect.cpp)

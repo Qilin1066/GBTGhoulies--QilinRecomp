@@ -277,6 +277,7 @@ int main(int argc, char** argv) {
     // And the title's virtual memory, above it.
     host::virtual_memory().init(c.mem, mm.ram_size, rt::kVirtualLimit, true);
     host::register_xapi();
+    host::register_game_fixes();
     // The settings (ghoulies.ini in the data folder): written with the defaults the first time.
     const std::filesystem::path data_folder = data_dir ? std::filesystem::path(data_dir) : default_data_dir();
     static platform::Settings settings = platform::load_settings(data_folder);

@@ -327,6 +327,12 @@ void Menu::display_page() {
         if (ImGui::SliderInt("Phosphor stripes", &mask, 0, 100, "%d%%", ImGuiSliderFlags_AlwaysClamp)) s_.mask = uint32_t(mask), changed();
     }
     if (ImGui::Checkbox("Vsync (off: the lowest latency, may tear)", &s_.vsync)) changed();
+    {
+        static const char* const kRates[] = {"30 (original)", "60", "The display's refresh rate", "Unlimited"};
+        int rate = int(s_.frame_rate);
+        if (ImGui::Combo("Frame rate", &rate, kRates, 4)) s_.frame_rate = platform::Settings::FrameRate(rate), changed();
+    }
+    if (ImGui::Checkbox("Low latency (with vsync: at most one frame waiting)", &s_.low_latency)) changed();
     if (ImGui::Button("Look at the picture")) peek_ = true;
     ImGui::SameLine();
     ImGui::TextDisabled("(any key or button comes back)");

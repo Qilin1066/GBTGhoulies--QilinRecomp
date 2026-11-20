@@ -11,6 +11,16 @@ Each release is a git tag (`vX.Y.Z`) with a matching GitHub release. The version
 
 ## [Unreleased]
 
+## [0.40.0] - 2026-11-20
+
+### Added
+- **The frame rate unlocked**: a Frame rate option on the Display page (`frame_rate` in [display]): 30 as the console, 60, your display's refresh rate (the default: 144 frames a second on a 144 Hz screen, if the computer keeps up), or unlimited. The game's time step comes from the clock, so it plays at the right speed at any rate.
+- **Low latency** (on by default, `low_latency` in [display]): with vsync, at most one frame waits for the screen, and the game reads your controls just after each refresh, so what you press shows at the next one.
+- `QILIN_FPS=1` logs the frame rate and the time step once a second.
+
+### Fixed
+- With the frame rate unlocked, the game stalled on the loading screen before the first fight: a screen transition's timer that lands on exactly zero (a step the console never takes) never finished. The transitions' updates are replaced natively with that case counted as finished; at 30 frames a second nothing changes.
+
 ## [0.39.1] - 2026-11-20
 
 ### Fixed

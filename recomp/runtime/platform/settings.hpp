@@ -38,6 +38,13 @@ struct Settings {
     uint32_t scanlines = 60;           // CRT: the gaps between raster lines, 0-100 (percent dark)
     uint32_t mask = 30;                // CRT: the phosphor stripes, 0-100
     bool vsync = true;                 // at the display's refresh, no tearing; off: the lowest latency
+    // Frames per second: the console's 30, 60, the display's refresh rate
+    // (the game's time step from the clock, not the console's vblanks), or
+    // as many as the computer draws (capped at the refresh rate with vsync).
+    enum class FrameRate : uint8_t { Original, Sixty, Display, Unlimited } frame_rate = FrameRate::Display;
+    // With vsync, one frame at most waiting for the display (fewer swapchain
+    // images): the least lag, a little less slack for a GPU near its limit.
+    bool low_latency = true;
     uint32_t anisotropy = 1;           // texture filtering: 1 (the console's), 2, 4, 8 or 16
     // The picture's shape, width:height: 4:3 the original, wider ones show more
     // at the sides (up to 4:1); 0:0 is "auto", the screen's own shape.

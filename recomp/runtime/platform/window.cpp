@@ -82,6 +82,11 @@ float desktop_aspect(SDL_DisplayID display) {
 
 float Window::screen_aspect() const { return desktop_aspect(SDL_GetDisplayForWindow(window_)); }
 
+float Window::refresh_rate() const {
+    const SDL_DisplayMode* mode = SDL_GetCurrentDisplayMode(SDL_GetDisplayForWindow(window_));
+    return mode && mode->refresh_rate > 0 ? mode->refresh_rate : 0.0f;
+}
+
 float Window::main_screen_aspect() {
     std::string error;
     return start_video(&error) ? desktop_aspect(SDL_GetPrimaryDisplay()) : 0.0f;
