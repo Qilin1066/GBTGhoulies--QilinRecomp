@@ -2,6 +2,7 @@
 
 #include "input.hpp"
 
+#include <algorithm>
 #include <SDL3/SDL.h>
 #define SDL_MAIN_HANDLED  // the runtime's own main() starts everything; SDL is told it's ready
 #include <SDL3/SDL_main.h>
@@ -36,14 +37,17 @@ std::unique_ptr<Window> Window::create(const std::string& title, uint32_t width,
     if (!start_video(error)) return nullptr;
     SDL_WindowFlags flags = SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY;
     if (fullscreen) flags |= SDL_WINDOW_FULLSCREEN;  // borderless, at the desktop's mode
-    // The largest whole multiple of the size that fits the main display's
-    // usable area, so the picture is big and its pixels even.
-    uint32_t scale = 1;
+    // As large as fits nine tenths of the main display's usable area, at the
+    // size's shape (the picture's): a whole multiple of the game's 480 lines
+    // would leave a 16:9 picture at 854×480 on a 1080p screen.
+    uint32_t w0 = width, h0 = height;
     SDL_Rect usable{};
-    if (SDL_GetDisplayUsableBounds(SDL_GetPrimaryDisplay(), &usable) && width && height)
-        while (width * (scale + 1) <= uint32_t(usable.w) * 9 / 10 && height * (scale + 1) <= uint32_t(usable.h) * 9 / 10) ++scale;
+    if (SDL_GetDisplayUsableBounds(SDL_GetPrimaryDisplay(), &usable) && width && height) {
+        const double fit = std::min(double(usable.w) * 0.9 / width, double(usable.h) * 0.9 / height);
+        if (fit > 1.0) w0 = uint32_t(width * fit), h0 = uint32_t(height * fit);
+    }
     std::unique_ptr<Window> w(new Window);
-    w->window_ = SDL_CreateWindow(title.c_str(), int(width * scale), int(height * scale), flags);
+    w->window_ = SDL_CreateWindow(title.c_str(), int(w0), int(h0), flags);
     if (!w->window_) {
         *error = std::string("can't open a window: ") + SDL_GetError();
         return nullptr;

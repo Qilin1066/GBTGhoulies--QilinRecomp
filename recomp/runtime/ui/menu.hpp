@@ -5,6 +5,9 @@
 // A hint names the keys for the first seconds of a run.
 #pragma once
 
+#include "frame_times.hpp"
+#include <string>
+#include <vector>
 #include <cstdint>
 #include <filesystem>
 #include <functional>
@@ -44,12 +47,18 @@ public:
     // Builds what's drawn over the next frame shown (the menu, or the hint),
     // or nothing.
     void tick();
+    // A frame reached the screen, this long after the last (the counter's);
+    // `details` are lines the counter shows under its numbers.
+    void frame_shown(double ms, std::vector<std::string> details);
+    // Frames between these two aren't counted (the menu's pause).
+    void restart_frame_times() { frame_times_.clear(); }
 
 private:
     void toggle();
     void close();
     void draw_menu();
     void draw_hint();
+    void draw_frame_times();
     void controls_page();
     void display_page();
     void aspect_combo();
@@ -64,6 +73,8 @@ private:
     bool ok_ = false, sdl_backend_ = false, vulkan_backend_ = false;
     bool open_ = false, quit_ = false, close_asked_ = false, peek_ = false, drawing_ = false;
     uint64_t hint_until_ = 0;
+    FrameTimes frame_times_;
+    std::vector<std::string> frame_details_;
     int capture_ = -1;            // the control waiting for a key, or -1
     uint64_t capture_until_ = 0;  // when waiting gives up
     std::string note_;

@@ -26,7 +26,7 @@ void check_vk(VkResult r) {
     if (r != VK_SUCCESS) std::fprintf(stderr, "qilin: Vulkan error %d in the settings menu\n", int(r));
 }
 
-constexpr const char* kHint = "F1 or Esc (controller: Back and Start together): settings";
+constexpr const char* kHint = "F1 or Esc (controller: Back and Start together): settings    F3: frame rate counter";
 
 struct Language {
     uint32_t value;
@@ -127,6 +127,12 @@ bool Menu::handle(const SDL_Event& e) {
                 toggle();
                 return true;
             }
+            if (!e.key.repeat && e.key.key == SDLK_F3) {  // the frame rate counter, kept in the settings
+                s_.performance_overlay = !s_.performance_overlay;
+                if (!platform::save_settings(folder_, s_))
+                    std::printf("qilin_run: the settings can't be saved to %s\n", platform::settings_file(folder_).string().c_str());
+                return true;
+            }
             break;
         case SDL_EVENT_GAMEPAD_BUTTON_DOWN: {
             // Back and Start together (alone they're the game's); with the
@@ -183,7 +189,8 @@ void Menu::tick() {
     const uint64_t now = SDL_GetTicks();
     if (capture_ >= 0 && now >= capture_until_) capture_ = -1, note_ = "Nothing was pressed: unchanged.";
     const bool hint = !open_ && now < hint_until_;
-    if (!open_ && !hint) {
+    const bool counter = !open_ && s_.performance_overlay;
+    if (!open_ && !hint && !counter) {
         if (drawing_) renderer_.set_overlay({}), drawing_ = false;
         return;
     }
@@ -196,10 +203,40 @@ void Menu::tick() {
     ImGui_ImplVulkan_NewFrame();
     ImGui_ImplSDL3_NewFrame();
     ImGui::NewFrame();
+    if (counter) draw_frame_times();
     if (hint) draw_hint();
-    else if (!peek_) draw_menu();
+    else if (open_ && !peek_) draw_menu();
     ImGui::Render();
     if (close_asked_) close_asked_ = false, close();
+}
+
+void Menu::frame_shown(double ms, std::vector<std::string> details) {
+    frame_times_.add(ms);
+    frame_details_ = std::move(details);
+}
+
+// F3: how fast and how evenly frames reach the screen, top left. The lows
+// are the frame rates of the slowest 1% and 0.1% of frames over the last
+// 20 s (as PunchOutWii-QilinRecomp's counter).
+void Menu::draw_frame_times() {
+    const FrameTimes::Summary s = frame_times_.summary();
+    const ImGuiViewport* vp = ImGui::GetMainViewport();
+    ImGui::SetNextWindowPos(ImVec2(vp->WorkPos.x + 8.0f, vp->WorkPos.y + 8.0f), ImGuiCond_Always);
+    ImGui::SetNextWindowBgAlpha(0.55f);
+    ImGui::Begin("##frame times", nullptr,
+                 ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoInputs | ImGuiWindowFlags_NoNav |
+                     ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoSavedSettings);
+    if (s.frames == 0) {
+        ImGui::TextUnformatted("frame times: waiting for frames");
+    } else {
+        ImGui::Text("%.1f fps  %.2f ms", s.fps, s.average_ms);
+        ImGui::Text("1%% low %.1f  0.1%% low %.1f", s.low1_fps, s.low01_fps);
+        ImGui::Text("worst %.1f ms", s.worst_ms);
+        const std::vector<float> recent = frame_times_.recent(240);
+        ImGui::PlotLines("##ft", recent.data(), int(recent.size()), 0, nullptr, 0.0f, 50.0f, ImVec2(240.0f, 48.0f));
+    }
+    for (const std::string& line : frame_details_) ImGui::TextUnformatted(line.c_str());
+    ImGui::End();
 }
 
 void Menu::draw_hint() {
@@ -333,6 +370,7 @@ void Menu::display_page() {
         if (ImGui::Combo("Frame rate", &rate, kRates, 4)) s_.frame_rate = platform::Settings::FrameRate(rate), changed();
     }
     if (ImGui::Checkbox("Low latency (with vsync: at most one frame waiting)", &s_.low_latency)) changed();
+    if (ImGui::Checkbox("Frame rate counter (F3)", &s_.performance_overlay)) changed();
     if (ImGui::Button("Look at the picture")) peek_ = true;
     ImGui::SameLine();
     ImGui::TextDisabled("(any key or button comes back)");

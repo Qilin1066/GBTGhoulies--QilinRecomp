@@ -137,6 +137,8 @@ std::string settings_text(const Settings& s) {
                                                                             : "unlimited") << "\n"
          "# on: with vsync, at most one frame waiting for the screen (the least lag).\n"
          "low_latency = " << on(s.low_latency) << "\n"
+         "# on: the frame rate counter, top left (F3 switches it).\n"
+         "performance_overlay = " << on(s.performance_overlay) << "\n"
          "# Texture filtering: 1 (the console's), 2, 4, 8 or 16.\n"
          "anisotropy = " << s.anisotropy << "\n"
          "# The picture's shape, width:height: auto (the screen's own), 4:3 (the\n"
@@ -222,6 +224,7 @@ Settings parse_settings(const std::string& text, std::vector<std::string>& warni
                 else if (v == "unlimited") s.frame_rate = Settings::FrameRate::Unlimited;
                 else ok = false;
             } else if (key == "low_latency") ok = read_bool(v, &s.low_latency);
+            else if (key == "performance_overlay") ok = read_bool(v, &s.performance_overlay);
             else if (key == "anisotropy") ok = read_uint(v, 1, 16, &s.anisotropy);
             else if (key == "aspect") ok = aspect_given = read_aspect(v, &s.aspect_w, &s.aspect_h);
             else if (key == "hud") {

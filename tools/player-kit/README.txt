@@ -57,7 +57,7 @@ screen's shape; 4:3 the original; 16:10, 16:9, 21:9 and 32:9 show more at the
 sides), how the picture fills the window, the HUD on wide shapes (at the screen's edges, in the
 middle 4:3, or stretched), the render resolution (auto, or 1x to 4x), smooth or
 sharp pixels, SMAA anti-aliasing, AMD FSR 1 upscaling with its sharpness, a CRT television look, vsync, the frame rate (30 as
-the console, 60, your display's refresh rate, or unlimited), low latency, anisotropic texture
+the console, 60, your display's refresh rate, or unlimited), low latency, a frame rate counter (F3), anisotropic texture
 filtering. Controls: rumble, and the keyboard's keys (set by pressing them).
 Game: volume, stereo or 5.1, the game's language.
 F11 or Alt+Enter: full screen. The window can be resized: the picture keeps

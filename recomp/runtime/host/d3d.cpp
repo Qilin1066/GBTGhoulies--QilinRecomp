@@ -99,7 +99,12 @@ struct Device {
     platform::Settings::FrameRate frame_rate = platform::Settings::FrameRate::Original;
     std::chrono::steady_clock::time_point clock_last{};  // the frame clock's last call (unlocked rates)
     std::chrono::steady_clock::time_point next_frame{};  // the next frame's time, pacing without vsync
-    std::chrono::steady_clock::time_point last_refresh{};  // when the last early acquire returned (the display's refresh)
+    std::chrono::steady_clock::time_point last_refresh{};
+    std::chrono::steady_clock::time_point last_shown{};
+    // The flat draws' extents in the frame buffer (x0, x1, y0, y1, the
+    // game's pixels), this frame's and the last's: a line of text the game
+    // draws in pieces moves as one when the HUD is re-anchored.
+    std::vector<std::array<float, 4>> flat_now, flat_before;  // the last Swap's present (the frame rate counter)  // when the last early acquire returned (the display's refresh)
     std::vector<uint32_t> frame_buffers;  // guest surfaces; frame_buffers[i] is the renderer's buffer i
     // Frame buffers the CPU locked (cpu_frames.cpp below): the renderer's
     // buffer index and the hash of guest memory as the image was copied there.
@@ -828,8 +833,27 @@ void swap(rt::Context& c) {
     const uint32_t old_back = d.frame_buffers[d.renderer->back_index()];
     if (!d.cpu_frames.empty()) flush_cpu_frames(c, d);
     d.cpu_frames.clear();  // a lock lasts until the next Swap
-    if (d.menu) d.menu->tick();  // what's drawn over this frame (the hint)
+    if (d.menu) d.menu->tick();  // what's drawn over this frame (the hint, the frame rate counter)
     d.renderer->present();
+    if (d.menu && d.config.settings && d.config.settings->performance_overlay) {
+        const auto now = std::chrono::steady_clock::now();
+        if (d.last_shown.time_since_epoch().count()) {
+            using Rate = platform::Settings::FrameRate;
+            const char* rate = d.frame_rate == Rate::Original ? "30, as the console"
+                               : d.frame_rate == Rate::Sixty  ? "60"
+                               : d.frame_rate == Rate::Display ? "the display's"
+                                                               : "unlimited";
+            const float hz = d.config.window ? d.config.window->refresh_rate() : 0.0f;
+            std::vector<std::string> details;
+            details.push_back(hz > 0 ? strf("target: %s  (display %.0f Hz)", rate, double(hz)) : strf("target: %s", rate));
+            details.push_back(strf("vsync %s%s", d.picture.vsync ? "on" : "off", d.picture.vsync && d.picture.low_latency ? ", low latency" : ""));
+            details.push_back(strf("game time step %.2f ms", double(std::bit_cast<float>(ld(c, 0x5096C0))) * 1000.0));
+            d.menu->frame_shown(std::chrono::duration<double, std::milli>(now - d.last_shown).count(), std::move(details));
+        }
+        d.last_shown = now;
+    } else {
+        d.last_shown = {};
+    }
     ++d.swaps;
     // The settings menu, once the window has shown a frame (it draws with the window's images).
     if (!d.menu && d.config.window && d.config.settings) {
@@ -855,8 +879,12 @@ void swap(rt::Context& c) {
         pause_audio(false);
         d.epoch += std::chrono::steady_clock::now() - paused;
         d.clock_last += std::chrono::steady_clock::now() - paused;  // the unlocked clock too
+        d.last_shown = {};
+        d.menu->restart_frame_times();
     }
     update_aspect(c, d, std::exchange(d.settings_changed, false));
+    d.flat_before.swap(d.flat_now);
+    d.flat_now.clear();
     if (d.swaps % 64 == 0) sweep_vertex_runs(d, 120);  // runs not drawn for 4 seconds leave the vertex arena
     // A render target that was the back buffer becomes the new one (the
     // device's internal reference moves with it).
@@ -2418,16 +2446,18 @@ void issue_draw(rt::Context& c, Device& d, const char* fn, uint32_t prim, Vertic
     // Flat: placed by a position matrix with no perspective (the HUD, the
     // menus' and pages' pictures and text), and where on screen across.
     bool flat = false;
-    float flat_x0 = 0, flat_x1 = 0;
+    float flat_x0 = 0, flat_x1 = 0, flat_y0 = 0, flat_y1 = 0;
     if (const auto it = d.position_matrix.find(vs_key); !passthrough && it != d.position_matrix.end() && it->second >= 0 && !v.attr[0].empty()) {
         const float* m = &vsu[size_t(it->second) * 4];  // the x row at m[0], the w row at m[12]
         if (m[12] == 0 && m[13] == 0 && m[14] == 0 && m[15] != 0) {
-            const float sx = vsu[(96 - 38) * 4], ox = vsu[(96 - 37) * 4];
-            flat_x0 = INFINITY, flat_x1 = -INFINITY;
+            const float sx = vsu[(96 - 38) * 4], ox = vsu[(96 - 37) * 4], sy = vsu[(96 - 38) * 4 + 1], oy = vsu[(96 - 37) * 4 + 1];
+            flat_x0 = flat_y0 = INFINITY, flat_x1 = flat_y1 = -INFINITY;
             for (uint32_t i = 0; i < v.count; ++i) {
                 const float* p = &v.attr[0][(v.constant & 1) ? 0 : size_t(i) * 4];
                 const float x = (p[0] * m[0] + p[1] * m[1] + p[2] * m[2] + p[3] * m[3]) * sx / (p[3] * m[15]) + ox;
+                const float y = (p[0] * m[4] + p[1] * m[5] + p[2] * m[6] + p[3] * m[7]) * sy / (p[3] * m[15]) + oy;
                 flat_x0 = std::min(flat_x0, x), flat_x1 = std::max(flat_x1, x);
+                flat_y0 = std::min(flat_y0, y), flat_y1 = std::max(flat_y1, y);
             }
             flat = v.count > 0;
         }
@@ -2438,14 +2468,30 @@ void issue_draw(rt::Context& c, Device& d, const char* fn, uint32_t prim, Vertic
     // a 4:3 viewport of their own, already their shape) is squeezed back by
     // 4:3 over the picture's shape, about the screen's edge it's nearest (a
     // part within the left or right third) or its middle. Pictures across
-    // the whole frame (videos, fades) stay as they are.
+    // the whole frame (videos, fades) stay as they are. A part is the line
+    // it's on: the flat draws of this frame and the last that share its
+    // height and sit within 3% of the frame's width of it, as the game draws
+    // a line of text in pieces (the pause menu's "Chapter 1, Scene 9:
+    // Basement" in three), which would otherwise each go their own way.
     const platform::Settings* hs = d.config.settings;
     if (flat && hs && hs->hud != platform::Settings::Hud::Stretched && d.aspect > 4.0f / 3.0f + 1e-3f) {
         const uint32_t target = ld(c, dev + kDevRenderTarget);
         const bool frame_buffer = std::find(d.frame_buffers.begin(), d.frame_buffers.end(), target) != d.frame_buffers.end();
         const float w = float(target_w);
         if (frame_buffer && ld(c, dev + kDevViewport) == 0 && ld(c, dev + kDevViewport + 8) == target_w && flat_x1 - flat_x0 < 0.9f * w) {
-            const float centre = (flat_x0 + flat_x1) * 0.5f;
+            d.flat_now.push_back({flat_x0, flat_x1, flat_y0, flat_y1});
+            float lo = flat_x0, hi = flat_x1;
+            const float gap = 0.03f * w, h = flat_y1 - flat_y0;
+            for (bool grew = true; grew;) {
+                grew = false;
+                for (const auto* list : {&d.flat_before, &d.flat_now})
+                    for (const auto& r : *list) {
+                        const float shared = std::min(r[3], flat_y1) - std::max(r[2], flat_y0);
+                        if (shared <= 0.5f * std::min(h, r[3] - r[2]) || r[0] > hi + gap || r[1] < lo - gap) continue;
+                        if (r[0] < lo || r[1] > hi) lo = std::min(lo, r[0]), hi = std::max(hi, r[1]), grew = true;
+                    }
+            }
+            const float centre = (lo + hi) * 0.5f;
             const float about = hs->hud == platform::Settings::Hud::Middle ? w * 0.5f : centre < w / 3 ? 0.0f : centre > w * 2 / 3 ? w : w * 0.5f;
             vsu[gfx::nv2a::kVsPixels * 4 + 1] = (4.0f / 3.0f) / d.aspect;
             vsu[gfx::nv2a::kVsPixels * 4 + 2] = about;

@@ -45,6 +45,9 @@ struct Settings {
     // With vsync, one frame at most waiting for the display (fewer swapchain
     // images): the least lag, a little less slack for a GPU near its limit.
     bool low_latency = true;
+    // The frame rate counter, top left (F3 switches it): frames a second, the
+    // 1% and 0.1% lows, the worst frame and a graph of the last four seconds.
+    bool performance_overlay = false;
     uint32_t anisotropy = 1;           // texture filtering: 1 (the console's), 2, 4, 8 or 16
     // The picture's shape, width:height: 4:3 the original, wider ones show more
     // at the sides (up to 4:1); 0:0 is "auto", the screen's own shape.

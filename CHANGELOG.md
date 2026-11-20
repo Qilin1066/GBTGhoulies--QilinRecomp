@@ -11,6 +11,15 @@ Each release is a git tag (`vX.Y.Z`) with a matching GitHub release. The version
 
 ## [Unreleased]
 
+## [0.40.1] - 2026-11-20
+
+### Added
+- **Frame rate counter**: F3, or the Display page's "Frame rate counter" (`performance_overlay` in [display]), shows top left the frames a second, the 1% and 0.1% lows over the last 20 s, the worst frame, a graph of the last four seconds, the target rate and your display's refresh, vsync and latency, and the game's time step (as PunchOutWii-QilinRecomp's counter, whose frame-time tracker it shares). The settings hint mentions F3.
+
+### Fixed
+- **Pause menu text split apart** on wide pictures: the game draws a line of text in pieces, and the HUD re-anchoring (v0.39.0) moved each piece towards its own nearest edge ("Chapt  …  er 1, Scene 9: Bas  …  ement"). Pieces on one line, next to each other, now move as one.
+- **The window opened small**: it was a whole multiple of the game's 480 lines at the picture's shape, which for 16:9 on a 1080p screen is 854×480. It now opens as large as fits nine tenths of the screen, at the picture's shape.
+
 ## [0.40.0] - 2026-11-20
 
 ### Added
