@@ -190,7 +190,9 @@ public:
     // until more come. Each packet is a whole number of the format's blocks.
     void make_stream();
     bool stream() const { return stream_; }
-    void queue_packet(uint32_t guest_addr, uint32_t bytes, uint32_t id);
+    // `start`: a stopped voice starts again at the packet (a stream held
+    // after its envelope's release doesn't: it waits for a flush).
+    void queue_packet(uint32_t guest_addr, uint32_t bytes, uint32_t id, bool start = true);
     struct Done {
         uint32_t id, bytes;  // the packet, and how much of it played
     };

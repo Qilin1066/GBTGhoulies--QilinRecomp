@@ -560,9 +560,13 @@ void Voice::make_stream() {
     pos_ = 0;
 }
 
-void Voice::queue_packet(uint32_t guest_addr, uint32_t bytes, uint32_t id) {
+void Voice::queue_packet(uint32_t guest_addr, uint32_t bytes, uint32_t id, bool start) {
     const uint64_t frames = format_.bytes_to_frames(bytes);
     packets_.push_back({guest_addr, bytes, id, queued_end_, frames});
+    if (!start && !playing_) {
+        queued_end_ += frames;
+        return;
+    }
     // A voice stopped (after a discontinuity, or never started) starts again
     // at the new packet: the frames since the last one are silence, not data;
     // its envelope starts again with it.

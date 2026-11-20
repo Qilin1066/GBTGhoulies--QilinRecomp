@@ -329,6 +329,19 @@ void frame_clock(rt::Context& c) {
         const auto last = std::exchange(dp->clock_last, now);
         // The first frame: two vblanks, as the console's first.
         step = last.time_since_epoch().count() ? std::chrono::duration<float>(now - last).count() : 2.0f / float(rate);
+        // QILIN_FIXED_STEP=seconds[,after]: that step every frame whatever the
+        // time, from `after` seconds in (to try a high refresh rate's step on
+        // a slower machine).
+        static const auto fixed = [] {
+            std::pair<float, float> f{0.0f, 0.0f};
+            if (const char* v = std::getenv("QILIN_FIXED_STEP")) {
+                f.first = std::strtof(v, nullptr);
+                if (const char* comma = std::strchr(v, ',')) f.second = std::strtof(comma + 1, nullptr);
+            }
+            return f;
+        }();
+        static const auto started = now;
+        if (fixed.first > 0 && std::chrono::duration<float>(now - started).count() >= fixed.second) step = fixed.first;
     } else {
         // fild of the count (unsigned: 2^32 added to a negative one, 0x32B144), over the rate.
         const uint32_t vblanks = rt::ld32(m, 0x5096D0, 0);

@@ -11,6 +11,14 @@ Each release is a git tag (`vX.Y.Z`) with a matching GitHub release. The version
 
 ## [Unreleased]
 
+## [0.40.2] - 2026-11-20
+
+### Fixed
+- **Music that wouldn't stop**: tracks the game stopped (the pause music when you unpause, the menu's when you go back to the game) played on under the next, and each pause added another copy. XACT stops a track by releasing its fade and waiting for DirectSound to report the fade done; that report wasn't given, and the track was restarted with the next data XACT sent. Streams stopped this way now hold, report the fade done, and stop when XACT flushes them, as on the console. It happened at every frame rate.
+
+### Added
+- `QILIN_FIXED_STEP=seconds[,after]`: the game's time step fixed (from `after` seconds in), to try a high refresh rate's step on a slower machine; `QILIN_AUDIO_STATS=1`: the streams and buffers playing, once a second.
+
 ## [0.40.1] - 2026-11-20
 
 ### Added

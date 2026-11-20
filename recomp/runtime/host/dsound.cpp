@@ -74,7 +74,13 @@ struct Buffer {
         uint32_t completed_size = 0, status = 0, event = 0, context = 0;  // XMEDIAPACKET's pointers and context
     };
     std::map<uint32_t, Packet> packets;
-    bool flush_after_release = false;  // FlushEx with the envelope: flush once the release has played
+    bool flush_after_release = false;  // FlushEx with the envelope (flag 2): flush once the release has played
+    // FlushEx with flag 4, as the original's voice flags 0x1000 and 0x2000:
+    // the envelope released, then the stream held (reporting
+    // DSSTREAMSTATUS_ENVELOPE, new packets queued but not started) until a
+    // flush. XACT stops a cue's stream this way and waits for that status
+    // before it flushes; without it the stream went on playing.
+    bool hold_after_release = false, held = false;
     // DirectSound's 3D voice data (Set3DVoiceData): the DS3DVOICEDATA
     // dwords after its flags, as the original keeps them, and whether the
     // voice uses them (Use3DVoiceData).
@@ -241,6 +247,7 @@ void catch_up_locked() {
         for (auto& [addr, b] : d.buffers) {
             if (!b->stream) continue;
             for (const audio::Voice::Done& done : b->voice.take_completed()) d.completions.push_back({addr, done.id, done.bytes, kPacketSuccess});
+            if (b->hold_after_release && !b->voice.playing()) b->hold_after_release = false, b->held = true;
             if (b->flush_after_release && !b->voice.playing()) {
                 b->flush_after_release = false;
                 for (const audio::Voice::Done& done : b->voice.flush()) d.completions.push_back({addr, done.id, done.bytes, kPacketFlushed});
@@ -829,6 +836,7 @@ void stream_get_status(rt::Context& c) {
     size_t held = b.packets.size();
     for (const Completion& k : ds().completions) held -= k.stream == arg(c, 0) && b.packets.count(k.id) ? 1 : 0;
     if (held < b.max_packets) status |= 1;
+    if (b.held) status |= 0x80000;  // DSSTREAMSTATUS_ENVELOPE: released, waiting for a flush
     if (b.voice.playing()) {
         if (b.voice.paused() || b.voice.starved()) status |= 0x20000;
         if (b.voice.starved()) status |= 0x40000;
@@ -870,7 +878,7 @@ void stream_process(rt::Context& c) {
     if (p.event) st(c, p.event + 4, 0);
     const uint32_t id = d.next_packet++;
     b.packets[id] = p;
-    b.voice.queue_packet(data, bytes, id);
+    b.voice.queue_packet(data, bytes, id, !b.held);
     if (b.resume_on_start) b.voice.pause(false), b.resume_on_start = false;
     ret(c, kDsOk, 12);
 }
@@ -898,7 +906,7 @@ void stream_discontinuity(rt::Context& c) {
 // Drops the packets not yet played: each reported flushed, with how much
 // of it played (the lock held; the caller delivers after).
 void flush_stream(uint32_t a, Buffer& b) {
-    b.flush_after_release = false;
+    b.flush_after_release = b.hold_after_release = b.held = false;
     for (const audio::Voice::Done& done : b.voice.flush()) ds().completions.push_back({a, done.id, done.bytes, kPacketFlushed});
 }
 
@@ -916,9 +924,11 @@ void stream_flush(rt::Context& c) {
 
 // HRESULT FlushEx(REFERENCE_TIME rtTimeStamp, DWORD dwFlags): as the
 // original (0x1CA73B), flags 2 and 4 let the envelope's release play out
-// before the packets are flushed (here: the voice released, the flush when
-// it has stopped), and 1 returns without waiting. Without an envelope the
-// release is instant: a flush now. A time stamp stops the runtime.
+// first, and 1 returns without waiting. With 2 the packets are flushed once
+// the release has played; with 4 the stream is held instead (its voice flag
+// 0x2000: GetStatus reports DSSTREAMSTATUS_ENVELOPE, and packets the game
+// gives it wait) until it's flushed, which is how XACT stops a cue. Without
+// an envelope the release is instant. A time stamp stops the runtime.
 void stream_flush_ex(rt::Context& c) {
     const char* fn = "CDirectSoundStream_FlushEx";
     {
@@ -928,9 +938,19 @@ void stream_flush_ex(rt::Context& c) {
         if (arg(c, 1) || arg(c, 2)) unmodelled(fn, "a flush at a time stamp");
         if (flags & ~7u) unmodelled(fn, strf("flags %#x", flags));
         Buffer& b = stream(c, a, fn);
-        if (flags & 6) b.voice.release();
-        if ((flags & 6) && b.voice.playing()) b.flush_after_release = true;
-        else flush_stream(a, b);
+        if ((flags & 6) && b.voice.playing()) {
+            b.voice.release();
+            if (flags & 4) b.hold_after_release = true;
+            else b.flush_after_release = true;
+            if (!b.voice.playing()) {  // no envelope: released at once
+                if (flags & 4) b.hold_after_release = false, b.held = true;
+                else flush_stream(a, b);
+            }
+        } else if (flags & 4) {
+            b.held = true;  // nothing playing to release: held now
+        } else {
+            flush_stream(a, b);
+        }
     }
     deliver(c);
     ret(c, kDsOk, 16);
@@ -1098,6 +1118,21 @@ void pump_audio(rt::Context& c) {
     {
         Lock lock_(ds().m);
         catch_up(c);
+        // QILIN_AUDIO_STATS=1: the streams and buffers playing, once a second.
+        static const bool stats = std::getenv("QILIN_AUDIO_STATS") != nullptr;
+        static auto last = std::chrono::steady_clock::now();
+        if (stats && std::chrono::steady_clock::now() - last >= std::chrono::seconds(1)) {
+            last = std::chrono::steady_clock::now();
+            int streams = 0, buffers = 0, looping = 0;
+            std::string list;
+            for (auto& [addr, b] : ds().buffers) {
+                if (b->voice.submix() || !b->voice.playing()) continue;
+                (b->stream ? streams : buffers)++;
+                if (b->stream) list += strf(" %08X(%uch %uHz vol %d)", addr, b->voice.format().channels, b->voice.format().rate, b->voice.volume);
+            }
+            (void)looping;
+            std::printf("qilin_run: audio: %d streams, %d buffers playing;%s\n", streams, buffers, list.c_str());
+        }
     }
     deliver(c);
 }
