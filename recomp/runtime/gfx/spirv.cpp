@@ -132,11 +132,21 @@ Id Builder::sampler(Id sampler_type, uint32_t set, uint32_t binding) {
     return v;
 }
 
+void Builder::mark_exact(uint16_t opcode, Id r) {
+    if (!exact_) return;
+    switch (opcode) {
+        case op::FNegate: case op::FAdd: case op::FSub: case op::FMul: case op::FDiv: case op::VectorTimesScalar: case op::Dot:
+            decorate(r, deco::NoContraction);
+            break;
+        default: break;
+    }
+}
 Id Builder::op(uint16_t opcode, Id result_type, std::initializer_list<Id> operands) {
     const Id r = id();
     std::vector<uint32_t> ops{result_type, r};
     ops.insert(ops.end(), operands.begin(), operands.end());
     emit(code_, opcode, ops);
+    mark_exact(opcode, r);
     return r;
 }
 Id Builder::op(uint16_t opcode, Id result_type, const std::vector<Id>& operands) {
@@ -144,6 +154,7 @@ Id Builder::op(uint16_t opcode, Id result_type, const std::vector<Id>& operands)
     std::vector<uint32_t> ops{result_type, r};
     ops.insert(ops.end(), operands.begin(), operands.end());
     emit(code_, opcode, ops);
+    mark_exact(opcode, r);
     return r;
 }
 void Builder::op_void(uint16_t opcode, std::initializer_list<Id> operands) { emit(code_, opcode, operands); }

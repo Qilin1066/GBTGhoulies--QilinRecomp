@@ -52,6 +52,7 @@ private:
     void draw_hint();
     void controls_page();
     void display_page();
+    void aspect_combo();
     void game_page();
     void changed();
 

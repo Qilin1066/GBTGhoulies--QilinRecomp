@@ -73,6 +73,20 @@ uint64_t Window::create_surface(void* instance, std::string* error) const {
     return uint64_t(surface);
 }
 
+namespace {
+float desktop_aspect(SDL_DisplayID display) {
+    const SDL_DisplayMode* mode = display ? SDL_GetDesktopDisplayMode(display) : nullptr;
+    return mode && mode->w > 0 && mode->h > 0 ? float(mode->w) / float(mode->h) : 0.0f;
+}
+}  // namespace
+
+float Window::screen_aspect() const { return desktop_aspect(SDL_GetDisplayForWindow(window_)); }
+
+float Window::main_screen_aspect() {
+    std::string error;
+    return start_video(&error) ? desktop_aspect(SDL_GetPrimaryDisplay()) : 0.0f;
+}
+
 void Window::pixel_size(uint32_t* width, uint32_t* height) const {
     int w = 0, h = 0;
     SDL_GetWindowSizeInPixels(window_, &w, &h);

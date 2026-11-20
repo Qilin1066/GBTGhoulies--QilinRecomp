@@ -52,10 +52,11 @@ as the Xbox controller, or the keyboard as controller 1:
   stick clicks         F, H
 
 F1 or Esc, or Back and Start together on a controller: the settings menu
-(the game pauses). Display: full screen, how the picture fills the window,
-smooth or sharp pixels, a CRT television look, vsync, anisotropic texture
+(the game pauses). Display: full screen, the aspect ratio (auto: your
+screen's shape; 4:3 the original; 16:10, 16:9, 21:9 and 32:9 show more at the
+sides), how the picture fills the window, smooth or sharp pixels, a CRT television look, vsync, anisotropic texture
 filtering. Controls: rumble, and the keyboard's keys (set by pressing them).
-Game: volume, stereo or 5.1, the game's language, widescreen (16:9) or 4:3.
+Game: volume, stereo or 5.1, the game's language.
 F11 or Alt+Enter: full screen. The window can be resized: the picture keeps
 its shape.
 

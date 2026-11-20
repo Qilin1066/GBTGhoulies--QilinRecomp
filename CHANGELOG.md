@@ -11,6 +11,16 @@ Each release is a git tag (`vX.Y.Z`) with a matching GitHub release. The version
 
 ## [Unreleased]
 
+## [0.37.0] - 2026-11-20
+
+### Added
+- **Any aspect ratio, 4:3 to 4:1**: the settings menu's Display page (and `aspect` in [display]) has Auto (your screen's shape, the default), 4:3 (the original), 16:10, 16:9, 21:9 (64:27) and 32:9, and any `W:H` can be written in `ghoulies.ini`. Wider than 4:3, the game's cameras see more at the sides with the same vertical view (Hor+): the game's own 16:9 camera format (the table at `0x42A460`) widened to the shape, so its cut scenes keep their 2.35:1 framing and its 4:3 comic pages are pillarboxed by the game, as at 16:9. It changes as soon as the menu closes, with the next frame the game draws; Auto follows the screen the window is on, and the window opens at the shape. The HUD is still stretched across the frame (re-anchoring it comes with higher render resolutions).
+- **A draw trace** for finding rendering bugs: `QILIN_TRACE_DRAWS=N[,M]` logs every clear, draw and copy of those frames with their state, `QILIN_TRACE_MATCH` filters the lines, and `QILIN_TRACE_DUMP` writes the frames and the render targets the logged draws sample (`docs/graphics.md`).
+
+### Fixed
+- **Shadows on real GPUs**: the floor shadows are drawn by redrawing the floor with another vertex program at a ZBias of 4, so they only show where the two programs agree on the floor's depth, as the Xbox's always do. GPU shader compilers could fuse and reorder each program's arithmetic differently, putting the shadow pass behind the floor in patches: shadows flickering while characters move and missing when they stand still. Every vertex program now computes exactly as written (`NoContraction`) with an invariant position, so the two passes agree. (Mesa's software renderer, used for testing here, computed both the same way and showed the shadows correctly.)
+- **Swapchain synchronisation**: the frame's first use of the image the display hands over now waits for it at the stage it's used (colour output), and the hand-back to the display waits for the image's last layout change; Vulkan's synchronisation validation now reports nothing over the intro and the first fight.
+
 ### Changed
 - **The project is renamed GBTGhoulies-QilinRecomp** (it was GBTG-Qilincomp), to match the GitHub repository, now [Qilin1066/GBTGhoulies-QilinRecomp](https://github.com/Qilin1066/GBTGhoulies-QilinRecomp), and its sister projects ApbArcade-QilinRecomp, BeatTheBeat-QilinRecomp and PunchOutWii-QilinRecomp. The CMake project, the README and docs, the menu and settings-file text ("Grabbed by the Ghoulies QilinRecomp"), the build scripts and the workflow use the new name, and the Windows download is now `GBTGhoulies-QilinRecomp-<version>-windows-x64.zip`, unpacking to a `GBTGhoulies-QilinRecomp` folder. The tools (`qilin`, `qilin_run`), the `QILIN_*` options and where the settings and saves are kept (`qilin/ghoulies` in the user's data folder) are unchanged, so nothing saved is lost. A new download folder asks for the disc folder once more the first time.
 

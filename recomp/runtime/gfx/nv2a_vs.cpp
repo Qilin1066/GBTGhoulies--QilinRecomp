@@ -133,6 +133,14 @@ struct Vs {
 std::vector<uint32_t> vertex_program(const vsh::Program& program, uint32_t inputs) {
     Vs s;
     Builder& b = s.b;
+    // The position exactly as the program computes it, in every program: a
+    // game draws the same surface again with another program (a floor's
+    // projected shadow, at a ZBias of a few units of depth, or an EQUAL
+    // depth test) and relies on the two depths agreeing, as they do on the
+    // NV2A. A GPU's compiler may otherwise fuse and reorder each program's
+    // arithmetic its own way, and the second pass falls behind the first in
+    // patches (shadows flickering and missing on real GPUs).
+    b.exact_arithmetic(true);
     for (uint32_t n = 0; n < 16; ++n) {
         if (inputs & (1u << n)) {
             const Id v = b.input(s.v4, n);
@@ -181,6 +189,7 @@ std::vector<uint32_t> vertex_program(const vsh::Program& program, uint32_t input
     };
     const Id clip = b.vec4(axis(s.x(pos), 0, true), axis(s.y(pos), 1, true), axis(s.z(pos), 2, false), pw);
     const Id position = b.builtin_var(spv::Storage::Output, s.v4, spv::builtin::Position);
+    b.decorate(position, spv::deco::Invariant);
     b.store(position, clip);
     s.interface.push_back(position);
 

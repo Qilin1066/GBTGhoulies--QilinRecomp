@@ -10,6 +10,7 @@
 // so its initializers run as XAPI ran them, in the same order; entries that
 // belong to libraries replaced natively (XGRPH, DSOUND) are skipped, their
 // work done by the native replacements.
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <initializer_list>
@@ -282,15 +283,17 @@ int main(int argc, char** argv) {
     fullscreen = fullscreen || settings.fullscreen;
     if (!audio_channels) audio_channels = settings.channels;
     host::set_console_language(settings.language);
-    host::set_console_widescreen(settings.widescreen);
-    d3d.widescreen = settings.widescreen;
+    // The picture's shape (auto: the main screen's; headless, 16:9), which
+    // the game reads as it starts: the window opens at it too.
+    const float aspect = host::game_aspect_ratio(platform::aspect_ratio(settings, headless ? 0.0f : platform::Window::main_screen_aspect()));
+    host::set_game_aspect(m, aspect, false);
     d3d.settings = &settings;
     d3d.settings_folder = data_folder.string();
     // The window: where there's no display, the game still runs and draws.
     std::unique_ptr<platform::Window> window;
     if (!headless) {
         std::string why;
-        window = platform::Window::create("Grabbed by the Ghoulies", 640, 480, fullscreen, &why);
+        window = platform::Window::create("Grabbed by the Ghoulies", uint32_t(std::lround(480.0f * aspect)), 480, fullscreen, &why);
         if (!window) std::printf("qilin_run: no window (%s); running without one\n", why.c_str());
     }
     // Controllers, read through the window's events; without a window, none.

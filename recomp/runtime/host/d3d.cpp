@@ -87,6 +87,9 @@ void st(const rt::Context& c, uint32_t a, uint32_t v) { rt::st32(mem(c), a, v, 0
 struct Device {
     std::unique_ptr<gfx::Renderer> renderer;
     std::unique_ptr<ui::Menu> menu;  // the settings menu, once the window has shown a frame
+    gfx::Picture picture;            // how frames are shown (the settings)
+    bool settings_changed = false;   // by the menu, since the last frame
+    float aspect = 0;                // the shape the game draws for and frames are shown at (0: not yet set)
     D3dConfig config;
     uint32_t width = 0, height = 0, interval = 1;
     std::vector<uint32_t> frame_buffers;  // guest surfaces; frame_buffers[i] is the renderer's buffer i
@@ -177,6 +180,15 @@ struct Device {
 };
 Device* g_device = nullptr;
 void apply_settings(Device& d, const platform::Settings& s);
+// A trace of what the game draws, for finding rendering bugs (docs/graphics.md):
+// QILIN_TRACE_DRAWS=N[,M] logs every clear, draw and copy of frames N to M
+// (default N) on stderr, with the state that matters; QILIN_TRACE_MATCH=a|b
+// keeps only the lines with one of them in; QILIN_TRACE_DUMP=dir also writes
+// those frames there (frame_NNNNN.png) and what each render target a logged
+// draw samples holds (swap_n_address.pam).
+bool trace_draws(const Device& d);
+bool trace_wanted(const std::string& line);
+void update_aspect(rt::Context& c, Device& d, bool settings_changed);
 
 Device& device(const char* fn) {
     if (!g_device) unmodelled(fn, "a call before Direct3D_CreateDevice");
@@ -267,13 +279,14 @@ void run_vblanks(rt::Context& c, Device& d, uint32_t until, bool swap_done) {
 // ---------------------------------------------------------------- frames out
 void deliver_frame(Device& d) {
     const uint64_t n = d.renderer->frames_presented();
-    if (!d.config.dump_dir.empty()) {
+    static const char* trace_dir = std::getenv("QILIN_TRACE_DUMP");
+    if (!d.config.dump_dir.empty() || (trace_dir && trace_draws(d))) {
         gfx::Image im = d.renderer->read_front_buffer();
         for (size_t i = 0; i < im.rgba.size(); i += 4) {  // as the TV gets it: through the gamma ramp, alpha unused
             for (int k = 0; k < 3; ++k) im.rgba[i + k] = d.gamma[k][im.rgba[i + k]];
             im.rgba[i + 3] = 255;
         }
-        const std::string path = d.config.dump_dir + strf("/frame_%05llu.png", (unsigned long long)n);
+        const std::string path = (d.config.dump_dir.empty() ? std::string(trace_dir) : d.config.dump_dir) + strf("/frame_%05llu.png", (unsigned long long)n);
         if (!gfx::write_png(path, im)) std::fprintf(stderr, "qilin: can't write %s\n", path.c_str());
     }
     if (d.config.max_frames && n >= d.config.max_frames) {
@@ -371,6 +384,7 @@ void create_device(rt::Context& c) {
     for (int k = 0; k < 3; ++k)
         for (int i = 0; i < 256; ++i) d->gamma[k][i] = uint8_t(i);
     if (d->config.settings) apply_settings(*d, *d->config.settings);
+    update_aspect(c, *d, true);
 
     // The frame buffers as guest surfaces (linear A8R8G8B8 / X8R8G8B8, as the
     // original makes them), and the depth buffer (linear D24S8).
@@ -552,6 +566,32 @@ void block_until_idle(rt::Context& c) {
 //     one 256×256 texture and clears each tile through its viewport.
 std::pair<uint32_t, uint32_t> apply_target(rt::Context& c, Device& d, const char* fn);
 void hand_back_target(rt::Context& c, Device& d, uint32_t data);
+bool trace_draws(const Device& d) {
+    static const std::pair<uint32_t, uint32_t> range = [] {
+        const char* e = std::getenv("QILIN_TRACE_DRAWS");
+        if (!e || !*e) return std::pair<uint32_t, uint32_t>{1, 0};
+        char* end = nullptr;
+        const uint32_t a = uint32_t(std::strtoul(e, &end, 10));
+        return std::pair<uint32_t, uint32_t>{a, *end == ',' ? uint32_t(std::strtoul(end + 1, nullptr, 10)) : a};
+    }();
+    return d.swaps >= range.first && d.swaps <= range.second;
+}
+
+// QILIN_TRACE_MATCH=a|b: only the lines with one of them in.
+bool trace_wanted(const std::string& line) {
+    static const char* match = std::getenv("QILIN_TRACE_MATCH");
+    if (!match) return true;
+    for (std::string_view m = match; !m.empty();) {
+        const size_t bar = m.find('|');
+        if (line.find(m.substr(0, bar)) != std::string::npos) return true;
+        m = bar == std::string_view::npos ? std::string_view() : m.substr(bar + 1);
+    }
+    return false;
+}
+void trace_line(const std::string& line) {
+    if (trace_wanted(line)) std::fputs(line.c_str(), stderr);
+}
+
 void clear(rt::Context& c) {
     Device& d = device("D3DDevice_Clear");
     const uint32_t count = arg(c, 0), rects = arg(c, 1), flags = arg(c, 2), color = arg(c, 3), stencil = arg(c, 5);
@@ -584,6 +624,10 @@ void clear(rt::Context& c) {
     const float rgba[4] = {float((color >> 16) & 0xFF) / 255.0f, float((color >> 8) & 0xFF) / 255.0f, float(color & 0xFF) / 255.0f,
                            float(color >> 24) / 255.0f};
     apply_target(c, d, "D3DDevice_Clear");
+    if (trace_draws(d))
+        trace_line(strf("clear %u rt=%08X flags=%x color=%08X z=%g rects=%zu first=%d,%d %ux%u\n", d.swaps,
+                     ld(c, ld(c, kDeviceStorage + kDevRenderTarget) + 4), flags, color, double(z), list.size(), list[0].x, list[0].y,
+                     list[0].w, list[0].h));
     d.renderer->clear(list.data(), uint32_t(list.size()), f, rgba, z, stencil & 0xFF);
     ret(c, 0, 24);
 }
@@ -591,14 +635,14 @@ void clear(rt::Context& c) {
 // The settings in effect: the picture and texture filtering, the volume,
 // the keyboard's keys and rumble (the settings menu calls it as they change).
 void apply_settings(Device& d, const platform::Settings& s) {
-    gfx::Picture p;
+    gfx::Picture& p = d.picture;
     p.scaling = gfx::Picture::Scaling(uint8_t(s.scaling));
     p.smooth = s.smooth;
     p.look = gfx::Picture::Look(uint8_t(s.look));
     p.scanlines = float(s.scanlines) / 100.0f;
     p.mask = float(s.mask) / 100.0f;
     p.vsync = s.vsync;
-    p.aspect = d.config.widescreen ? 16.0f / 9.0f : 4.0f / 3.0f;  // as the game draws (the setting at start)
+    p.aspect = d.aspect ? d.aspect : 16.0f / 9.0f;  // a new shape comes with the game's next frame (update_aspect)
     d.renderer->set_picture(p);
     d.renderer->set_anisotropy(s.anisotropy);
     set_output_volume(float(s.volume) / 100.0f);
@@ -606,6 +650,22 @@ void apply_settings(Device& d, const platform::Settings& s) {
         in->set_keys(s.keys);
         in->set_rumble(s.rumble);
     }
+}
+
+// The shape the settings ask for (auto: the screen the window is on, looked
+// at every 64 frames, so moving the window to another screen follows it),
+// given to the game between frames: the frame it draws next is the first
+// at the new shape, and is shown at it.
+void update_aspect(rt::Context& c, Device& d, bool settings_changed) {
+    const platform::Settings* s = d.config.settings;
+    if (!s || (!settings_changed && d.aspect && (s->aspect_w || d.swaps % 64))) return;
+    const float screen = d.config.window ? d.config.window->screen_aspect() : 0.0f;
+    const float aspect = game_aspect_ratio(platform::aspect_ratio(*s, screen));
+    if (aspect == d.aspect) return;
+    set_game_aspect(mem(c), aspect, true);
+    d.aspect = aspect;
+    d.picture.aspect = aspect;
+    d.renderer->set_picture(d.picture);
 }
 
 // The window's events (the settings menu's first); closing the window, or
@@ -638,7 +698,10 @@ void swap(rt::Context& c) {
     // The settings menu, once the window has shown a frame (it draws with the window's images).
     if (!d.menu && d.config.window && d.config.settings) {
         auto m = std::make_unique<ui::Menu>(*d.config.window, *d.renderer, *d.config.settings, d.config.settings_folder,
-                                            [&d](const platform::Settings& s) { apply_settings(d, s); });
+                                            [&d](const platform::Settings& s) {
+                                                apply_settings(d, s);
+                                                d.settings_changed = true;
+                                            });
         if (m->ok()) d.menu = std::move(m);
     }
     // The menu open: the game stands still under it. Its frame is shown again
@@ -656,6 +719,7 @@ void swap(rt::Context& c) {
         pause_audio(false);
         d.epoch += std::chrono::steady_clock::now() - paused;
     }
+    update_aspect(c, d, std::exchange(d.settings_changed, false));
     if (d.swaps % 64 == 0) sweep_vertex_runs(d, 120);  // runs not drawn for 4 seconds leave the vertex arena
     // A render target that was the back buffer becomes the new one (the
     // device's internal reference moves with it).
@@ -728,6 +792,9 @@ void copy_rects(rt::Context& c) {
     Device& d = device(fn);
     const uint32_t src = arg(c, 0), rects = arg(c, 1), count = arg(c, 2), dst = arg(c, 3), points = arg(c, 4);
     const SurfacePixels from = surface_pixels(c, d, fn, src), to = surface_pixels(c, d, fn, dst);
+    if (trace_draws(d))
+        trace_line(strf("copy %u from=%08X %ux%u fb=%d to=%08X %ux%u count=%u\n", d.swaps, from.data, from.width, from.height, from.frame_buffer, to.data,
+                        to.width, to.height, count));
     if (to.frame_buffer >= 0) unmodelled(fn, "a copy into a frame buffer");
     if (count == 0 && rects) unmodelled(fn, "a rectangle list with no rectangles");
     // The rectangles: source (left, top, right, bottom) and where each goes.
@@ -1480,6 +1547,7 @@ void hand_back_target(rt::Context& c, Device& d, uint32_t data) {
     auto it = d.targets.find(data);
     if (it == d.targets.end()) return;
     const Device::TargetTexture& t = it->second;
+    if (trace_draws(d)) trace_line(strf("handback %u rt=%08X\n", d.swaps, data));
     image_to_guest(c, data, t.texture.linear, t.pitch, d.renderer->read_render_target(t.texture.id));
     d.renderer->destroy_texture(t.texture.id);
     d.targets.erase(it);
@@ -1507,6 +1575,7 @@ Device::TargetTexture& texture_target(rt::Context& c, Device& d, uint32_t data, 
     }
     // The texels the image starts from, or that the CPU wrote since the GPU
     // last drew: on the Xbox the GPU draws over the texture's memory.
+    if (t.guest != guest && trace_draws(d)) trace_line(strf("upload %u rt=%08X id=%u\n", d.swaps, data, t.texture.id));
     if (t.guest != guest) d.renderer->write_render_target(t.texture.id, guest_image(c, data, w, h, linear, pitch));
     t.guest = guest;
     t.checked_swap = d.swaps, t.checked_epoch = d.memory_epoch;
@@ -1570,6 +1639,7 @@ const Device::CachedTexture* target_texture(rt::Context& c, Device& d, uint32_t 
     const bool same_shape = fmt == t.format && w == t.texture.width && h == t.texture.height && ((format >> 16) & 0xF) <= 1;
     const bool compare = t.checked_swap != d.swaps || t.checked_epoch != d.memory_epoch;
     const bool cpu_wrote = compare && hash_bytes(c.mem + data, size_t(t.texture.width) * t.texture.height * 4, 0x9E3779B97F4A7C15ull) != t.guest;
+    if ((!same_shape || cpu_wrote) && trace_draws(d)) trace_line(strf("dropped %u rt=%08X shape=%d cpu=%d\n", d.swaps, data, same_shape, cpu_wrote));
     if (!same_shape || cpu_wrote) {  // the memory holds something else now
         d.renderer->destroy_texture(t.texture.id);
         d.targets.erase(it);
@@ -2168,6 +2238,35 @@ void issue_draw(rt::Context& c, Device& d, const char* fn, uint32_t prim, Vertic
     if (indexed) cmd.indices = seq.data(), cmd.index_count = uint32_t(seq.size());
     cmd.vs_uniforms = vsu.data();
     cmd.fs_uniforms = fsu.data();
+    if (trace_draws(d)) {
+        std::string t;
+        for (uint32_t stage = 0; stage < 4; ++stage)
+            if (const uint32_t tex = ld(c, dev + 0xF78 + 4 * stage); tex && cmd.textures[stage])
+                t += strf(" t%u=%08X/%x", stage, ld(c, tex + 4), (ld(c, tex + 12) >> 8) & 0xFF);
+        const uint32_t target = ld(c, dev + kDevRenderTarget), depth = ld(c, dev + kDevDepth);
+        const std::string line =
+            strf("draw %u %s rt=%08X zs=%08X %ux%u vp=%d,%d %ux%u prim=%u n=%u %s%s blend=%u %x/%x/%x z=%u/%u/%x st=%u zb=%u cw=%08X a=%u/%u "
+                 "cull=%x modes=%x c0=%08X/%08X vs=%08X\n",
+                 d.swaps, fn, ld(c, target + 4), depth ? ld(c, depth + 4) : 0u, target_w, target_h, cmd.scissor.x, cmd.scissor.y,
+                 cmd.scissor.w, cmd.scissor.h, prim, v.count, passthrough ? "xyzrhw" : fixed_function ? "ff" : "prog", t.c_str(),
+                 rs(kRsAlphaBlendEnable), rs(kRsSrcBlend), rs(kRsDestBlend), rs(kRsBlendOp), zenable, rs(kRsZWriteEnable), rs(kRsZFunc),
+                 rs(kRsStencilEnable), ld(c, kRsZBiasSlot), cw, rs(kRsAlphaTestEnable), rs(kRsAlphaRef), cull, cs.texture_modes,
+                 rs(kRsPsRgbInputs), rs(kRsPsRgbOutputs), ld(c, dev + kDevVertexShader));
+        trace_line(line);
+        if (const char* dir = std::getenv("QILIN_TRACE_DUMP"); dir && *dir && trace_wanted(line)) {
+            static uint32_t n = 0;
+            for (uint32_t stage = 0; stage < 4; ++stage)
+                for (const auto& [addr, tt] : d.targets)
+                    if (cmd.textures[stage] && tt.texture.id == cmd.textures[stage]) {
+                        const gfx::Image im = d.renderer->read_render_target(tt.texture.id);
+                        if (FILE* f = std::fopen(strf("%s/%u_%04u_%08X.pam", dir, d.swaps, n++, addr).c_str(), "wb")) {
+                            std::fprintf(f, "P7\nWIDTH %u\nHEIGHT %u\nDEPTH 4\nMAXVAL 255\nTUPLTYPE RGB_ALPHA\nENDHDR\n", im.width, im.height);
+                            std::fwrite(im.rgba.data(), 1, im.rgba.size(), f);
+                            std::fclose(f);
+                        }
+                    }
+        }
+    }
     d.renderer->draw(cmd);
     t_spare_vertices = std::move(v);
     t_spare_sequence = std::move(seq);

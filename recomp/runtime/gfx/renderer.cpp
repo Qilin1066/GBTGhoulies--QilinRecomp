@@ -871,7 +871,9 @@ void VulkanRenderer::submit(VkSemaphore wait, VkSemaphore signal) {
     VkSemaphoreSubmitInfo w{VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO}, sg{VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO};
     if (wait) {
         w.semaphore = wait;
-        w.stageMask = VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT;
+        // The acquired image is first touched by a layout change at either of
+        // these stages (the present pass's colour output, or a copy): both wait.
+        w.stageMask = VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT | VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
         info.waitSemaphoreInfoCount = 1;
         info.pWaitSemaphoreInfos = &w;
     }
@@ -1144,7 +1146,7 @@ void VulkanRenderer::show(Target& frame) {
     vkCmdBlitImage(cmd_, frame.image, frame.layout, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit,
                    picture_.smooth ? VK_FILTER_LINEAR : VK_FILTER_NEAREST);
     barrier(VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT,
-            VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_2_NONE, 0);
+            VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, 0);  // before the semaphore present waits on
     submit(acquired_, rendered_[index]);
 
     VkPresentInfoKHR info{VK_STRUCTURE_TYPE_PRESENT_INFO_KHR};
@@ -1437,7 +1439,7 @@ void VulkanRenderer::present_through_pass(Target& frame, uint32_t index, int32_t
     }
     vkCmdEndRendering(cmd_);
     barrier(VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
-            VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT, VK_PIPELINE_STAGE_2_NONE, 0);
+            VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, 0);  // before the semaphore present waits on
     submit(acquired_, rendered_[index]);
 
     VkPresentInfoKHR pi{VK_STRUCTURE_TYPE_PRESENT_INFO_KHR};

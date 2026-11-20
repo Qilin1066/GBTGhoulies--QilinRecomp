@@ -36,6 +36,9 @@ struct Settings {
     uint32_t mask = 30;                // CRT: the phosphor stripes, 0-100
     bool vsync = true;                 // at the display's refresh, no tearing; off: the lowest latency
     uint32_t anisotropy = 1;           // texture filtering: 1 (the console's), 2, 4, 8 or 16
+    // The picture's shape, width:height: 4:3 the original, wider ones show more
+    // at the sides (up to 4:1); 0:0 is "auto", the screen's own shape.
+    uint32_t aspect_w = 0, aspect_h = 0;
     // [controls]
     bool rumble = true;
     std::vector<std::string> keys[kControlCount];  // SDL's key names ("Space", "W")
@@ -44,8 +47,9 @@ struct Settings {
     uint32_t channels = 0;             // 0 the device's own (5.1 where it has six speakers), 2 stereo, 6 5.1
     // [console]: what the game reads as the Xbox's own settings
     uint32_t language = 1;             // XC_LANGUAGE: 1 English, 3 German, 4 French, 5 Spanish, 6 Italian
-    bool widescreen = true;            // the console's 16:9 setting: the game draws for a 16:9 screen (off: 4:3)
 };
+// The shape asked for: width over height, or `screen` (the screen's own) for auto.
+float aspect_ratio(const Settings& s, float screen);
 
 Settings default_settings();
 void default_keys(Settings& s);  // the keyboard's controls back to the defaults (docs/input.md)

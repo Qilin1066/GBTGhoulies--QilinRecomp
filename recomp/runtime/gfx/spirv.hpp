@@ -46,7 +46,7 @@ enum class Storage : uint32_t { UniformConstant = 0, Input = 1, Uniform = 2, Out
 enum class Stage : uint32_t { Vertex = 0, Fragment = 4 };
 
 namespace deco {
-enum : uint32_t { Block = 2, ArrayStride = 6, BuiltIn = 11, NoPerspective = 13, Flat = 14, Location = 30, Binding = 33, DescriptorSet = 34, Offset = 35 };
+enum : uint32_t { Block = 2, ArrayStride = 6, BuiltIn = 11, NoPerspective = 13, Flat = 14, Invariant = 18, Location = 30, Binding = 33, DescriptorSet = 34, Offset = 35, NoContraction = 42 };
 }
 namespace builtin {
 enum : uint32_t { Position = 0, PointSize = 1, FragCoord = 15, PointCoord = 16, FragDepth = 22 };
@@ -93,6 +93,10 @@ public:
     void decorate(Id target, uint32_t decoration, std::initializer_list<uint32_t> args = {});
 
     // The body: instructions go into main() in order.
+    // Floating-point arithmetic from here on exactly as written: no fused
+    // multiply-adds or reordering (NoContraction), so two programs that
+    // compute the same expression get the same bits.
+    void exact_arithmetic(bool on) { exact_ = on; }
     Id op(uint16_t opcode, Id result_type, std::initializer_list<Id> operands);
     Id op(uint16_t opcode, Id result_type, const std::vector<Id>& operands);
     void op_void(uint16_t opcode, std::initializer_list<Id> operands);
@@ -117,6 +121,8 @@ public:
     std::vector<uint32_t> finish(const std::vector<Id>& interface);
 
 private:
+    bool exact_ = false;
+    void mark_exact(uint16_t opcode, Id r);
     bool depth_replacing_ = false;
     using Words = std::vector<uint32_t>;
     static void emit(Words& w, uint16_t opcode, std::initializer_list<uint32_t> operands);

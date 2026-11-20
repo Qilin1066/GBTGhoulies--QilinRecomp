@@ -39,6 +39,10 @@ public:
     // The drawable area in pixels, which on high-DPI displays is more than the size in points.
     void pixel_size(uint32_t* width, uint32_t* height) const;
     bool minimized() const;
+    // The shape (width / height) of the desktop on the display the window is
+    // on, or of the main display before there's a window; 0 if unknown.
+    float screen_aspect() const;
+    static float main_screen_aspect();
 
     // Handles what happened since the last call: closing the window asks the
     // runtime to stop (`quit_requested`), F11 and Alt+Enter switch fullscreen;

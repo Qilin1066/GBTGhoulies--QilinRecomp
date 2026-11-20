@@ -63,6 +63,15 @@ bool read_uint(const std::string& v, uint32_t lo, uint32_t hi, uint32_t* out) {
     return true;
 }
 const char* on(bool b) { return b ? "on" : "off"; }
+// "auto" (0:0), or W:H with both 1-10000.
+bool read_aspect(const std::string& v, uint32_t* w, uint32_t* h) {
+    if (v == "auto") return *w = 0, *h = 0, true;
+    const size_t colon = v.find(':');
+    uint32_t a = 0, b = 0;
+    if (colon == std::string::npos || !read_uint(v.substr(0, colon), 1, 10000, &a) || !read_uint(v.substr(colon + 1), 1, 10000, &b))
+        return false;
+    return *w = a, *h = b, true;
+}
 
 }  // namespace
 
@@ -72,6 +81,10 @@ bool key_reserved(const std::string& name) { return name == "Escape" || name == 
 
 void default_keys(Settings& s) {
     for (uint32_t c = 0; c < kControlCount; ++c) s.keys[c] = info(Control(c)).keys;
+}
+
+float aspect_ratio(const Settings& s, float screen) {
+    return s.aspect_w && s.aspect_h ? float(s.aspect_w) / float(s.aspect_h) : screen;
 }
 
 Settings default_settings() {
@@ -101,7 +114,14 @@ std::string settings_text(const Settings& s) {
          "# on: at the display's refresh, no tearing; off: the lowest latency.\n"
          "vsync = " << on(s.vsync) << "\n"
          "# Texture filtering: 1 (the console's), 2, 4, 8 or 16.\n"
-         "anisotropy = " << s.anisotropy << "\n\n";
+         "anisotropy = " << s.anisotropy << "\n"
+         "# The picture's shape, width:height: auto (the screen's own), 4:3 (the\n"
+         "# original), 16:10, 16:9, 64:27 (21:9), 32:9, or any other from 4:3 to 4:1.\n"
+         "# Wider than 4:3, the game's cameras see more at the sides.\n"
+         "aspect = ";
+    if (s.aspect_w && s.aspect_h) o << s.aspect_w << ":" << s.aspect_h;
+    else o << "auto";
+    o << "\n\n";
     o << "[controls]\n"
          "# Controllers use the Xbox controller's layout. These are the keyboard's\n"
          "# keys (SDL's names, several separated by commas; empty for none).\n"
@@ -119,10 +139,7 @@ std::string settings_text(const Settings& s) {
     o << "[console]\n"
          "# The Xbox's language, which the game uses: 1 English, 3 German, 4 French,\n"
          "# 5 Spanish, 6 Italian. From the next start.\n"
-         "language = " << s.language << "\n"
-         "# The console's widescreen setting: the game draws for a 16:9 screen; off: 4:3.\n"
-         "# From the next start.\n"
-         "widescreen = " << on(s.widescreen) << "\n";
+         "language = " << s.language << "\n";
     return o.str();
 }
 
@@ -130,6 +147,7 @@ Settings parse_settings(const std::string& text, std::vector<std::string>& warni
     Settings s = default_settings();
     std::istringstream in(text);
     std::string line, section;
+    bool aspect_given = false, widescreen = true;  // 0.36's [console] widescreen = off, without an aspect: 4:3
     for (int n = 1; std::getline(in, line); ++n) {
         line = trim(line.substr(0, line.find('#')));
         if (line.empty()) continue;
@@ -161,6 +179,7 @@ Settings parse_settings(const std::string& text, std::vector<std::string>& warni
             else if (key == "mask") ok = read_uint(v, 0, 100, &s.mask);
             else if (key == "vsync") ok = read_bool(v, &s.vsync);
             else if (key == "anisotropy") ok = read_uint(v, 1, 16, &s.anisotropy);
+            else if (key == "aspect") ok = aspect_given = read_aspect(v, &s.aspect_w, &s.aspect_h);
             else ok = false;
         } else if (section == "controls") {
             if (key == "rumble") {
@@ -183,13 +202,14 @@ Settings parse_settings(const std::string& text, std::vector<std::string>& warni
             else ok = false;
         } else if (section == "console") {
             if (key == "language") ok = read_uint(v, 1, 6, &s.language) && s.language != 2;  // 2 Japanese: not on this disc
-            else if (key == "widescreen") ok = read_bool(v, &s.widescreen);
+            else if (key == "widescreen") ok = read_bool(v, &widescreen);
             else ok = false;
         } else {
             ok = false;
         }
         if (!ok) warn("can't read \"" + line + "\"");
     }
+    if (!widescreen && !aspect_given) s.aspect_w = 4, s.aspect_h = 3;
     return s;
 }
 

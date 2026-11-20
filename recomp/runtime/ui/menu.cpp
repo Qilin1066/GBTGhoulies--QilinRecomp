@@ -243,6 +243,28 @@ void Menu::draw_menu() {
     ImGui::End();
 }
 
+// The picture's shape: the game's cameras widen to it (see host/aspect.cpp).
+void Menu::aspect_combo() {
+    struct Shape {
+        uint32_t w, h;
+        const char* name;
+    };
+    static const Shape kShapes[] = {
+        {0, 0, "Auto (the screen's shape)"}, {4, 3, "4:3 (the original)"}, {16, 10, "16:10"},
+        {16, 9, "16:9 (the console's widescreen)"}, {64, 27, "21:9 ultrawide"}, {32, 9, "32:9 super ultrawide"},
+    };
+    std::string current = std::to_string(s_.aspect_w) + ":" + std::to_string(s_.aspect_h);
+    for (const Shape& k : kShapes)
+        if (k.w == s_.aspect_w && k.h == s_.aspect_h) current = k.name;
+    if (ImGui::BeginCombo("Aspect ratio", current.c_str())) {
+        for (const Shape& k : kShapes)
+            if (ImGui::Selectable(k.name, k.w == s_.aspect_w && k.h == s_.aspect_h)) s_.aspect_w = k.w, s_.aspect_h = k.h, changed();
+        ImGui::EndCombo();
+    }
+    ImGui::SameLine();
+    ImGui::TextDisabled("(wider: more at the sides)");
+}
+
 void Menu::display_page() {
     bool full = window_.fullscreen();
     if (ImGui::Checkbox("Full screen (F11 or Alt+Enter)", &full)) {
@@ -250,6 +272,7 @@ void Menu::display_page() {
         s_.fullscreen = full;
     }
     ImGui::SeparatorText("The picture");
+    aspect_combo();
     int scaling = int(s_.scaling);
     bool any = false;
     any |= ImGui::RadioButton("Whole multiples (sharpest)", &scaling, int(platform::Settings::Scaling::Integer));
@@ -349,7 +372,6 @@ void Menu::game_page() {
             if (ImGui::Selectable(l.name, l.value == s_.language)) s_.language = l.value;
         ImGui::EndCombo();
     }
-    ImGui::Checkbox("Widescreen (16:9; off: 4:3) (from the next start)", &s_.widescreen);
     ImGui::Separator();
     ImGui::TextDisabled("Grabbed by the Ghoulies QilinRecomp %s", QILIN_VERSION);
     ImGui::TextDisabled("Settings: %s", platform::settings_file(folder_).string().c_str());
