@@ -11,6 +11,9 @@ Each release is a git tag (`vX.Y.Z`) with a matching GitHub release. The version
 
 ## [Unreleased]
 
+### Changed
+- **The project is renamed GBTGhoulies-QilinRecomp** (it was GBTG-Qilincomp), to match the GitHub repository, now [Qilin1066/GBTGhoulies-QilinRecomp](https://github.com/Qilin1066/GBTGhoulies-QilinRecomp), and its sister projects ApbArcade-QilinRecomp, BeatTheBeat-QilinRecomp and PunchOutWii-QilinRecomp. The CMake project, the README and docs, the menu and settings-file text ("Grabbed by the Ghoulies QilinRecomp"), the build scripts and the workflow use the new name, and the Windows download is now `GBTGhoulies-QilinRecomp-<version>-windows-x64.zip`, unpacking to a `GBTGhoulies-QilinRecomp` folder. The tools (`qilin`, `qilin_run`), the `QILIN_*` options and where the settings and saves are kept (`qilin/ghoulies` in the user's data folder) are unchanged, so nothing saved is lost. A new download folder asks for the disc folder once more the first time.
+
 ## [0.36.0] - 2026-11-19
 
 ### Added
@@ -652,9 +655,9 @@ Recompiler core foundations.
 ### Fixed
 - **CI:** use `macos-latest` (the `macos-14` image was retired).
 
-[Unreleased]: https://github.com/Qilin1066/GBTGhoulies-Qilincomp/compare/v0.5.0...HEAD
-[0.5.0]: https://github.com/Qilin1066/GBTGhoulies-Qilincomp/compare/v0.4.0...v0.5.0
-[0.4.0]: https://github.com/Qilin1066/GBTGhoulies-Qilincomp/compare/v0.3.0...v0.4.0
-[0.3.0]: https://github.com/Qilin1066/GBTGhoulies-Qilincomp/compare/v0.2.0...v0.3.0
-[0.2.0]: https://github.com/Qilin1066/GBTGhoulies-Qilincomp/compare/v0.1.0...v0.2.0
-[0.1.0]: https://github.com/Qilin1066/GBTGhoulies-Qilincomp/releases/tag/v0.1.0
+[Unreleased]: https://github.com/Qilin1066/GBTGhoulies-QilinRecomp/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/Qilin1066/GBTGhoulies-QilinRecomp/compare/v0.4.0...v0.5.0
+[0.4.0]: https://github.com/Qilin1066/GBTGhoulies-QilinRecomp/compare/v0.3.0...v0.4.0
+[0.3.0]: https://github.com/Qilin1066/GBTGhoulies-QilinRecomp/compare/v0.2.0...v0.3.0
+[0.2.0]: https://github.com/Qilin1066/GBTGhoulies-QilinRecomp/compare/v0.1.0...v0.2.0
+[0.1.0]: https://github.com/Qilin1066/GBTGhoulies-QilinRecomp/releases/tag/v0.1.0

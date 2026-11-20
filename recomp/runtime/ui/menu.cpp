@@ -351,7 +351,7 @@ void Menu::game_page() {
     }
     ImGui::Checkbox("Widescreen (16:9; off: 4:3) (from the next start)", &s_.widescreen);
     ImGui::Separator();
-    ImGui::TextDisabled("Grabbed by the Ghoulies QilinComp %s", QILIN_VERSION);
+    ImGui::TextDisabled("Grabbed by the Ghoulies QilinRecomp %s", QILIN_VERSION);
     ImGui::TextDisabled("Settings: %s", platform::settings_file(folder_).string().c_str());
     if (ImGui::Button("Quit the game")) {
         close();

@@ -7,7 +7,7 @@ if(APPLE AND NOT CMAKE_OSX_DEPLOYMENT_TARGET)
     set(CMAKE_OSX_DEPLOYMENT_TARGET 10.15 CACHE STRING "oldest macOS the runtime runs on")
 endif()
 # The single source of the version number (see CHANGELOG.md for the scheme).
-project(GBTGQilincomp VERSION 0.36.0 LANGUAGES C CXX)
+project(GBTGhoulies-QilinRecomp VERSION 0.36.0 LANGUAGES C CXX)
 
 # ---- Language: C++23 everywhere (recompiler, runtime, generated code) ----
 set(CMAKE_CXX_STANDARD 23)
@@ -182,7 +182,7 @@ add_library(qilin_platform STATIC recomp/runtime/platform/window.cpp recomp/runt
 target_include_directories(qilin_platform PUBLIC recomp/runtime/platform)
 target_link_libraries(qilin_platform PUBLIC SDL3::SDL3 PRIVATE qilin_warnings)
 
-# ---- The settings menu: Dear ImGui (MIT, vendored as the APB recomp has it) over the window ----
+# ---- The settings menu: Dear ImGui (MIT, vendored as ApbArcade-QilinRecomp has it) over the window ----
 add_library(qilin_imgui STATIC
     third_party/imgui/imgui.cpp third_party/imgui/imgui_draw.cpp third_party/imgui/imgui_tables.cpp
     third_party/imgui/imgui_widgets.cpp third_party/imgui/backends/imgui_impl_sdl3.cpp
@@ -234,7 +234,7 @@ if(QILIN_GEN_DIR)
 endif()
 
 # ---- The player kit: everything qilin_run needs but the code lifted from default.xbe ----
-# For the Windows download (tools/player-kit), as the APB and Punch-Out
+# For the Windows download (tools/player-kit), as ApbArcade-QilinRecomp and PunchOutWii-QilinRecomp
 # recomps': the runtime's start-up and dispatch and every library they link
 # (the host layer, renderer, audio, platform, XBE loader, SDL3, volk), merged
 # into one archive, with the headers the lifted code includes, qilin, and the

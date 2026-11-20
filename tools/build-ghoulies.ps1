@@ -1,5 +1,5 @@
-# Builds the game in one go from the source, as the APB and Punch-Out
-# recomps' build scripts: the recompiler, the lift of your disc's
+# Builds the game in one go from the source, as the build scripts of
+# ApbArcade-QilinRecomp and PunchOutWii-QilinRecomp do: the recompiler, the lift of your disc's
 # default.xbe, then the game. Run it again after a `git pull`: only what
 # changed is rebuilt (the lift leaves unchanged files alone).
 #

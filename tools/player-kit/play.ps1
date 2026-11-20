@@ -1,5 +1,5 @@
 # Play Grabbed by the Ghoulies (the Windows download's "Play Ghoulies.bat"
-# runs this), as the APB and Punch-Out recomps' downloads.
+# runs this), as ApbArcade-QilinRecomp's and PunchOutWii-QilinRecomp's downloads.
 #
 # The download holds everything but the game's own code: that is made here,
 # from your own disc, the first time (and again after an update): qilin
@@ -116,7 +116,7 @@ if (-not $Rebuild -and (Test-Path $game) -and $built -eq $kitVersion) {
     exit 0
 }
 
-Write-Host "Grabbed by the Ghoulies QilinComp $kitVersion" -ForegroundColor Cyan
+Write-Host "Grabbed by the Ghoulies QilinRecomp $kitVersion" -ForegroundColor Cyan
 if (Test-Path $game) { Write-Host "Updating the game for this version: a few minutes." }
 else { Write-Host "Building the game from your disc. This happens once (and after an update): about 5 to 20 minutes, depending on the PC." }
 Write-Host "Disc: $disc"

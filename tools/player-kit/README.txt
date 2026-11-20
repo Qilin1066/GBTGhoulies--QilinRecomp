@@ -1,4 +1,4 @@
-Grabbed by the Ghoulies QilinComp for Windows (64-bit)
+Grabbed by the Ghoulies QilinRecomp for Windows (64-bit)
 ======================================================
 
 Grabbed by the Ghoulies (Rare / Microsoft Game Studios, Xbox, 2003),

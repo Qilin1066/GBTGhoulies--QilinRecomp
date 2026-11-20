@@ -82,7 +82,7 @@ Settings default_settings() {
 
 std::string settings_text(const Settings& s) {
     std::ostringstream o;
-    o << "# Grabbed by the Ghoulies QilinComp: settings. The settings menu (F1 or Esc in the\n"
+    o << "# Grabbed by the Ghoulies QilinRecomp: settings. The settings menu (F1 or Esc in the\n"
          "# game, or Back and Start together on a controller) changes them and writes\n"
          "# them here; this file can be edited by hand too.\n\n";
     o << "[display]\n"
