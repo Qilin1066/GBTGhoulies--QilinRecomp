@@ -7,7 +7,7 @@ if(APPLE AND NOT CMAKE_OSX_DEPLOYMENT_TARGET)
     set(CMAKE_OSX_DEPLOYMENT_TARGET 10.15 CACHE STRING "oldest macOS the runtime runs on")
 endif()
 # The single source of the version number (see CHANGELOG.md for the scheme).
-project(GBTGhoulies-QilinRecomp VERSION 0.37.0 LANGUAGES C CXX)
+project(GBTGhoulies-QilinRecomp VERSION 0.38.0 LANGUAGES C CXX)
 
 # ---- Language: C++23 everywhere (recompiler, runtime, generated code) ----
 set(CMAKE_CXX_STANDARD 23)
@@ -134,7 +134,7 @@ add_test(NAME qilin_x87_consistency COMMAND qilin_x87_consistency 200000)
 add_library(qilin_volk STATIC third_party/volk/volk.c)
 target_include_directories(qilin_volk PUBLIC third_party/volk third_party/vulkan-headers/include)
 target_link_libraries(qilin_volk PUBLIC ${CMAKE_DL_LIBS})
-add_library(qilin_gfx STATIC recomp/runtime/gfx/renderer.cpp recomp/runtime/gfx/png.cpp recomp/runtime/gfx/vsh.cpp
+add_library(qilin_gfx STATIC recomp/runtime/gfx/renderer.cpp recomp/runtime/gfx/fsr/fsr_constants.cpp recomp/runtime/gfx/png.cpp recomp/runtime/gfx/vsh.cpp
     recomp/runtime/gfx/spirv.cpp recomp/runtime/gfx/nv2a_vs.cpp recomp/runtime/gfx/nv2a_ps.cpp recomp/runtime/gfx/texture.cpp)
 target_include_directories(qilin_gfx PUBLIC recomp/runtime/gfx PRIVATE recomp/runtime)
 target_link_libraries(qilin_gfx PUBLIC qilin_volk PRIVATE qilin_warnings)

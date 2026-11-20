@@ -246,6 +246,7 @@ mad oPos.xyz, oPos.xyzz, r1.x, c-37.xyzz
         const float pos[3][4] = {{0, 0, 0.5f, 1}, {40, 0, 0.5f, 1}, {0, 40, 0.5f, 1}};
         const float col[3][4] = {{0, 1, 0, 1}, {0, 1, 0, 1}, {0, 1, 0, 1}};
         std::vector<float> vsu(gfx::nv2a::kVsUniformVec4s * 4, 0.0f), fsu(gfx::nv2a::kFsUniformVec4s * 4, 0.0f);
+        vsu[gfx::nv2a::kVsPixels * 4] = 1.0f;
         vsu[gfx::nv2a::kVsScreen * 4 + 0] = 2.0f / float(cfg.width);
         vsu[gfx::nv2a::kVsScreen * 4 + 1] = 2.0f / float(cfg.height);
         vsu[gfx::nv2a::kVsScreen * 4 + 2] = 1.0f;
@@ -299,6 +300,7 @@ mad oPos.xyz, oPos.xyzz, r1.x, c-37.xyzz
         const float pos_v[4][4] = {{0, 0, 0.5f, 1}, {8, 0, 0.5f, 1}, {0, 8, 0.5f, 1}, {8, 8, 0.5f, 1}};
         const float uv_v[4][4] = {{0, 0, 0, 1}, {1, 0, 0, 1}, {0, 1, 0, 1}, {1, 1, 0, 1}};
         std::vector<float> vsu(gfx::nv2a::kVsUniformVec4s * 4, 0.0f), fsu(gfx::nv2a::kFsUniformVec4s * 4, 0.0f);
+        vsu[gfx::nv2a::kVsPixels * 4] = 1.0f;
         vsu[gfx::nv2a::kVsScreen * 4 + 0] = 2.0f / float(cfg.width);
         vsu[gfx::nv2a::kVsScreen * 4 + 1] = 2.0f / float(cfg.height);
         vsu[gfx::nv2a::kVsScreen * 4 + 2] = 1.0f;

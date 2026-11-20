@@ -38,7 +38,7 @@ printf '%s\n' "$version" > "$pkg/kit/VERSION"
 
 # Every licence of what's included, by component.
 lic="$pkg/LICENSES"
-mkdir -p "$lic/llvm-mingw" "$lic/ninja" "$lic/SDL3" "$lic/Vulkan-Headers" "$lic/volk" "$lic/Zydis" "$lic/Dear ImGui"
+mkdir -p "$lic/llvm-mingw" "$lic/ninja" "$lic/SDL3" "$lic/Vulkan-Headers" "$lic/volk" "$lic/Zydis" "$lic/Dear ImGui" "$lic/FidelityFX FSR"
 mv "$pkg/kit/toolchain/licenses/"* "$lic/llvm-mingw/"
 rmdir "$pkg/kit/toolchain/licenses"
 cp "$NINJA_WINDOWS/COPYING" "$lic/ninja/"
@@ -48,6 +48,7 @@ cp "$sdl/LICENSE.txt" "$lic/SDL3/"
 cp -r "$root"/third_party/vulkan-headers/LICENSE.md "$root"/third_party/vulkan-headers/LICENSES "$lic/Vulkan-Headers/"
 cp "$root"/third_party/volk/LICENSE* "$lic/volk/"
 cp "$root"/third_party/imgui/LICENSE.txt "$lic/Dear ImGui/"
+cp "$root"/third_party/fsr1/LICENSE.txt "$lic/FidelityFX FSR/"
 cp "$root"/third_party/zydis/LICENSE "$lic/Zydis/"
 cp "$root"/third_party/zydis/dependencies/zycore/LICENSE "$lic/Zydis/LICENSE-Zycore" 2>/dev/null || true
 # (nxdk's kernel export list, CC0-1.0, is in the runtime too: third_party/README.md.)

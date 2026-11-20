@@ -31,6 +31,8 @@ struct Settings {
     bool fullscreen = false;           // borderless, at the desktop's mode (F11 or Alt+Enter switch it)
     enum class Scaling : uint8_t { Integer, Fit, Stretch } scaling = Scaling::Fit;
     bool smooth = false;               // bilinear; off: sharp pixels
+    bool fsr = false;                  // AMD FSR 1 where the picture is shown larger than it's drawn
+    uint32_t sharpness = 80;           // FSR's sharpening, 0-100
     enum class Look : uint8_t { Plain, Crt } look = Look::Plain;
     uint32_t scanlines = 60;           // CRT: the gaps between raster lines, 0-100 (percent dark)
     uint32_t mask = 30;                // CRT: the phosphor stripes, 0-100
@@ -39,6 +41,9 @@ struct Settings {
     // The picture's shape, width:height: 4:3 the original, wider ones show more
     // at the sides (up to 4:1); 0:0 is "auto", the screen's own shape.
     uint32_t aspect_w = 0, aspect_h = 0;
+    // The render resolution, in multiples of the game's 480 lines (1-4; its
+    // width follows the picture's shape); 0 is "auto", the window's size.
+    uint32_t resolution = 0;
     // [controls]
     bool rumble = true;
     std::vector<std::string> keys[kControlCount];  // SDL's key names ("Space", "W")
@@ -50,6 +55,9 @@ struct Settings {
 };
 // The shape asked for: width over height, or `screen` (the screen's own) for auto.
 float aspect_ratio(const Settings& s, float screen);
+// The render resolution's scale across and down, for a picture `aspect` wide
+// shown `shown_lines` high (auto rounds to the nearest whole multiple of 480).
+void resolution_scale(const Settings& s, float aspect, uint32_t shown_lines, uint32_t* x, uint32_t* y);
 
 Settings default_settings();
 void default_keys(Settings& s);  // the keyboard's controls back to the defaults (docs/input.md)

@@ -18,6 +18,10 @@ namespace qilin::gfx {
 struct Config {
     uint32_t width = 640, height = 480;  // the frame buffers' size in pixels
     uint32_t back_buffers = 1;           // D3DPRESENT_PARAMETERS.BackBufferCount; with the front buffer, one more image
+    // The render resolution: every frame buffer and render target drawn at
+    // these multiples of its size across and down (1-8), the game seeing
+    // its own sizes (set_resolution_scale changes them).
+    uint32_t scale_x = 1, scale_y = 1;
     bool depth_stencil = true;           // a 24-bit depth, 8-bit stencil buffer
     int gpu = -1;                        // index among the Vulkan devices; -1 picks the best one
     bool validation = false;             // Vulkan validation layers, if installed (also QILIN_VK_VALIDATION=1)
@@ -49,6 +53,11 @@ struct Picture {
     // The shape the frame is shown at, width over height: 4:3, or 16:9 for a
     // game drawing for a widescreen TV (squeezed into the same frame).
     float aspect = 4.0f / 3.0f;
+    // AMD FidelityFX Super Resolution 1 where the frame is shown larger than
+    // it's drawn (not at whole multiples): edge-aware upscaling, then
+    // sharpening by `sharpness`, 0 (least) to 1 (most).
+    bool fsr = false;
+    float sharpness = 0.8f;
     bool operator==(const Picture&) const = default;
 };
 
@@ -176,6 +185,7 @@ public:
     virtual uint64_t frames_presented() const = 0;
     // How the window shows frames, from the next one shown.
     virtual void set_picture(const Picture& p) = 0;
+    virtual const Picture& picture() const = 0;
     // Anisotropic filtering for the game's textures: 1 (the console's: none)
     // to max_anisotropy().
     virtual void set_anisotropy(uint32_t level) = 0;
@@ -261,6 +271,15 @@ public:
 
     // Validation messages of error severity so far (0 without the layers).
     virtual uint32_t validation_errors() const = 0;
+    // The render resolution (Config's scale_x, scale_y): every frame buffer
+    // and render target made again at the new size, their pictures scaled
+    // into it (depth starts cleared). Clears, scissors, copies, line widths
+    // and points are in the game's pixels and scaled here; reading a target
+    // back gives it at the game's size (each pixel the average of the ones it
+    // became), and writing one scales it up.
+    virtual void set_resolution_scale(uint32_t x, uint32_t y) = 0;
+    virtual uint32_t resolution_scale_x() const = 0;
+    virtual uint32_t resolution_scale_y() const = 0;
 };
 
 // Writes an image as a PNG (uncompressed). False if the file can't be written.

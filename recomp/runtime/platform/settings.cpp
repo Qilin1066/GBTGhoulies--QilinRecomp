@@ -1,6 +1,7 @@
 #include "settings.hpp"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
@@ -87,6 +88,14 @@ float aspect_ratio(const Settings& s, float screen) {
     return s.aspect_w && s.aspect_h ? float(s.aspect_w) / float(s.aspect_h) : screen;
 }
 
+void resolution_scale(const Settings& s, float aspect, uint32_t shown_lines, uint32_t* x, uint32_t* y) {
+    const uint32_t down = s.resolution ? s.resolution : std::clamp<uint32_t>((shown_lines + 240) / 480, 1, 4);
+    // Across: as many as the picture is wider than 4:3, so its pixels stay
+    // about square on screen (the game's 640 columns are stretched to it).
+    *y = down;
+    *x = std::clamp<uint32_t>(uint32_t(std::lround(float(down) * aspect * 0.75f)), 1, 8);
+}
+
 Settings default_settings() {
     Settings s;
     default_keys(s);
@@ -106,6 +115,10 @@ std::string settings_text(const Settings& s) {
          "scaling = " << (s.scaling == Settings::Scaling::Integer ? "integer" : s.scaling == Settings::Scaling::Stretch ? "stretch" : "fit") << "\n"
          "# on: bilinear; off: sharp pixels (each of the game's pixels a solid block).\n"
          "smooth = " << on(s.smooth) << "\n"
+         "# AMD FidelityFX Super Resolution 1 where the picture is shown larger than\n"
+         "# the render resolution (not at whole multiples), and its sharpening, 0-100.\n"
+         "fsr = " << on(s.fsr) << "\n"
+         "sharpness = " << s.sharpness << "\n"
          "# plain, or crt: a television's raster lines and phosphor stripes.\n"
          "look = " << (s.look == Settings::Look::Crt ? "crt" : "plain") << "\n"
          "# CRT: how dark the gaps between lines are, and the stripes' strength, 0-100.\n"
@@ -120,6 +133,12 @@ std::string settings_text(const Settings& s) {
          "# Wider than 4:3, the game's cameras see more at the sides.\n"
          "aspect = ";
     if (s.aspect_w && s.aspect_h) o << s.aspect_w << ":" << s.aspect_h;
+    else o << "auto";
+    o << "\n"
+         "# The render resolution: auto (the window's size), or 1 (640x480, the\n"
+         "# original) to 4 (1920 lines), its width following the picture's shape.\n"
+         "resolution = ";
+    if (s.resolution) o << s.resolution;
     else o << "auto";
     o << "\n\n";
     o << "[controls]\n"
@@ -171,6 +190,8 @@ Settings parse_settings(const std::string& text, std::vector<std::string>& warni
                 else if (v == "stretch") s.scaling = Settings::Scaling::Stretch;
                 else ok = false;
             } else if (key == "smooth") ok = read_bool(v, &s.smooth);
+            else if (key == "fsr") ok = read_bool(v, &s.fsr);
+            else if (key == "sharpness") ok = read_uint(v, 0, 100, &s.sharpness);
             else if (key == "look") {
                 if (v == "plain") s.look = Settings::Look::Plain;
                 else if (v == "crt") s.look = Settings::Look::Crt;
@@ -180,6 +201,7 @@ Settings parse_settings(const std::string& text, std::vector<std::string>& warni
             else if (key == "vsync") ok = read_bool(v, &s.vsync);
             else if (key == "anisotropy") ok = read_uint(v, 1, 16, &s.anisotropy);
             else if (key == "aspect") ok = aspect_given = read_aspect(v, &s.aspect_w, &s.aspect_h);
+            else if (key == "resolution") ok = v == "auto" ? (s.resolution = 0, true) : read_uint(v, 1, 4, &s.resolution);
             else ok = false;
         } else if (section == "controls") {
             if (key == "rumble") {

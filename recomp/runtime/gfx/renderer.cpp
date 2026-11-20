@@ -19,8 +19,10 @@
 #include <cstring>
 
 #include <map>
+#include <span>
 #include <unordered_map>
 
+#include "fsr/fsr_constants.hpp"
 #include "gfx.hpp"
 #include "nv2a_shaders.hpp"
 #include "spirv.hpp"
@@ -34,6 +36,9 @@
 #endif
 
 namespace qilin::gfx {
+namespace fsr_spirv {
+#include "fsr/fsr_spirv.inc"
+}  // namespace fsr_spirv
 namespace {
 
 [[noreturn]] void fatal(const char* what, VkResult r) {
@@ -51,7 +56,10 @@ struct Target {
     VkImageView view = VK_NULL_HANDLE;
     VkImageLayout layout = VK_IMAGE_LAYOUT_UNDEFINED;
     VkImageAspectFlags aspect = 0;
-    uint32_t width = 0, height = 0;
+    uint32_t width = 0, height = 0;    // the image's, in pixels
+    uint32_t sx = 1, sy = 1;           // the render resolution's scale: the game's size is width / sx by height / sy
+    VkFormat format = VK_FORMAT_UNDEFINED;
+    VkImageUsageFlags usage = 0;
 };
 
 // The pipeline stages and accesses that go with an image layout, for barriers.
@@ -73,9 +81,13 @@ void layout_use(VkImageLayout layout, VkPipelineStageFlags2& stage, VkAccessFlag
             stage = VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT;
             access = VK_ACCESS_2_TRANSFER_WRITE_BIT;
             break;
-        case VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL:
-            stage = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
+        case VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL:  // sampled by draws, or by FSR's passes
+            stage = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
             access = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT;
+            break;
+        case VK_IMAGE_LAYOUT_GENERAL:  // written by FSR's passes
+            stage = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+            access = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
             break;
         default:  // undefined: nothing to wait for
             stage = VK_PIPELINE_STAGE_2_NONE;
@@ -141,6 +153,7 @@ public:
         return true;
     }
     void set_overlay(std::function<void(void*)> draw) override { overlay_ = std::move(draw); }
+    const Picture& picture() const override { return picture_; }
     Picture picture_;
     uint32_t anisotropy_ = 1, max_anisotropy_ = 1;
     std::function<void(void*)> overlay_;
@@ -155,12 +168,27 @@ public:
     }
     void set_gamma_ramp(const uint8_t ramp[3][256]) override;
     uint32_t validation_errors() const override { return validation_errors_; }
+    void set_resolution_scale(uint32_t x, uint32_t y) override;
+    uint32_t resolution_scale_x() const override { return config_.scale_x; }
+    uint32_t resolution_scale_y() const override { return config_.scale_y; }
 
 private:
     bool create_instance(std::string* error);
     bool pick_device(std::string* error);
     void create_device();
+    // An image of the game's width × height (0: the frame buffers'), made at the render resolution.
     Target create_target(VkFormat format, VkImageUsageFlags usage, VkImageAspectFlags aspect, uint32_t width = 0, uint32_t height = 0);
+    Target create_image(VkFormat format, VkImageUsageFlags usage, VkImageAspectFlags aspect, uint32_t width, uint32_t height);
+    uint32_t present_scale_[2] = {0, 0};  // the render resolution the present pass's shaders were made for
+    // FSR 1 (fsr/): EASU scales the frame to the size it's shown at, RCAS
+    // sharpens that, both compute passes into images of that size, which
+    // the present pass then samples one to one.
+    VkDescriptorSetLayout fsr_set_layout_ = VK_NULL_HANDLE;
+    VkPipelineLayout fsr_layout_ = VK_NULL_HANDLE;
+    VkPipeline fsr_pipelines_[2] = {};  // EASU, RCAS
+    Target fsr_images_[2];              // their outputs
+    void fsr_objects(uint32_t width, uint32_t height);  // made, at this size, before the frame's commands
+    Target& run_fsr(Target& frame);
     Target& target() { return current_rt_ ? render_targets_.at(current_rt_) : color_[back_]; }  // what draws and clears go to
     // The depth buffer draws and clears use, or null.
     Target* depth_target() {
@@ -620,10 +648,21 @@ uint32_t VulkanRenderer::memory_type(uint32_t allowed, VkMemoryPropertyFlags wan
 
 Target VulkanRenderer::create_target(VkFormat format, VkImageUsageFlags usage, VkImageAspectFlags aspect, uint32_t width,
                                      uint32_t height) {
+    Target t = create_image(format, usage, aspect, (width ? width : config_.width) * config_.scale_x,
+                            (height ? height : config_.height) * config_.scale_y);
+    t.sx = config_.scale_x;
+    t.sy = config_.scale_y;
+    return t;
+}
+
+Target VulkanRenderer::create_image(VkFormat format, VkImageUsageFlags usage, VkImageAspectFlags aspect, uint32_t width,
+                                    uint32_t height) {
     Target t;
     t.aspect = aspect;
-    t.width = width ? width : config_.width;
-    t.height = height ? height : config_.height;
+    t.format = format;
+    t.usage = usage;
+    t.width = width;
+    t.height = height;
     VkImageCreateInfo info{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
     info.imageType = VK_IMAGE_TYPE_2D;
     info.format = format;
@@ -655,7 +694,7 @@ Target VulkanRenderer::create_target(VkFormat format, VkImageUsageFlags usage, V
 bool VulkanRenderer::init(const Config& config, std::string* error) {
     config_ = config;
     if (config_.width == 0 || config_.height == 0 || config_.width > 16384 || config_.height > 16384 || config_.back_buffers == 0 ||
-        config_.back_buffers > 3) {
+        config_.back_buffers > 3 || config_.scale_x - 1 > 7 || config_.scale_y - 1 > 7) {
         *error = "bad frame buffer size or count";
         return false;
     }
@@ -701,6 +740,10 @@ void VulkanRenderer::destroy() {
             if (t.memory) vkFreeMemory(device_, t.memory, nullptr);
         };
         for (Target& t : color_) drop(t);
+        for (Target& t : fsr_images_) drop(t);
+        for (VkPipeline p : fsr_pipelines_) if (p) vkDestroyPipeline(device_, p, nullptr);
+        if (fsr_layout_) vkDestroyPipelineLayout(device_, fsr_layout_, nullptr);
+        if (fsr_set_layout_) vkDestroyDescriptorSetLayout(device_, fsr_set_layout_, nullptr);
         for (auto& [id, t] : render_targets_) drop(t);
         for (auto& [id, t] : depth_targets_) drop(t);
         drop(depth_);
@@ -818,14 +861,14 @@ void VulkanRenderer::end_pass() {
 void VulkanRenderer::clear(const Rect* rects, uint32_t count, uint32_t flags, const float rgba[4], float depth, uint32_t stencil) {
     if (!target_has_depth()) flags &= ~uint32_t(kClearDepth | kClearStencil);
     if (!(flags & (kClearColor | kClearDepth | kClearStencil))) return;
-    const uint32_t tw = target().width, th = target().height;
-    // Clip the rectangles to the buffer; no rectangles means all of it.
+    const uint32_t tw = target().width, th = target().height, sx = target().sx, sy = target().sy;
+    // Clip the rectangles (the game's pixels) to the buffer; no rectangles means all of it.
     std::vector<VkClearRect> clipped;
     bool whole = count == 0;
     for (uint32_t i = 0; i < count; ++i) {
-        const int64_t x0 = std::max<int64_t>(rects[i].x, 0), y0 = std::max<int64_t>(rects[i].y, 0);
-        const int64_t x1 = std::min<int64_t>(int64_t(rects[i].x) + rects[i].w, tw);
-        const int64_t y1 = std::min<int64_t>(int64_t(rects[i].y) + rects[i].h, th);
+        const int64_t x0 = std::max<int64_t>(int64_t(rects[i].x) * sx, 0), y0 = std::max<int64_t>(int64_t(rects[i].y) * sy, 0);
+        const int64_t x1 = std::min<int64_t>((int64_t(rects[i].x) + rects[i].w) * sx, tw);
+        const int64_t y1 = std::min<int64_t>((int64_t(rects[i].y) + rects[i].h) * sy, th);
         if (x1 <= x0 || y1 <= y0) continue;
         whole = whole || (x0 == 0 && y0 == 0 && x1 == tw && y1 == th);
         clipped.push_back({{{int32_t(x0), int32_t(y0)}, {uint32_t(x1 - x0), uint32_t(y1 - y0)}}, 0, 1});
@@ -1136,7 +1179,7 @@ void VulkanRenderer::show(Target& frame) {
     barrier(VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT,
             VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
 
-    const uint64_t fw = config_.width, fh = config_.height, dw = dw0, dh = dh0;
+    const uint64_t fw = frame.width, fh = frame.height, dw = dw0, dh = dh0;
     const int32_t dx = int32_t((sw0 - dw) / 2), dy = int32_t((sh0 - dh) / 2);
     VkImageBlit blit{};
     blit.srcSubresource = blit.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
@@ -1185,7 +1228,9 @@ std::vector<uint32_t> present_vs() {
 // the pixel each covers); at whole-number scales that is nearest-neighbour,
 // at others no texel is wider than its neighbours by a pixel, and nothing
 // is blurred. Then each channel through the gamma ramp.
-std::vector<uint32_t> present_fs(uint32_t width, uint32_t height) {
+// width × height: the frame image's size (sharp scaling snaps to its
+// texels); lines: the game's frame lines (the CRT's scanlines).
+std::vector<uint32_t> present_fs(uint32_t width, uint32_t height, uint32_t lines) {
     namespace op = spv::op;
     namespace glsl = spv::glsl;
     spv::Builder b{spv::Stage::Fragment};
@@ -1210,16 +1255,17 @@ std::vector<uint32_t> present_fs(uint32_t width, uint32_t height) {
         return b.op(op::FDiv, f, {b.op(op::FAdd, f, {base, moved}), b.c_float(size)});
     };
     const spv::Id sharp = b.op(op::CompositeConstruct, v2, {axis(0, float(width), op::DPdx), axis(1, float(height), op::DPdy)});
-    // Smooth: the frame's own position, bilinear. (CRT: sharp across, the raster lines below.)
+    // Smooth: the frame's own position, bilinear (also FSR's output, already
+    // the shown size); else sharp, as for the CRT, its raster lines below.
     const spv::Id plain = b.shuffle(v2, uv, uv, {0, 1});
-    const spv::Id at = b.ext(glsl::FMix, v2, {sharp, plain, b.splat(b.op(op::FMul, f, {smooth, b.op(op::FSub, f, {b.c_float(1), crt})}), 2)});
+    const spv::Id at = b.ext(glsl::FMix, v2, {sharp, plain, b.splat(smooth, 2)});
     spv::Id c = b.op(op::ImageSampleImplicitLod, v4, {frame, at});
     // A CRT: each of the frame's lines lit across its middle and dark at its
     // edges (by `scanlines`), and the window's columns through red, green and
     // blue phosphor stripes in turn (by `mask`), brightened back to the
     // frame's average level.
     {
-        const spv::Id line = b.op(op::FSub, f, {b.ext(glsl::Fract, f, {b.op(op::FMul, f, {b.extract(f, uv, 1), b.c_float(float(height))})}), b.c_float(0.5f)});
+        const spv::Id line = b.op(op::FSub, f, {b.ext(glsl::Fract, f, {b.op(op::FMul, f, {b.extract(f, uv, 1), b.c_float(float(lines))})}), b.c_float(0.5f)});
         const spv::Id d2 = b.op(op::FMul, f, {b.c_float(4), b.op(op::FMul, f, {line, line})});
         const spv::Id scan = b.op(op::FSub, f, {b.c_float(1), b.op(op::FMul, f, {scanlines, d2})});
         const spv::Id coord = b.load(v4, frag_coord);
@@ -1268,7 +1314,17 @@ void VulkanRenderer::set_gamma_ramp(const uint8_t ramp[3][256]) {
 }
 
 VkPipeline VulkanRenderer::present_pipeline() {
-    if (present_pipeline_ && present_format_ == swap_format_) return present_pipeline_;
+    const bool rescaled = present_scale_[0] != config_.scale_x || present_scale_[1] != config_.scale_y;
+    if (present_pipeline_ && present_format_ == swap_format_ && !rescaled) return present_pipeline_;
+    if (rescaled && present_shaders_[1]) {  // the fragment shader samples the frame at its size
+        vkDestroyShaderModule(device_, present_shaders_[1], nullptr);
+        const std::vector<uint32_t> fs = present_fs(config_.width * config_.scale_x, config_.height * config_.scale_y, config_.height);
+        VkShaderModuleCreateInfo mi{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+        mi.codeSize = fs.size() * 4;
+        mi.pCode = fs.data();
+        check(vkCreateShaderModule(device_, &mi, nullptr, &present_shaders_[1]), "vkCreateShaderModule");
+    }
+    present_scale_[0] = config_.scale_x, present_scale_[1] = config_.scale_y;
     if (!present_set_layout_) {
         VkDescriptorSetLayoutBinding b[2]{};
         for (uint32_t i = 0; i < 2; ++i) {
@@ -1285,7 +1341,8 @@ VkPipeline VulkanRenderer::present_pipeline() {
         pl.setLayoutCount = 1;
         pl.pSetLayouts = &present_set_layout_;
         check(vkCreatePipelineLayout(device_, &pl, nullptr, &present_layout_), "vkCreatePipelineLayout");
-        const std::vector<uint32_t> code[2] = {present_vs(), present_fs(config_.width, config_.height)};
+        const std::vector<uint32_t> code[2] = {present_vs(),
+                                               present_fs(config_.width * config_.scale_x, config_.height * config_.scale_y, config_.height)};
         for (int i = 0; i < 2; ++i) {
             VkShaderModuleCreateInfo mi{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
             mi.codeSize = code[i].size() * 4;
@@ -1358,13 +1415,20 @@ void VulkanRenderer::present_through_pass(Target& frame, uint32_t index, int32_t
         set_gamma_ramp(identity);
     }
     const VkPipeline pl = present_pipeline();
+    // FSR where the frame is shown larger than it is (not at whole multiples:
+    // there it would only blur).
+    const bool fsr = picture_.fsr && picture_.scaling != Picture::Scaling::Integer && (dw > frame.width || dh > frame.height);
+    if (fsr) fsr_objects(uint32_t(dw), uint32_t(dh));
     // The vertices first: a full ring submits, which must come before the window's image is touched.
-    const float smooth = picture_.smooth ? 1.0f : 0.0f, crt = picture_.look == Picture::Look::Crt ? 1.0f : 0.0f;
+    // Sampled as it is (smooth) where FSR made it the shown size, or with smooth pixels and no CRT.
+    const float crt = picture_.look == Picture::Look::Crt ? 1.0f : 0.0f;
+    const float smooth = fsr || (picture_.smooth && !crt) ? 1.0f : 0.0f;
     const float sl = std::clamp(picture_.scanlines, 0.0f, 1.0f), mk = std::clamp(picture_.mask, 0.0f, 1.0f);
     const float tri[24] = {-1, -1, 0, 0, smooth, crt, sl, mk, 3, -1, 2, 0, smooth, crt, sl, mk, -1, 3, 0, 2, smooth, crt, sl, mk};
     const VkDeviceSize at = ring_alloc(sizeof tri, 16, tri);
     record();
     transition(frame, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    Target& source = fsr ? run_fsr(frame) : frame;
     const VkImage image = swap_images_[index];
     auto barrier = [&](VkImageLayout from, VkImageLayout to, VkPipelineStageFlags2 src, VkAccessFlags2 src_access,
                        VkPipelineStageFlags2 dst, VkAccessFlags2 dst_access) {
@@ -1396,7 +1460,7 @@ void VulkanRenderer::present_through_pass(Target& frame, uint32_t index, int32_t
     linear.u = linear.v = nearest.u = nearest.v = Address::Clamp;
     linear.anisotropy = nearest.anisotropy = 0;  // the present pass's own: never anisotropic
     nearest.mag = nearest.min = Filter::Nearest;
-    const VkDescriptorImageInfo images[2] = {{sampler(linear), frame.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
+    const VkDescriptorImageInfo images[2] = {{sampler(linear), source.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
                                              {sampler(nearest), textures_.at(gamma_texture_).view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL}};
     VkWriteDescriptorSet writes[2]{};
     for (uint32_t i = 0; i < 2; ++i) {
@@ -1453,6 +1517,96 @@ void VulkanRenderer::present_through_pass(Target& frame, uint32_t index, int32_t
     else check(shown, "vkQueuePresentKHR");
 }
 
+void VulkanRenderer::fsr_objects(uint32_t width, uint32_t height) {
+    if (!fsr_layout_) {
+        VkDescriptorSetLayoutBinding b[2]{};
+        b[0].binding = 0;
+        b[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        b[1].binding = 1;
+        b[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+        for (auto& x : b) x.descriptorCount = 1, x.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+        VkDescriptorSetLayoutCreateInfo sl{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+        sl.bindingCount = 2;
+        sl.pBindings = b;
+        check(vkCreateDescriptorSetLayout(device_, &sl, nullptr, &fsr_set_layout_), "vkCreateDescriptorSetLayout");
+        const VkPushConstantRange push{VK_SHADER_STAGE_COMPUTE_BIT, 0, 80};
+        VkPipelineLayoutCreateInfo pl{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+        pl.setLayoutCount = 1;
+        pl.pSetLayouts = &fsr_set_layout_;
+        pl.pushConstantRangeCount = 1;
+        pl.pPushConstantRanges = &push;
+        check(vkCreatePipelineLayout(device_, &pl, nullptr, &fsr_layout_), "vkCreatePipelineLayout");
+        const std::span<const uint32_t> code[2] = {fsr_spirv::kFsr_easu, fsr_spirv::kFsr_rcas};
+        for (int i = 0; i < 2; ++i) {
+            VkShaderModuleCreateInfo mi{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+            mi.codeSize = code[i].size_bytes();
+            mi.pCode = code[i].data();
+            VkShaderModule module = VK_NULL_HANDLE;
+            check(vkCreateShaderModule(device_, &mi, nullptr, &module), "vkCreateShaderModule");
+            VkComputePipelineCreateInfo ci{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+            ci.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+            ci.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+            ci.stage.module = module;
+            ci.stage.pName = "main";
+            ci.layout = fsr_layout_;
+            check(vkCreateComputePipelines(device_, pipeline_cache_, 1, &ci, nullptr, &fsr_pipelines_[i]), "vkCreateComputePipelines");
+            vkDestroyShaderModule(device_, module, nullptr);
+        }
+    }
+    if (fsr_images_[0].width == width && fsr_images_[0].height == height) return;
+    wait_idle();  // the old ones may still be read by a frame on its way
+    for (Target& t : fsr_images_) {
+        if (t.image) {
+            vkDestroyImageView(device_, t.view, nullptr);
+            vkDestroyImage(device_, t.image, nullptr);
+            vkFreeMemory(device_, t.memory, nullptr);
+        }
+        t = create_image(VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, VK_IMAGE_ASPECT_COLOR_BIT,
+                         width, height);
+    }
+}
+
+Target& VulkanRenderer::run_fsr(Target& frame) {
+    SamplerDesc linear;
+    linear.u = linear.v = Address::Clamp;
+    linear.anisotropy = 0;
+    const VkSampler smp = sampler(linear);
+    Target* in = &frame;
+    for (uint32_t pass = 0; pass < 2; ++pass) {
+        Target& out = fsr_images_[pass];
+        transition(out, VK_IMAGE_LAYOUT_GENERAL);
+        VkDescriptorSetAllocateInfo ai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+        ai.descriptorPool = descriptor_pool_;
+        ai.descriptorSetCount = 1;
+        ai.pSetLayouts = &fsr_set_layout_;
+        VkDescriptorSet set = VK_NULL_HANDLE;
+        check(vkAllocateDescriptorSets(device_, &ai, &set), "vkAllocateDescriptorSets");
+        const VkDescriptorImageInfo source{smp, in->view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+        const VkDescriptorImageInfo target{VK_NULL_HANDLE, out.view, VK_IMAGE_LAYOUT_GENERAL};
+        VkWriteDescriptorSet w[2]{};
+        for (uint32_t i = 0; i < 2; ++i) {
+            w[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            w[i].dstSet = set;
+            w[i].dstBinding = i;
+            w[i].descriptorCount = 1;
+            w[i].descriptorType = i ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE : VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+            w[i].pImageInfo = i ? &target : &source;
+        }
+        vkUpdateDescriptorSets(device_, 2, w, 0, nullptr);
+        uint32_t push[20] = {};
+        if (pass == 0) fsr::easu_constants(frame.width, frame.height, out.width, out.height, push);
+        else fsr::rcas_constants(picture_.sharpness, push);
+        push[16] = out.width, push[17] = out.height;
+        vkCmdBindPipeline(cmd_, VK_PIPELINE_BIND_POINT_COMPUTE, fsr_pipelines_[pass]);
+        vkCmdBindDescriptorSets(cmd_, VK_PIPELINE_BIND_POINT_COMPUTE, fsr_layout_, 0, 1, &set, 0, nullptr);
+        vkCmdPushConstants(cmd_, fsr_layout_, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof push, push);
+        vkCmdDispatch(cmd_, (out.width + 15) / 16, (out.height + 15) / 16, 1);  // a 16×16 tile a group
+        transition(out, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+        in = &out;
+    }
+    return fsr_images_[1];
+}
+
 // A staging buffer with `data`, freed after the submission.
 VkBuffer VulkanRenderer::staging_buffer(const void* data, VkDeviceSize bytes) {
     VkBuffer staging = VK_NULL_HANDLE;
@@ -1478,13 +1632,16 @@ VkBuffer VulkanRenderer::staging_buffer(const void* data, VkDeviceSize bytes) {
 
 // The CPU's pixels into a frame buffer (RGBA in, the image's BGRA out).
 void VulkanRenderer::write(Target& t, const Image& im) {
-    if (im.width != t.width || im.height != t.height) return;
-    std::vector<uint8_t> bgra(im.rgba.size());
-    for (size_t i = 0; i < im.rgba.size(); i += 4) {
-        bgra[i] = im.rgba[i + 2];
-        bgra[i + 1] = im.rgba[i + 1];
-        bgra[i + 2] = im.rgba[i];
-        bgra[i + 3] = im.rgba[i + 3];
+    // At the game's size: each pixel becomes sx × sy of the image's.
+    if (im.width * t.sx != t.width || im.height * t.sy != t.height) return;
+    std::vector<uint8_t> bgra(size_t(t.width) * t.height * 4);
+    for (uint32_t y = 0; y < t.height; ++y) {
+        const uint8_t* row = &im.rgba[size_t(y / t.sy) * im.width * 4];
+        uint8_t* out = &bgra[size_t(y) * t.width * 4];
+        for (uint32_t x = 0; x < t.width; ++x, out += 4) {
+            const uint8_t* p = row + size_t(x / t.sx) * 4;
+            out[0] = p[2], out[1] = p[1], out[2] = p[0], out[3] = p[3];
+        }
     }
     const VkBuffer staging = staging_buffer(bgra.data(), bgra.size());
     const bool was_open = pass_open_;
@@ -1536,19 +1693,25 @@ Image VulkanRenderer::read(Target& t) {
     submit();
     wait_idle();
 
+    // At the game's size: each pixel the average of the sx × sy it became.
     Image out;
-    out.width = t.width;
-    out.height = t.height;
-    out.rgba.resize(size_t(bytes));
+    out.width = t.width / t.sx;
+    out.height = t.height / t.sy;
+    out.rgba.resize(size_t(out.width) * out.height * 4);
     void* mapped = nullptr;
     check(vkMapMemory(device_, readback_memory_, 0, bytes, 0, &mapped), "vkMapMemory");
     const uint8_t* bgra = static_cast<const uint8_t*>(mapped);
-    for (size_t i = 0; i < size_t(bytes); i += 4) {
-        out.rgba[i] = bgra[i + 2];
-        out.rgba[i + 1] = bgra[i + 1];
-        out.rgba[i + 2] = bgra[i];
-        out.rgba[i + 3] = bgra[i + 3];
-    }
+    const uint32_t n = t.sx * t.sy;
+    for (uint32_t y = 0; y < out.height; ++y)
+        for (uint32_t x = 0; x < out.width; ++x) {
+            uint32_t sum[4] = {};
+            for (uint32_t j = 0; j < t.sy; ++j) {
+                const uint8_t* p = bgra + (size_t(y * t.sy + j) * t.width + size_t(x) * t.sx) * 4;
+                for (uint32_t i = 0; i < t.sx; ++i, p += 4) sum[0] += p[2], sum[1] += p[1], sum[2] += p[0], sum[3] += p[3];
+            }
+            uint8_t* o = &out.rgba[(size_t(y) * out.width + x) * 4];
+            for (int k = 0; k < 4; ++k) o[k] = uint8_t((sum[k] + n / 2) / n);
+        }
     vkUnmapMemory(device_, readback_memory_);
     return out;
 }
@@ -1583,11 +1746,12 @@ void VulkanRenderer::create_draw_objects() {
     check(vkCreatePipelineLayout(device_, &pl, nullptr, &pipeline_layout_), "vkCreatePipelineLayout");
 
     const uint32_t sets = 8192;
-    const VkDescriptorPoolSize sizes[2] = {{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 2 * sets},
-                                           {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, kSamplers * sets}};
+    const VkDescriptorPoolSize sizes[3] = {{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 2 * sets},
+                                           {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, kSamplers * sets},
+                                           {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 8}};  // FSR's, two a frame
     VkDescriptorPoolCreateInfo dp{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
     dp.maxSets = sets;
-    dp.poolSizeCount = 2;
+    dp.poolSizeCount = 3;
     dp.pPoolSizes = sizes;
     for (Slot& slot : slots_) check(vkCreateDescriptorPool(device_, &dp, nullptr, &slot.pool), "vkCreateDescriptorPool");
 
@@ -2022,9 +2186,11 @@ void VulkanRenderer::copy_frame_to_target(uint32_t frame_index, uint32_t target_
     transition(from, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
     transition(to, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
     std::vector<VkImageCopy> copies;
-    for (const CopyRegion& r : regions) {
+    for (CopyRegion r : regions) {  // the game's pixels; both images are at the render resolution
+        r.sx *= from.sx, r.dx *= from.sx, r.width *= from.sx;
+        r.sy *= from.sy, r.dy *= from.sy, r.height *= from.sy;
         if (!r.width || !r.height || r.sx + r.width > from.width || r.sy + r.height > from.height || r.dx + r.width > to.width ||
-            r.dy + r.height > to.height)
+            r.dy + r.height > to.height || to.sx != from.sx || to.sy != from.sy)
             continue;
         VkImageCopy c{};
         c.srcSubresource = c.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
@@ -2035,6 +2201,51 @@ void VulkanRenderer::copy_frame_to_target(uint32_t frame_index, uint32_t target_
     }
     if (!copies.empty()) vkCmdCopyImage(cmd_, from.image, from.layout, to.image, to.layout, uint32_t(copies.size()), copies.data());
     transition(to, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+}
+
+void VulkanRenderer::set_resolution_scale(uint32_t x, uint32_t y) {
+    x = std::clamp<uint32_t>(x, 1, 8), y = std::clamp<uint32_t>(y, 1, 8);
+    if (x == config_.scale_x && y == config_.scale_y) return;
+    end_pass();
+    wait_idle();
+    config_.scale_x = x, config_.scale_y = y;
+    // Each image made again at the new size: colour scaled across (linear),
+    // depth and stencil cleared (the game clears them each frame).
+    std::vector<Target> old;
+    record();
+    auto remake = [&](Target& t) {
+        Target n = create_target(t.format, t.usage, t.aspect, t.width / t.sx, t.height / t.sy);
+        const VkImageLayout was = t.layout;
+        transition(n, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+        if (t.aspect == VK_IMAGE_ASPECT_COLOR_BIT) {
+            transition(t, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+            VkImageBlit blit{};
+            blit.srcSubresource = blit.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+            blit.srcOffsets[1] = {int32_t(t.width), int32_t(t.height), 1};
+            blit.dstOffsets[1] = {int32_t(n.width), int32_t(n.height), 1};
+            vkCmdBlitImage(cmd_, t.image, t.layout, n.image, n.layout, 1, &blit, VK_FILTER_LINEAR);
+            if (was == VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL) transition(n, was);  // sampled between passes, as it was
+        } else {
+            const VkClearDepthStencilValue zero{};
+            const VkImageSubresourceRange range{n.aspect, 0, 1, 0, 1};
+            vkCmdClearDepthStencilImage(cmd_, n.image, n.layout, &zero, 1, &range);
+        }
+        old.push_back(t);
+        t = n;
+    };
+    for (Target& t : color_) remake(t);
+    if (depth_.image) remake(depth_);
+    for (auto& [id, t] : render_targets_) remake(t);
+    for (auto& [id, t] : depth_targets_) remake(t);
+    submit();
+    wait_idle();
+    for (Target& t : old) {
+        vkDestroyImageView(device_, t.view, nullptr);
+        vkDestroyImage(device_, t.image, nullptr);
+        vkFreeMemory(device_, t.memory, nullptr);
+    }
+    for (Slot& s : slots_) s.sets.clear();  // they named the old images' views
+    drawn_.valid = false;
 }
 
 uint32_t VulkanRenderer::create_render_target(uint32_t width, uint32_t height) {
@@ -2222,9 +2433,10 @@ void VulkanRenderer::draw(const DrawCmd& c) {
     const int32_t tw = int32_t(target().width), th = int32_t(target().height);
     const VkViewport viewport{0, 0, float(tw), float(th), 0, 1};
     if (all || std::memcmp(&was.viewport, &viewport, sizeof viewport) != 0) vkCmdSetViewport(cmd_, 0, 1, &viewport), was.viewport = viewport;
-    const int32_t sx0 = std::clamp(c.scissor.x, 0, tw), sy0 = std::clamp(c.scissor.y, 0, th);
-    const int32_t sx1 = std::clamp(int32_t(int64_t(c.scissor.x) + c.scissor.w), sx0, tw);
-    const int32_t sy1 = std::clamp(int32_t(int64_t(c.scissor.y) + c.scissor.h), sy0, th);
+    const int64_t ssx = target().sx, ssy = target().sy;  // the scissor is in the game's pixels
+    const int32_t sx0 = int32_t(std::clamp<int64_t>(int64_t(c.scissor.x) * ssx, 0, tw)), sy0 = int32_t(std::clamp<int64_t>(int64_t(c.scissor.y) * ssy, 0, th));
+    const int32_t sx1 = int32_t(std::clamp<int64_t>((int64_t(c.scissor.x) + c.scissor.w) * ssx, sx0, tw));
+    const int32_t sy1 = int32_t(std::clamp<int64_t>((int64_t(c.scissor.y) + c.scissor.h) * ssy, sy0, th));
     const VkRect2D scissor{{sx0, sy0}, {uint32_t(sx1 - sx0), uint32_t(sy1 - sy0)}};
     if (all || std::memcmp(&was.scissor, &scissor, sizeof scissor) != 0) vkCmdSetScissor(cmd_, 0, 1, &scissor), was.scissor = scissor;
     // Culling a winding: screen space runs y down as in the framebuffer, so
@@ -2261,7 +2473,7 @@ void VulkanRenderer::draw(const DrawCmd& c) {
     if (all || was.bias_on != bias_on) vkCmdSetDepthBiasEnable(cmd_, bias_on), was.bias_on = bias_on;
     if (bias_on && (all || was.bias != c.depth_bias || was.slope != c.depth_slope))
         vkCmdSetDepthBias(cmd_, c.depth_bias, 0.0f, c.depth_slope), was.bias = c.depth_bias, was.slope = c.depth_slope;
-    const float line = wide_lines_ ? std::clamp(c.line_width, 1.0f, line_width_max_) : 1.0f;
+    const float line = wide_lines_ ? std::clamp(c.line_width * float(ssy), 1.0f, line_width_max_) : 1.0f;
     if (all || was.line != line) vkCmdSetLineWidth(cmd_, line), was.line = line;
     was.valid = true;
     if (c.indices) {

@@ -200,7 +200,8 @@ std::vector<uint32_t> vertex_program(const vsh::Program& program, uint32_t input
     for (const auto& in : program.code) writes_size |= in.out_mask && !in.out_is_const && in.out_address == vsh::kPts;
     const Id size_in = writes_size ? s.x(s.outputs[vsh::kPts]) : b.extract(s.f, screen, 3);
     const Id point_size = b.builtin_var(spv::Storage::Output, s.f, spv::builtin::PointSize);
-    b.store(point_size, b.ext(glsl::FClamp, s.f, {size_in, b.c_float(1), b.c_float(63.875f)}));
+    const Id pixels = b.extract(s.f, b.uniform_vec4(s.consts, b.c_int(kVsPixels)), 0);  // the render resolution's scale
+    b.store(point_size, b.op(spv::op::FMul, s.f, {b.ext(glsl::FClamp, s.f, {size_in, b.c_float(1), b.c_float(63.875f)}), pixels}));
     s.interface.push_back(point_size);
 
     // Colours are clamped to [0, 1], as the hardware does.

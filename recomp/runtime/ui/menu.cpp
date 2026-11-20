@@ -263,6 +263,24 @@ void Menu::aspect_combo() {
     }
     ImGui::SameLine();
     ImGui::TextDisabled("(wider: more at the sides)");
+
+    // The render resolution, with the size it gives at the shape shown.
+    const float aspect = renderer_.picture().aspect;
+    auto size_of = [&](uint32_t lines) {
+        platform::Settings t = s_;
+        t.resolution = lines;
+        uint32_t sx = 1, sy = 1;
+        platform::resolution_scale(t, aspect, 480 * lines, &sx, &sy);
+        return std::to_string(640 * sx) + "x" + std::to_string(480 * sy);
+    };
+    const std::string now = std::to_string(640 * renderer_.resolution_scale_x()) + "x" + std::to_string(480 * renderer_.resolution_scale_y());
+    const std::string names[5] = {"Auto (the window's size: " + now + ")", "1x, " + size_of(1) + " (the original)", "2x, " + size_of(2),
+                                  "3x, " + size_of(3), "4x, " + size_of(4)};
+    if (ImGui::BeginCombo("Render resolution", names[std::min<uint32_t>(s_.resolution, 4)].c_str())) {
+        for (uint32_t k = 0; k <= 4; ++k)
+            if (ImGui::Selectable(names[k].c_str(), s_.resolution == k)) s_.resolution = k, changed();
+        ImGui::EndCombo();
+    }
 }
 
 void Menu::display_page() {
@@ -282,6 +300,14 @@ void Menu::display_page() {
     any |= ImGui::RadioButton("Fill the window", &scaling, int(platform::Settings::Scaling::Stretch));
     if (any) s_.scaling = platform::Settings::Scaling(scaling), changed();
     if (ImGui::Checkbox("Smooth (bilinear; off: sharp pixels)", &s_.smooth)) changed();
+    if (ImGui::Checkbox("AMD FSR 1 upscaling", &s_.fsr)) changed();
+    ImGui::SameLine();
+    ImGui::TextDisabled(s_.scaling == platform::Settings::Scaling::Integer ? "(not at whole multiples)"
+                                                                           : "(where the picture is shown larger than it's drawn)");
+    if (s_.fsr) {
+        int sharp = int(s_.sharpness);
+        if (ImGui::SliderInt("FSR sharpness", &sharp, 0, 100, "%d%%", ImGuiSliderFlags_AlwaysClamp)) s_.sharpness = uint32_t(sharp), changed();
+    }
     int look = int(s_.look);
     any = ImGui::RadioButton("Plain", &look, int(platform::Settings::Look::Plain));
     ImGui::SameLine();

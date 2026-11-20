@@ -11,6 +11,15 @@ Each release is a git tag (`vX.Y.Z`) with a matching GitHub release. The version
 
 ## [Unreleased]
 
+## [0.38.0] - 2026-11-20
+
+### Added
+- **Render resolution**: the settings menu's Display page (and `resolution` in [display]) draws the game at Auto (the size the picture is shown at in the window, the default), or 1× (640×480, the original) to 4× (1920 lines). Its width follows the picture's shape, so wide pictures get the columns they're stretched across: 16:9 at 2× is 1920×960, 21:9 at 2× 2560×960. Every frame buffer and render target is drawn at the larger size while the game sees its own; shadows and the comic pages' textures get the detail too. It changes as soon as the menu closes, the pictures already drawn carried over.
+- **AMD FSR 1**: FidelityFX Super Resolution 1 (MIT, `third_party/fsr1`) where the picture is shown larger than it's drawn (not at whole multiples), with a sharpness slider (0-100%, `fsr` and `sharpness` in [display]). Edge-aware upscaling, then sharpening, in two compute passes before the present pass, so the CRT look still applies over it. The shaders are AMD's, compiled once to SPIR-V and committed (`tools/gen/fsr_spirv.sh`); FSR's licence is in the download's LICENSES.
+
+### Changed
+- `QILIN_TRACE_DUMP` writes only the frames with a logged line, so a narrow `QILIN_TRACE_MATCH` over a long range keeps just the frames that matter.
+
 ## [0.37.0] - 2026-11-20
 
 ### Added

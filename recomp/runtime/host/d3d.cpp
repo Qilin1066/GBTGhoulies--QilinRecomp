@@ -188,6 +188,7 @@ void apply_settings(Device& d, const platform::Settings& s);
 // draw samples holds (swap_n_address.pam).
 bool trace_draws(const Device& d);
 bool trace_wanted(const std::string& line);
+bool g_trace_matched = false;  // a line was logged this frame: QILIN_TRACE_DUMP keeps it
 void update_aspect(rt::Context& c, Device& d, bool settings_changed);
 
 Device& device(const char* fn) {
@@ -280,7 +281,7 @@ void run_vblanks(rt::Context& c, Device& d, uint32_t until, bool swap_done) {
 void deliver_frame(Device& d) {
     const uint64_t n = d.renderer->frames_presented();
     static const char* trace_dir = std::getenv("QILIN_TRACE_DUMP");
-    if (!d.config.dump_dir.empty() || (trace_dir && trace_draws(d))) {
+    if (!d.config.dump_dir.empty() || (trace_dir && trace_draws(d) && std::exchange(g_trace_matched, false))) {
         gfx::Image im = d.renderer->read_front_buffer();
         for (size_t i = 0; i < im.rgba.size(); i += 4) {  // as the TV gets it: through the gamma ramp, alpha unused
             for (int k = 0; k < 3; ++k) im.rgba[i + k] = d.gamma[k][im.rgba[i + k]];
@@ -589,7 +590,7 @@ bool trace_wanted(const std::string& line) {
     return false;
 }
 void trace_line(const std::string& line) {
-    if (trace_wanted(line)) std::fputs(line.c_str(), stderr);
+    if (trace_wanted(line)) std::fputs(line.c_str(), stderr), g_trace_matched = true;
 }
 
 void clear(rt::Context& c) {
@@ -638,6 +639,8 @@ void apply_settings(Device& d, const platform::Settings& s) {
     gfx::Picture& p = d.picture;
     p.scaling = gfx::Picture::Scaling(uint8_t(s.scaling));
     p.smooth = s.smooth;
+    p.fsr = s.fsr;
+    p.sharpness = float(s.sharpness) / 100.0f;
     p.look = gfx::Picture::Look(uint8_t(s.look));
     p.scanlines = float(s.scanlines) / 100.0f;
     p.mask = float(s.mask) / 100.0f;
@@ -656,16 +659,29 @@ void apply_settings(Device& d, const platform::Settings& s) {
 // at every 64 frames, so moving the window to another screen follows it),
 // given to the game between frames: the frame it draws next is the first
 // at the new shape, and is shown at it.
+//
+// The render resolution with it (auto: the size the picture is shown at,
+// looked at as often), the renderer's images made again at it when it changes.
 void update_aspect(rt::Context& c, Device& d, bool settings_changed) {
     const platform::Settings* s = d.config.settings;
-    if (!s || (!settings_changed && d.aspect && (s->aspect_w || d.swaps % 64))) return;
+    if (!s || (!settings_changed && d.aspect && d.swaps % 64)) return;
     const float screen = d.config.window ? d.config.window->screen_aspect() : 0.0f;
     const float aspect = game_aspect_ratio(platform::aspect_ratio(*s, screen));
-    if (aspect == d.aspect) return;
-    set_game_aspect(mem(c), aspect, true);
-    d.aspect = aspect;
-    d.picture.aspect = aspect;
-    d.renderer->set_picture(d.picture);
+    if (aspect != d.aspect) {
+        set_game_aspect(mem(c), aspect, true);
+        d.aspect = aspect;
+        d.picture.aspect = aspect;
+        d.renderer->set_picture(d.picture);
+    }
+    uint32_t shown = 480;
+    if (d.config.window) {
+        uint32_t ww = 0, wh = 0;
+        d.config.window->pixel_size(&ww, &wh);
+        if (ww && wh) shown = std::min(wh, uint32_t(float(ww) / aspect));
+    }
+    uint32_t sx = 1, sy = 1;
+    platform::resolution_scale(*s, aspect, shown, &sx, &sy);
+    d.renderer->set_resolution_scale(sx, sy);  // nothing if it's the same
 }
 
 // The window's events (the settings menu's first); closing the window, or
@@ -2172,6 +2188,7 @@ void issue_draw(rt::Context& c, Device& d, const char* fn, uint32_t prim, Vertic
     vsu[gfx::nv2a::kVsScreen * 4 + 0] = 2.0f / float(target_w);
     vsu[gfx::nv2a::kVsScreen * 4 + 1] = 2.0f / float(target_h);
     vsu[gfx::nv2a::kVsScreen * 4 + 2] = zscale > 0 ? 1.0f / zscale : 1.0f;
+    vsu[gfx::nv2a::kVsPixels * 4] = float(d.renderer->resolution_scale_y());
 
     // Fixed-function state.
     cmd.blend = rs(kRsAlphaBlendEnable);

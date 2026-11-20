@@ -16,7 +16,8 @@ enum Varying : uint32_t { kVaryD0 = 0, kVaryD1 = 1, kVaryFog = 2, kVaryT0 = 3, k
 // Vertex uniforms (set 0, binding 0): the 192 program constants, then the
 // renderer's own: [192] = (2 / width, 2 / height, 1 / depth scale, 0), the
 // screen-space to clip-space factors.
-inline constexpr uint32_t kVsConstants = 192, kVsScreen = 192, kVsUniformVec4s = 193;
+// kVsPixels: x, the render resolution's scale (points are drawn that many times larger).
+inline constexpr uint32_t kVsConstants = 192, kVsScreen = 192, kVsPixels = 193, kVsUniformVec4s = 194;
 
 // A vertex program: `inputs` has bit n set for each attribute v[n] the draw
 // supplies (location n, vec4); the others read (0, 0, 0, 1).
