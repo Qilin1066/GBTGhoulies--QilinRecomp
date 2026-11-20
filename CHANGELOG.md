@@ -11,6 +11,12 @@ Each release is a git tag (`vX.Y.Z`) with a matching GitHub release. The version
 
 ## [Unreleased]
 
+## [0.39.0] - 2026-11-20
+
+### Added
+- **SMAA anti-aliasing**: SMAA 1x (MIT, `third_party/smaa`) on the Display page and as `antialiasing = smaa` in [display]: jagged edges found and blended in three passes over the frame at the render resolution, before FSR and the CRT look. With a higher render resolution it's smoother still. Its licence is in the download's LICENSES.
+- **The HUD at its own shape on wide pictures**: the game draws its HUD for a 640×480 frame and lets a widescreen TV stretch it; on any shape wider than 4:3 (16:10, 16:9, 21:9, 32:9) the heart and the count are now squeezed back to their proportions. The Display page's HUD option (`hud` in [display]) puts each part at the screen's edge it's nearest (the default), keeps the whole HUD in the middle 4:3 as on a 4:3 TV, or leaves it stretched as the game draws it. At 4:3 nothing changes. Menus, comic pages and captions already keep their shape (the game draws them in a 4:3 area of their own), and full-screen pictures (videos, fades) and the hearts floating over characters stay as they are.
+
 ## [0.38.0] - 2026-11-20
 
 ### Added

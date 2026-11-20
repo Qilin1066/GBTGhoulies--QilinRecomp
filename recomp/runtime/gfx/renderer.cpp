@@ -39,6 +39,25 @@ namespace qilin::gfx {
 namespace fsr_spirv {
 #include "fsr/fsr_spirv.inc"
 }  // namespace fsr_spirv
+namespace smaa_spirv {
+#include "smaa/smaa_spirv.inc"
+}  // namespace smaa_spirv
+namespace smaa_tables {
+#if defined(__clang__)
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wunused-variable"
+#elif defined(__GNUC__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wunused-variable"
+#endif
+#include "../../../third_party/smaa/AreaTex.h"
+#include "../../../third_party/smaa/SearchTex.h"
+#if defined(__clang__)
+#pragma clang diagnostic pop
+#elif defined(__GNUC__)
+#pragma GCC diagnostic pop
+#endif
+}  // namespace smaa_tables
 namespace {
 
 [[noreturn]] void fatal(const char* what, VkResult r) {
@@ -189,6 +208,16 @@ private:
     Target fsr_images_[2];              // their outputs
     void fsr_objects(uint32_t width, uint32_t height);  // made, at this size, before the frame's commands
     Target& run_fsr(Target& frame);
+    // SMAA 1x (smaa/): edge detection, blending weights and neighbourhood
+    // blending, three full-screen passes over the frame at its own size,
+    // before FSR and the present pass.
+    VkDescriptorSetLayout smaa_set_layout_ = VK_NULL_HANDLE;
+    VkPipelineLayout smaa_layout_ = VK_NULL_HANDLE;
+    VkPipeline smaa_pipelines_[3] = {};
+    Target smaa_images_[3];  // the edges, the blending weights, the result
+    uint32_t smaa_area_ = 0, smaa_search_ = 0;  // SMAA's lookup textures
+    void smaa_objects(const Target& frame);
+    Target& run_smaa(Target& frame);
     Target& target() { return current_rt_ ? render_targets_.at(current_rt_) : color_[back_]; }  // what draws and clears go to
     // The depth buffer draws and clears use, or null.
     Target* depth_target() {
@@ -741,6 +770,10 @@ void VulkanRenderer::destroy() {
         };
         for (Target& t : color_) drop(t);
         for (Target& t : fsr_images_) drop(t);
+        for (Target& t : smaa_images_) drop(t);
+        for (VkPipeline p : smaa_pipelines_) if (p) vkDestroyPipeline(device_, p, nullptr);
+        if (smaa_layout_) vkDestroyPipelineLayout(device_, smaa_layout_, nullptr);
+        if (smaa_set_layout_) vkDestroyDescriptorSetLayout(device_, smaa_set_layout_, nullptr);
         for (VkPipeline p : fsr_pipelines_) if (p) vkDestroyPipeline(device_, p, nullptr);
         if (fsr_layout_) vkDestroyPipelineLayout(device_, fsr_layout_, nullptr);
         if (fsr_set_layout_) vkDestroyDescriptorSetLayout(device_, fsr_set_layout_, nullptr);
@@ -1419,6 +1452,7 @@ void VulkanRenderer::present_through_pass(Target& frame, uint32_t index, int32_t
     // there it would only blur).
     const bool fsr = picture_.fsr && picture_.scaling != Picture::Scaling::Integer && (dw > frame.width || dh > frame.height);
     if (fsr) fsr_objects(uint32_t(dw), uint32_t(dh));
+    if (picture_.smaa) smaa_objects(frame);
     // The vertices first: a full ring submits, which must come before the window's image is touched.
     // Sampled as it is (smooth) where FSR made it the shown size, or with smooth pixels and no CRT.
     const float crt = picture_.look == Picture::Look::Crt ? 1.0f : 0.0f;
@@ -1428,7 +1462,8 @@ void VulkanRenderer::present_through_pass(Target& frame, uint32_t index, int32_t
     const VkDeviceSize at = ring_alloc(sizeof tri, 16, tri);
     record();
     transition(frame, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
-    Target& source = fsr ? run_fsr(frame) : frame;
+    Target& smoothed = picture_.smaa ? run_smaa(frame) : frame;
+    Target& source = fsr ? run_fsr(smoothed) : smoothed;
     const VkImage image = swap_images_[index];
     auto barrier = [&](VkImageLayout from, VkImageLayout to, VkPipelineStageFlags2 src, VkAccessFlags2 src_access,
                        VkPipelineStageFlags2 dst, VkAccessFlags2 dst_access) {
@@ -1605,6 +1640,173 @@ Target& VulkanRenderer::run_fsr(Target& frame) {
         in = &out;
     }
     return fsr_images_[1];
+}
+
+void VulkanRenderer::smaa_objects(const Target& frame) {
+    if (!smaa_layout_) {
+        VkDescriptorSetLayoutBinding b[3]{};
+        for (uint32_t i = 0; i < 3; ++i) {
+            b[i].binding = i;
+            b[i].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+            b[i].descriptorCount = 1;
+            b[i].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+        }
+        VkDescriptorSetLayoutCreateInfo sl{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+        sl.bindingCount = 3;
+        sl.pBindings = b;
+        check(vkCreateDescriptorSetLayout(device_, &sl, nullptr, &smaa_set_layout_), "vkCreateDescriptorSetLayout");
+        const VkPushConstantRange push{VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, 16};
+        VkPipelineLayoutCreateInfo pl{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+        pl.setLayoutCount = 1;
+        pl.pSetLayouts = &smaa_set_layout_;
+        pl.pushConstantRangeCount = 1;
+        pl.pPushConstantRanges = &push;
+        check(vkCreatePipelineLayout(device_, &pl, nullptr, &smaa_layout_), "vkCreatePipelineLayout");
+        const std::span<const uint32_t> code[3][2] = {{smaa_spirv::kSmaa1_vert, smaa_spirv::kSmaa1_frag},
+                                                      {smaa_spirv::kSmaa2_vert, smaa_spirv::kSmaa2_frag},
+                                                      {smaa_spirv::kSmaa3_vert, smaa_spirv::kSmaa3_frag}};
+        for (uint32_t pass = 0; pass < 3; ++pass) {
+            VkShaderModule modules[2] = {};
+            VkPipelineShaderStageCreateInfo stages[2]{};
+            for (int i = 0; i < 2; ++i) {
+                VkShaderModuleCreateInfo mi{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+                mi.codeSize = code[pass][i].size_bytes();
+                mi.pCode = code[pass][i].data();
+                check(vkCreateShaderModule(device_, &mi, nullptr, &modules[i]), "vkCreateShaderModule");
+                stages[i].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+                stages[i].stage = i ? VK_SHADER_STAGE_FRAGMENT_BIT : VK_SHADER_STAGE_VERTEX_BIT;
+                stages[i].module = modules[i];
+                stages[i].pName = "main";
+            }
+            VkPipelineVertexInputStateCreateInfo vi{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+            VkPipelineInputAssemblyStateCreateInfo ia{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
+            ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+            VkPipelineViewportStateCreateInfo vp{VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
+            vp.viewportCount = vp.scissorCount = 1;
+            VkPipelineRasterizationStateCreateInfo rs{VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
+            rs.polygonMode = VK_POLYGON_MODE_FILL;
+            rs.lineWidth = 1.0f;
+            VkPipelineMultisampleStateCreateInfo ms{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
+            ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+            VkPipelineDepthStencilStateCreateInfo ds{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
+            VkPipelineColorBlendAttachmentState att{};
+            att.colorWriteMask = 0xF;
+            VkPipelineColorBlendStateCreateInfo cb{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
+            cb.attachmentCount = 1;
+            cb.pAttachments = &att;
+            const VkDynamicState dynamic[] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
+            VkPipelineDynamicStateCreateInfo dyn{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
+            dyn.dynamicStateCount = 2;
+            dyn.pDynamicStates = dynamic;
+            const VkFormat format = pass == 2 ? frame.format : VK_FORMAT_R8G8B8A8_UNORM;
+            VkPipelineRenderingCreateInfo ri{VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO};
+            ri.colorAttachmentCount = 1;
+            ri.pColorAttachmentFormats = &format;
+            VkGraphicsPipelineCreateInfo info{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
+            info.pNext = &ri;
+            info.stageCount = 2;
+            info.pStages = stages;
+            info.pVertexInputState = &vi;
+            info.pInputAssemblyState = &ia;
+            info.pViewportState = &vp;
+            info.pRasterizationState = &rs;
+            info.pMultisampleState = &ms;
+            info.pDepthStencilState = &ds;
+            info.pColorBlendState = &cb;
+            info.pDynamicState = &dyn;
+            info.layout = smaa_layout_;
+            check(vkCreateGraphicsPipelines(device_, pipeline_cache_, 1, &info, nullptr, &smaa_pipelines_[pass]), "vkCreateGraphicsPipelines");
+            for (VkShaderModule m : modules) vkDestroyShaderModule(device_, m, nullptr);
+        }
+        // SMAA's tables: the area texture (two channels) and the search texture (one).
+        TextureData area;
+        area.width = 160, area.height = 560;
+        area.rgba.resize(size_t(160) * 560 * 4);
+        for (size_t i = 0; i < size_t(160) * 560; ++i)
+            area.rgba[i * 4] = smaa_tables::areaTexBytes[i * 2], area.rgba[i * 4 + 1] = smaa_tables::areaTexBytes[i * 2 + 1];
+        smaa_area_ = create_texture(area);
+        TextureData search;
+        search.width = 64, search.height = 16;
+        search.rgba.resize(size_t(64) * 16 * 4);
+        for (size_t i = 0; i < size_t(64) * 16; ++i) search.rgba[i * 4] = smaa_tables::searchTexBytes[i];
+        smaa_search_ = create_texture(search);
+    }
+    if (smaa_images_[0].width == frame.width && smaa_images_[0].height == frame.height) return;
+    wait_idle();  // the old ones may still be read by a frame on its way
+    for (uint32_t i = 0; i < 3; ++i) {
+        Target& t = smaa_images_[i];
+        if (t.image) {
+            vkDestroyImageView(device_, t.view, nullptr);
+            vkDestroyImage(device_, t.image, nullptr);
+            vkFreeMemory(device_, t.memory, nullptr);
+        }
+        t = create_image(i == 2 ? frame.format : VK_FORMAT_R8G8B8A8_UNORM,
+                         VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, VK_IMAGE_ASPECT_COLOR_BIT, frame.width,
+                         frame.height);
+        t.sx = frame.sx, t.sy = frame.sy;
+    }
+}
+
+Target& VulkanRenderer::run_smaa(Target& frame) {
+    SamplerDesc linear;
+    linear.u = linear.v = Address::Clamp;
+    linear.anisotropy = 0;
+    SamplerDesc point = linear;
+    point.mag = point.min = Filter::Nearest;
+    const VkSampler lin = sampler(linear), pnt = sampler(point);
+    const VkImageView area = textures_.at(smaa_area_).view, search = textures_.at(smaa_search_).view;
+    // What each pass reads: the colour; the edges, the area and search tables; the colour and the weights.
+    const VkDescriptorImageInfo inputs[3][3] = {
+        {{lin, frame.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL}, {lin, area, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
+         {pnt, search, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL}},
+        {{lin, smaa_images_[0].view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL}, {lin, area, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
+         {pnt, search, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL}},
+        {{lin, frame.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL}, {lin, smaa_images_[1].view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
+         {pnt, search, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL}}};
+    const float metrics[4] = {1.0f / float(frame.width), 1.0f / float(frame.height), float(frame.width), float(frame.height)};
+    for (uint32_t pass = 0; pass < 3; ++pass) {
+        Target& out = smaa_images_[pass];
+        transition(out, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+        VkDescriptorSetAllocateInfo ai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+        ai.descriptorPool = descriptor_pool_;
+        ai.descriptorSetCount = 1;
+        ai.pSetLayouts = &smaa_set_layout_;
+        VkDescriptorSet set = VK_NULL_HANDLE;
+        check(vkAllocateDescriptorSets(device_, &ai, &set), "vkAllocateDescriptorSets");
+        VkWriteDescriptorSet w[3]{};
+        for (uint32_t i = 0; i < 3; ++i) {
+            w[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            w[i].dstSet = set;
+            w[i].dstBinding = i;
+            w[i].descriptorCount = 1;
+            w[i].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+            w[i].pImageInfo = &inputs[pass][i];
+        }
+        vkUpdateDescriptorSets(device_, 3, w, 0, nullptr);
+        VkRenderingAttachmentInfo ca{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
+        ca.imageView = out.view;
+        ca.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+        ca.loadOp = pass == 2 ? VK_ATTACHMENT_LOAD_OP_DONT_CARE : VK_ATTACHMENT_LOAD_OP_CLEAR;  // edge detection discards the rest
+        ca.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+        VkRenderingInfo ri{VK_STRUCTURE_TYPE_RENDERING_INFO};
+        ri.renderArea = {{0, 0}, {out.width, out.height}};
+        ri.layerCount = 1;
+        ri.colorAttachmentCount = 1;
+        ri.pColorAttachments = &ca;
+        vkCmdBeginRendering(cmd_, &ri);
+        const VkViewport viewport{0, 0, float(out.width), float(out.height), 0, 1};
+        const VkRect2D scissor{{0, 0}, {out.width, out.height}};
+        vkCmdBindPipeline(cmd_, VK_PIPELINE_BIND_POINT_GRAPHICS, smaa_pipelines_[pass]);
+        vkCmdSetViewport(cmd_, 0, 1, &viewport);
+        vkCmdSetScissor(cmd_, 0, 1, &scissor);
+        vkCmdBindDescriptorSets(cmd_, VK_PIPELINE_BIND_POINT_GRAPHICS, smaa_layout_, 0, 1, &set, 0, nullptr);
+        vkCmdPushConstants(cmd_, smaa_layout_, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof metrics, metrics);
+        vkCmdDraw(cmd_, 3, 1, 0, 0);
+        vkCmdEndRendering(cmd_);
+        transition(out, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    }
+    drawn_.valid = false;  // its pipeline, viewport and scissor are SMAA's now
+    return smaa_images_[2];
 }
 
 // A staging buffer with `data`, freed after the submission.

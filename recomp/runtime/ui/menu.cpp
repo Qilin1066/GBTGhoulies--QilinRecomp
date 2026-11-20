@@ -276,6 +276,11 @@ void Menu::aspect_combo() {
     const std::string now = std::to_string(640 * renderer_.resolution_scale_x()) + "x" + std::to_string(480 * renderer_.resolution_scale_y());
     const std::string names[5] = {"Auto (the window's size: " + now + ")", "1x, " + size_of(1) + " (the original)", "2x, " + size_of(2),
                                   "3x, " + size_of(3), "4x, " + size_of(4)};
+    {
+        static const char* const kHud[] = {"At the screen's edges", "In the middle 4:3 (as on a 4:3 TV)", "Stretched (as the game draws it)"};
+        int hud = int(s_.hud);
+        if (ImGui::Combo("HUD (wider than 4:3)", &hud, kHud, 3)) s_.hud = platform::Settings::Hud(hud), changed();
+    }
     if (ImGui::BeginCombo("Render resolution", names[std::min<uint32_t>(s_.resolution, 4)].c_str())) {
         for (uint32_t k = 0; k <= 4; ++k)
             if (ImGui::Selectable(names[k].c_str(), s_.resolution == k)) s_.resolution = k, changed();
@@ -300,6 +305,9 @@ void Menu::display_page() {
     any |= ImGui::RadioButton("Fill the window", &scaling, int(platform::Settings::Scaling::Stretch));
     if (any) s_.scaling = platform::Settings::Scaling(scaling), changed();
     if (ImGui::Checkbox("Smooth (bilinear; off: sharp pixels)", &s_.smooth)) changed();
+    if (ImGui::Checkbox("SMAA anti-aliasing", &s_.smaa)) changed();
+    ImGui::SameLine();
+    ImGui::TextDisabled("(smooths jagged edges; with a higher render resolution, smoother still)");
     if (ImGui::Checkbox("AMD FSR 1 upscaling", &s_.fsr)) changed();
     ImGui::SameLine();
     ImGui::TextDisabled(s_.scaling == platform::Settings::Scaling::Integer ? "(not at whole multiples)"

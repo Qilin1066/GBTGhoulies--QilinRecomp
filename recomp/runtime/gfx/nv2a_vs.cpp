@@ -187,7 +187,12 @@ std::vector<uint32_t> vertex_program(const vsh::Program& program, uint32_t input
         if (centred) t = b.op(op::FSub, s.f, {t, b.c_float(1)});
         return b.op(op::FMul, s.f, {t, pw});
     };
-    const Id clip = b.vec4(axis(s.x(pos), 0, true), axis(s.y(pos), 1, true), axis(s.z(pos), 2, false), pw);
+    // Squeezed across about a point first (the HUD at wide shapes): z + (x - z) * y,
+    // exactly x where y is 1 and z 0.
+    const Id pixel = b.uniform_vec4(s.consts, b.c_int(kVsPixels));
+    const Id about = b.extract(s.f, pixel, 2);
+    const Id x = b.op(op::FAdd, s.f, {about, b.op(op::FMul, s.f, {b.op(op::FSub, s.f, {s.x(pos), about}), b.extract(s.f, pixel, 1)})});
+    const Id clip = b.vec4(axis(x, 0, true), axis(s.y(pos), 1, true), axis(s.z(pos), 2, false), pw);
     const Id position = b.builtin_var(spv::Storage::Output, s.v4, spv::builtin::Position);
     b.decorate(position, spv::deco::Invariant);
     b.store(position, clip);

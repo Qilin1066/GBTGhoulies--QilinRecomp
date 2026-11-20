@@ -135,6 +135,9 @@ struct Device {
     // Draws decoded since the last Swap, until the renderer draws them.
     // Shaders made so far, by key, and textures uploaded, by their header and address.
     std::unordered_map<uint64_t, std::vector<uint32_t>> shaders;
+    // Programs that place vertices by one matrix, oPos = (v0·c[n], …, v0·c[n+3])
+    // as the first four instructions: n (0-191), or -1 (flat_overlay).
+    std::unordered_map<uint64_t, int> position_matrix;
     struct CachedTexture {
         uint32_t id = 0;
         std::vector<uint8_t> texels;  // the guest's texels when uploaded, compared byte for byte
@@ -641,6 +644,7 @@ void apply_settings(Device& d, const platform::Settings& s) {
     p.smooth = s.smooth;
     p.fsr = s.fsr;
     p.sharpness = float(s.sharpness) / 100.0f;
+    p.smaa = s.smaa;
     p.look = gfx::Picture::Look(uint8_t(s.look));
     p.scanlines = float(s.scanlines) / 100.0f;
     p.mask = float(s.mask) / 100.0f;
@@ -1015,6 +1019,23 @@ struct Vertices {
     uint32_t constant = 0;  // bit n: attr[n] is one vec4 for every vertex (gfx::DrawCmd::constant_inputs)
     Vertices() { std::fill_n(arena, 16, gfx::DrawCmd::kNoArena); }
 };
+
+// The constant a program's position matrix starts at, if its first four
+// instructions are dp4 oPos.x … oPos.w of v0 with four constants in a row;
+// else -1.
+int position_matrix_of(const gfx::vsh::Program& p) {
+    if (p.code.size() < 4) return -1;
+    const int n = p.code[0].constant;
+    for (int i = 0; i < 4; ++i) {
+        const gfx::vsh::Instruction& in = p.code[size_t(i)];
+        const gfx::vsh::Operand& a = in.a;
+        if (in.mac != gfx::vsh::Mac::Dp4 || in.out_is_const || in.out_from_ilu || in.out_address != gfx::vsh::kPos ||
+            in.out_mask != (8 >> i) || in.relative || in.constant != n + i || a.kind != gfx::vsh::Src::Input || a.index != 0 ||
+            a.negate || a.swizzle[0] != 0 || a.swizzle[1] != 1 || a.swizzle[2] != 2 || a.swizzle[3] != 3 || in.b.kind != gfx::vsh::Src::Const)
+            return -1;
+    }
+    return n;
+}
 
 void convert_attribute(const uint8_t* p, uint32_t format, float* out) {
     const uint32_t type = format & 0xF, size = (format >> 4) & 0xF;
@@ -2068,6 +2089,7 @@ void issue_draw(rt::Context& c, Device& d, const char* fn, uint32_t prim, Vertic
             if (!prog) unmodelled(fn, "a vertex program that doesn't decode (" + error + ")");
         }
     }
+    if (prog && !passthrough) d.position_matrix[vs_key] = position_matrix_of(*prog);
     auto& vs_code = d.shaders[vs_key];
     if (vs_code.empty()) {
         try {
@@ -2189,6 +2211,45 @@ void issue_draw(rt::Context& c, Device& d, const char* fn, uint32_t prim, Vertic
     vsu[gfx::nv2a::kVsScreen * 4 + 1] = 2.0f / float(target_h);
     vsu[gfx::nv2a::kVsScreen * 4 + 2] = zscale > 0 ? 1.0f / zscale : 1.0f;
     vsu[gfx::nv2a::kVsPixels * 4] = float(d.renderer->resolution_scale_y());
+    vsu[gfx::nv2a::kVsPixels * 4 + 1] = 1.0f;  // the HUD's squeeze across, and the x it's about (flat_overlay)
+    vsu[gfx::nv2a::kVsPixels * 4 + 2] = 0.0f;
+
+    // Flat: placed by a position matrix with no perspective (the HUD, the
+    // menus' and pages' pictures and text), and where on screen across.
+    bool flat = false;
+    float flat_x0 = 0, flat_x1 = 0;
+    if (const auto it = d.position_matrix.find(vs_key); !passthrough && it != d.position_matrix.end() && it->second >= 0 && !v.attr[0].empty()) {
+        const float* m = &vsu[size_t(it->second) * 4];  // the x row at m[0], the w row at m[12]
+        if (m[12] == 0 && m[13] == 0 && m[14] == 0 && m[15] != 0) {
+            const float sx = vsu[(96 - 38) * 4], ox = vsu[(96 - 37) * 4];
+            flat_x0 = INFINITY, flat_x1 = -INFINITY;
+            for (uint32_t i = 0; i < v.count; ++i) {
+                const float* p = &v.attr[0][(v.constant & 1) ? 0 : size_t(i) * 4];
+                const float x = (p[0] * m[0] + p[1] * m[1] + p[2] * m[2] + p[3] * m[3]) * sx / (p[3] * m[15]) + ox;
+                flat_x0 = std::min(flat_x0, x), flat_x1 = std::max(flat_x1, x);
+            }
+            flat = v.count > 0;
+        }
+    }
+    // The HUD at its own shape on pictures wider than 4:3. The game lays its
+    // 2D out in 640×480 and, for 16:9, lets the TV stretch it with the 3D;
+    // what it draws flat across the whole frame (its menus and pages draw in
+    // a 4:3 viewport of their own, already their shape) is squeezed back by
+    // 4:3 over the picture's shape, about the screen's edge it's nearest (a
+    // part within the left or right third) or its middle. Pictures across
+    // the whole frame (videos, fades) stay as they are.
+    const platform::Settings* hs = d.config.settings;
+    if (flat && hs && hs->hud != platform::Settings::Hud::Stretched && d.aspect > 4.0f / 3.0f + 1e-3f) {
+        const uint32_t target = ld(c, dev + kDevRenderTarget);
+        const bool frame_buffer = std::find(d.frame_buffers.begin(), d.frame_buffers.end(), target) != d.frame_buffers.end();
+        const float w = float(target_w);
+        if (frame_buffer && ld(c, dev + kDevViewport) == 0 && ld(c, dev + kDevViewport + 8) == target_w && flat_x1 - flat_x0 < 0.9f * w) {
+            const float centre = (flat_x0 + flat_x1) * 0.5f;
+            const float about = hs->hud == platform::Settings::Hud::Middle ? w * 0.5f : centre < w / 3 ? 0.0f : centre > w * 2 / 3 ? w : w * 0.5f;
+            vsu[gfx::nv2a::kVsPixels * 4 + 1] = (4.0f / 3.0f) / d.aspect;
+            vsu[gfx::nv2a::kVsPixels * 4 + 2] = about;
+        }
+    }
 
     // Fixed-function state.
     cmd.blend = rs(kRsAlphaBlendEnable);
@@ -2263,12 +2324,13 @@ void issue_draw(rt::Context& c, Device& d, const char* fn, uint32_t prim, Vertic
         const uint32_t target = ld(c, dev + kDevRenderTarget), depth = ld(c, dev + kDevDepth);
         const std::string line =
             strf("draw %u %s rt=%08X zs=%08X %ux%u vp=%d,%d %ux%u prim=%u n=%u %s%s blend=%u %x/%x/%x z=%u/%u/%x st=%u zb=%u cw=%08X a=%u/%u "
-                 "cull=%x modes=%x c0=%08X/%08X vs=%08X\n",
+                 "cull=%x modes=%x c0=%08X/%08X vs=%08X%s\n",
                  d.swaps, fn, ld(c, target + 4), depth ? ld(c, depth + 4) : 0u, target_w, target_h, cmd.scissor.x, cmd.scissor.y,
                  cmd.scissor.w, cmd.scissor.h, prim, v.count, passthrough ? "xyzrhw" : fixed_function ? "ff" : "prog", t.c_str(),
                  rs(kRsAlphaBlendEnable), rs(kRsSrcBlend), rs(kRsDestBlend), rs(kRsBlendOp), zenable, rs(kRsZWriteEnable), rs(kRsZFunc),
                  rs(kRsStencilEnable), ld(c, kRsZBiasSlot), cw, rs(kRsAlphaTestEnable), rs(kRsAlphaRef), cull, cs.texture_modes,
-                 rs(kRsPsRgbInputs), rs(kRsPsRgbOutputs), ld(c, dev + kDevVertexShader));
+                 rs(kRsPsRgbInputs), rs(kRsPsRgbOutputs), ld(c, dev + kDevVertexShader),
+                 flat ? strf(" flat=%.0f..%.0f", double(flat_x0), double(flat_x1)).c_str() : "");
         trace_line(line);
         if (const char* dir = std::getenv("QILIN_TRACE_DUMP"); dir && *dir && trace_wanted(line)) {
             static uint32_t n = 0;

@@ -58,6 +58,7 @@ struct Picture {
     // sharpening by `sharpness`, 0 (least) to 1 (most).
     bool fsr = false;
     float sharpness = 0.8f;
+    bool smaa = false;  // SMAA 1x anti-aliasing on the frame first
     bool operator==(const Picture&) const = default;
 };
 

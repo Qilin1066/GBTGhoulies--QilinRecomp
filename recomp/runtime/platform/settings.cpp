@@ -119,6 +119,9 @@ std::string settings_text(const Settings& s) {
          "# the render resolution (not at whole multiples), and its sharpening, 0-100.\n"
          "fsr = " << on(s.fsr) << "\n"
          "sharpness = " << s.sharpness << "\n"
+         "# Anti-aliasing: off, or smaa (SMAA 1x: jagged edges smoothed, at the\n"
+         "# render resolution, before any upscaling).\n"
+         "antialiasing = " << (s.smaa ? "smaa" : "off") << "\n"
          "# plain, or crt: a television's raster lines and phosphor stripes.\n"
          "look = " << (s.look == Settings::Look::Crt ? "crt" : "plain") << "\n"
          "# CRT: how dark the gaps between lines are, and the stripes' strength, 0-100.\n"
@@ -140,7 +143,11 @@ std::string settings_text(const Settings& s) {
          "resolution = ";
     if (s.resolution) o << s.resolution;
     else o << "auto";
-    o << "\n\n";
+    o << "\n"
+         "# The HUD on pictures wider than 4:3, at its own shape: edges (each part at\n"
+         "# the screen's edge it's nearest), middle (the 4:3 area, as on a 4:3 TV), or\n"
+         "# stretched (as the game draws it).\n"
+         "hud = " << (s.hud == Settings::Hud::Middle ? "middle" : s.hud == Settings::Hud::Stretched ? "stretched" : "edges") << "\n\n";
     o << "[controls]\n"
          "# Controllers use the Xbox controller's layout. These are the keyboard's\n"
          "# keys (SDL's names, several separated by commas; empty for none).\n"
@@ -192,6 +199,7 @@ Settings parse_settings(const std::string& text, std::vector<std::string>& warni
             } else if (key == "smooth") ok = read_bool(v, &s.smooth);
             else if (key == "fsr") ok = read_bool(v, &s.fsr);
             else if (key == "sharpness") ok = read_uint(v, 0, 100, &s.sharpness);
+            else if (key == "antialiasing") ok = v == "smaa" ? (s.smaa = true) : v == "off" ? (s.smaa = false, true) : false;
             else if (key == "look") {
                 if (v == "plain") s.look = Settings::Look::Plain;
                 else if (v == "crt") s.look = Settings::Look::Crt;
@@ -201,7 +209,12 @@ Settings parse_settings(const std::string& text, std::vector<std::string>& warni
             else if (key == "vsync") ok = read_bool(v, &s.vsync);
             else if (key == "anisotropy") ok = read_uint(v, 1, 16, &s.anisotropy);
             else if (key == "aspect") ok = aspect_given = read_aspect(v, &s.aspect_w, &s.aspect_h);
-            else if (key == "resolution") ok = v == "auto" ? (s.resolution = 0, true) : read_uint(v, 1, 4, &s.resolution);
+            else if (key == "hud") {
+                if (v == "edges") s.hud = Settings::Hud::Edges;
+                else if (v == "middle") s.hud = Settings::Hud::Middle;
+                else if (v == "stretched") s.hud = Settings::Hud::Stretched;
+                else ok = false;
+            } else if (key == "resolution") ok = v == "auto" ? (s.resolution = 0, true) : read_uint(v, 1, 4, &s.resolution);
             else ok = false;
         } else if (section == "controls") {
             if (key == "rumble") {
