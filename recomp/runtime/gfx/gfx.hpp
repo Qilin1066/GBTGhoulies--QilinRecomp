@@ -257,6 +257,13 @@ public:
     // destroy_texture frees it.
     virtual uint32_t create_depth_target(uint32_t width, uint32_t height) = 0;
     virtual void set_render_target(uint32_t id, uint32_t depth) = 0;
+    // A depth target's depth and stencil written into a render target (of
+    // the same size or smaller) as the console's memory holds a D24S8
+    // surface, each texel one 32-bit word: alpha, red and green the depth's
+    // bytes from the top (the range 0 to 1 as 0 to 0xFFFFFF), blue the
+    // stencil. For a draw that reads a depth surface as a colour texture.
+    // False where the device can't sample its depth format.
+    virtual bool pack_depth(uint32_t depth_target, uint32_t render_target) = 0;
     // A render target's pixels read back, or written from the CPU (an image
     // of its size): its texels as the guest's memory has them.
     virtual Image read_render_target(uint32_t id) = 0;

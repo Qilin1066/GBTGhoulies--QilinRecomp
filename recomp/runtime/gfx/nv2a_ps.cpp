@@ -249,7 +249,16 @@ std::vector<uint32_t> combiners(const CombinerSetup& s) {
     };
     for (uint32_t i = 0; i < 4; ++i) {
         const uint32_t m = mode_of(s, i);
-        Id result = p.zero4;
+        // A stage with no texture (NONE) reads (0, 0, 0, 1), not zero as
+        // NV_texture_shader has it: the game's depth-sprite shader (the
+        // death effect: t1 a depth surface, DOTPRODUCT and DOT_ZW at stages
+        // 2 and 3, stage 0 NONE) outputs t0 under an alpha test of > 5, and
+        // writes the stencil that shapes the effect only if it passes; with
+        // zero, nothing passes and the effect fills its whole rectangle.
+        // Alpha 1 is inferred from that, not measured on the hardware (xemu
+        // reads zero); every other shader the game runs overwrites what it
+        // would read of it.
+        Id result = m == kNone ? b.c_vec({0, 0, 0, 1}) : p.zero4;
         const Id scale = p.uniform(kFsTexScale + i);
         if (m == kDotProduct || m == kDotZw) {
             dot_of(i);  // the register reads 0

@@ -11,6 +11,14 @@ Each release is a git tag (`vX.Y.Z`) with a matching GitHub release. The version
 
 ## [Unreleased]
 
+## [0.39.1] - 2026-11-20
+
+### Fixed
+- **Green boxes when imps die**: the slime the game draws over a dying imp now has the imp's shape, not a box (lime, or dark early in the effect) around it, or, at its worst, a green film over the whole screen except the characters. The game shapes it with the stencil, from the depth of the imp it renders into a texture, which it reads back from that texture's depth surface as if it were a colour texture. The renderer kept that depth only on the GPU, and the memory still had a copied comic-page image attached from earlier in the game, so the effect read an old picture as depth: what it showed depended on that picture, which is why it came and went. Depth surfaces read as textures now give their depth and stencil as the console's memory holds them, memory that changes from a colour texture to a depth surface (or back) drops what it was, and a texture stage with no texture reads alpha 1, which this effect needs to write its stencil.
+
+### Added
+- `QILIN_TRACE_DETAIL=1` for the draw trace: each logged draw's stencil, alpha test, combiners and first vertices.
+
 ## [0.39.0] - 2026-11-20
 
 ### Added

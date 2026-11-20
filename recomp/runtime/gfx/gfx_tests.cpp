@@ -372,6 +372,38 @@ mad oPos.xyz, oPos.xyzz, r1.x, c-37.xyzz
         }
     }
 
+    // A depth target packed as the console's D24S8 words (pack_depth): depth
+    // 0.25 and stencil 0x5A over it all, then 1.0 and 3 over its left half.
+    // 0.25 is 0x400000 in 24 bits: alpha 0x40, red and green 0, blue the
+    // stencil; 1.0 is 0xFFFFFF.
+    {
+        const uint32_t target = r->create_render_target(16, 8), depth = r->create_depth_target(16, 8);
+        const uint32_t packed = r->create_render_target(16, 8);
+        r->set_render_target(target, depth);
+        const float none[4] = {0, 0, 0, 0};
+        r->clear(nullptr, 0, gfx::kClearDepth | gfx::kClearStencil, none, 0.25f, 0x5A);
+        const gfx::Rect left{0, 0, 8, 8};
+        r->clear(&left, 1, gfx::kClearDepth | gfx::kClearStencil, none, 1.0f, 3);
+        if (r->pack_depth(depth, packed)) {
+            const gfx::Image im = r->read_render_target(packed);
+            CHECK(pixel_is(im, 0, 0, 0xFF, 0xFF, 3, 0xFF) && pixel_is(im, 7, 7, 0xFF, 0xFF, 3, 0xFF));
+            CHECK(pixel_is(im, 8, 0, 0, 0, 0x5A, 0x40) && pixel_is(im, 15, 7, 0, 0, 0x5A, 0x40));
+            // Drawn into again after: packed again, it follows.
+            r->set_render_target(target, depth);
+            r->clear(nullptr, 0, gfx::kClearDepth | gfx::kClearStencil, none, 1.0f, 0);
+            CHECK(r->pack_depth(depth, packed));
+            CHECK(pixel_is(r->read_render_target(packed), 12, 4, 0xFF, 0xFF, 0, 0xFF));
+            std::printf("depth target packed as D24S8 words\n");
+        } else {
+            std::printf("depth targets can't be sampled on this device: packing skipped\n");
+        }
+        r->set_render_target(0, 0);
+        r->destroy_texture(packed);
+        r->destroy_texture(depth);
+        r->destroy_texture(target);
+        CHECK(r->validation_errors() == 0);
+    }
+
     if (failures) std::fprintf(stderr, "%d check(s) failed\n", failures);
     else std::printf("all renderer tests passed\n");
     return failures != 0;

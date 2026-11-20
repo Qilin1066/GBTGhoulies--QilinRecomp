@@ -39,6 +39,9 @@ namespace qilin::gfx {
 namespace fsr_spirv {
 #include "fsr/fsr_spirv.inc"
 }  // namespace fsr_spirv
+namespace depth_pack_spirv {
+#include "depth/depth_pack_spirv.inc"
+}  // namespace depth_pack_spirv
 namespace smaa_spirv {
 #include "smaa/smaa_spirv.inc"
 }  // namespace smaa_spirv
@@ -104,6 +107,10 @@ void layout_use(VkImageLayout layout, VkPipelineStageFlags2& stage, VkAccessFlag
             stage = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
             access = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT;
             break;
+        case VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL:  // a depth target sampled (pack_depth)
+            stage = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
+            access = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT;
+            break;
         case VK_IMAGE_LAYOUT_GENERAL:  // written by FSR's passes
             stage = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
             access = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
@@ -151,6 +158,7 @@ public:
     void copy_frame_to_target(uint32_t frame_index, uint32_t target_id, const std::vector<CopyRegion>& regions) override;
     uint32_t create_depth_target(uint32_t width, uint32_t height) override;
     void set_render_target(uint32_t id, uint32_t depth) override;
+    bool pack_depth(uint32_t depth_target, uint32_t render_target) override;
     Image read_front_buffer() override { return read(color_[front_]); }
     void present_again() override;
     void set_picture(const Picture& p) override {
@@ -218,6 +226,12 @@ private:
     uint32_t smaa_area_ = 0, smaa_search_ = 0;  // SMAA's lookup textures
     void smaa_objects(const Target& frame);
     Target& run_smaa(Target& frame);
+    // Depth targets packed as the console's D24S8 words (pack_depth): one
+    // full-screen pass reading the depth and stencil aspects.
+    VkDescriptorSetLayout pack_set_layout_ = VK_NULL_HANDLE;
+    VkPipelineLayout pack_layout_ = VK_NULL_HANDLE;
+    VkPipeline pack_pipeline_ = VK_NULL_HANDLE;
+    bool depth_sampled_ = false;  // the depth format can be sampled
     Target& target() { return current_rt_ ? render_targets_.at(current_rt_) : color_[back_]; }  // what draws and clears go to
     // The depth buffer draws and clears use, or null.
     Target* depth_target() {
@@ -586,6 +600,7 @@ bool VulkanRenderer::pick_device(std::string* error) {
         vkGetPhysicalDeviceFormatProperties(gpu_, f, &fp);
         if (fp.optimalTilingFeatures & VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT) {
             depth_format_ = f;
+            depth_sampled_ = (fp.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT) != 0;
             break;
         }
     }
@@ -772,6 +787,9 @@ void VulkanRenderer::destroy() {
         for (Target& t : fsr_images_) drop(t);
         for (Target& t : smaa_images_) drop(t);
         for (VkPipeline p : smaa_pipelines_) if (p) vkDestroyPipeline(device_, p, nullptr);
+        if (pack_pipeline_) vkDestroyPipeline(device_, pack_pipeline_, nullptr);
+        if (pack_layout_) vkDestroyPipelineLayout(device_, pack_layout_, nullptr);
+        if (pack_set_layout_) vkDestroyDescriptorSetLayout(device_, pack_set_layout_, nullptr);
         if (smaa_layout_) vkDestroyPipelineLayout(device_, smaa_layout_, nullptr);
         if (smaa_set_layout_) vkDestroyDescriptorSetLayout(device_, smaa_set_layout_, nullptr);
         for (VkPipeline p : fsr_pipelines_) if (p) vkDestroyPipeline(device_, p, nullptr);
@@ -2470,7 +2488,9 @@ uint32_t VulkanRenderer::create_render_target(uint32_t width, uint32_t height) {
 }
 
 uint32_t VulkanRenderer::create_depth_target(uint32_t width, uint32_t height) {
-    Target t = create_target(depth_format_, VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+    Target t = create_target(depth_format_,
+                             VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+                                 (depth_sampled_ ? VK_IMAGE_USAGE_SAMPLED_BIT : 0),
                              VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT, width, height);
     const bool was_open = pass_open_;
     end_pass();
@@ -2483,6 +2503,146 @@ uint32_t VulkanRenderer::create_depth_target(uint32_t width, uint32_t height) {
     depth_targets_[id] = t;
     if (was_open) begin_pass();
     return id;
+}
+
+bool VulkanRenderer::pack_depth(uint32_t depth_id, uint32_t rt_id) {
+    auto di = depth_targets_.find(depth_id);
+    auto rti = render_targets_.find(rt_id);
+    if (!depth_sampled_ || di == depth_targets_.end() || rti == render_targets_.end()) return false;
+    Target& from = di->second;
+    Target& to = rti->second;
+    if (from.width < to.width || from.height < to.height) return false;
+    if (!pack_pipeline_) {
+        VkDescriptorSetLayoutBinding b[2]{};
+        for (uint32_t i = 0; i < 2; ++i) {
+            b[i].binding = i;
+            b[i].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+            b[i].descriptorCount = 1;
+            b[i].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+        }
+        VkDescriptorSetLayoutCreateInfo sl{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+        sl.bindingCount = 2;
+        sl.pBindings = b;
+        check(vkCreateDescriptorSetLayout(device_, &sl, nullptr, &pack_set_layout_), "vkCreateDescriptorSetLayout");
+        VkPipelineLayoutCreateInfo pl{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+        pl.setLayoutCount = 1;
+        pl.pSetLayouts = &pack_set_layout_;
+        check(vkCreatePipelineLayout(device_, &pl, nullptr, &pack_layout_), "vkCreatePipelineLayout");
+        const std::span<const uint32_t> code[2] = {depth_pack_spirv::kDepthPack_vert, depth_pack_spirv::kDepthPack_frag};
+        VkShaderModule modules[2] = {};
+        VkPipelineShaderStageCreateInfo stages[2]{};
+        for (int i = 0; i < 2; ++i) {
+            VkShaderModuleCreateInfo mi{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+            mi.codeSize = code[i].size_bytes();
+            mi.pCode = code[i].data();
+            check(vkCreateShaderModule(device_, &mi, nullptr, &modules[i]), "vkCreateShaderModule");
+            stages[i].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+            stages[i].stage = i ? VK_SHADER_STAGE_FRAGMENT_BIT : VK_SHADER_STAGE_VERTEX_BIT;
+            stages[i].module = modules[i];
+            stages[i].pName = "main";
+        }
+        VkPipelineVertexInputStateCreateInfo vi{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+        VkPipelineInputAssemblyStateCreateInfo ia{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
+        ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+        VkPipelineViewportStateCreateInfo vp{VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
+        vp.viewportCount = vp.scissorCount = 1;
+        VkPipelineRasterizationStateCreateInfo rs{VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
+        rs.polygonMode = VK_POLYGON_MODE_FILL;
+        rs.lineWidth = 1.0f;
+        VkPipelineMultisampleStateCreateInfo ms{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
+        ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+        VkPipelineDepthStencilStateCreateInfo ds{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
+        VkPipelineColorBlendAttachmentState att{};
+        att.colorWriteMask = 0xF;
+        VkPipelineColorBlendStateCreateInfo cb{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
+        cb.attachmentCount = 1;
+        cb.pAttachments = &att;
+        const VkDynamicState dynamic[] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
+        VkPipelineDynamicStateCreateInfo dyn{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
+        dyn.dynamicStateCount = 2;
+        dyn.pDynamicStates = dynamic;
+        const VkFormat format = to.format;
+        VkPipelineRenderingCreateInfo ri{VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO};
+        ri.colorAttachmentCount = 1;
+        ri.pColorAttachmentFormats = &format;
+        VkGraphicsPipelineCreateInfo info{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
+        info.pNext = &ri;
+        info.stageCount = 2;
+        info.pStages = stages;
+        info.pVertexInputState = &vi;
+        info.pInputAssemblyState = &ia;
+        info.pViewportState = &vp;
+        info.pRasterizationState = &rs;
+        info.pMultisampleState = &ms;
+        info.pDepthStencilState = &ds;
+        info.pColorBlendState = &cb;
+        info.pDynamicState = &dyn;
+        info.layout = pack_layout_;
+        check(vkCreateGraphicsPipelines(device_, pipeline_cache_, 1, &info, nullptr, &pack_pipeline_), "vkCreateGraphicsPipelines");
+        for (VkShaderModule m : modules) vkDestroyShaderModule(device_, m, nullptr);
+    }
+    // Outside the pass: the next one takes the current target and depth back
+    // into their attachment layouts.
+    end_pass();
+    record();
+    // Views of each aspect alone (sampling reads one), freed with the submission.
+    VkImageView aspect_view[2] = {};
+    for (uint32_t i = 0; i < 2; ++i) {
+        VkImageViewCreateInfo view{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+        view.image = from.image;
+        view.viewType = VK_IMAGE_VIEW_TYPE_2D;
+        view.format = from.format;
+        view.subresourceRange = {i ? VkImageAspectFlags(VK_IMAGE_ASPECT_STENCIL_BIT) : VkImageAspectFlags(VK_IMAGE_ASPECT_DEPTH_BIT), 0, 1, 0, 1};
+        check(vkCreateImageView(device_, &view, nullptr, &aspect_view[i]), "vkCreateImageView");
+        dead_textures_.push_back({VK_NULL_HANDLE, VK_NULL_HANDLE, aspect_view[i]});
+    }
+    transition(from, VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL);
+    transition(to, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+    SamplerDesc point;
+    point.u = point.v = Address::Clamp;
+    point.mag = point.min = Filter::Nearest;
+    point.anisotropy = 0;
+    const VkSampler pnt = sampler(point);
+    const VkDescriptorImageInfo inputs[2] = {{pnt, aspect_view[0], VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL},
+                                             {pnt, aspect_view[1], VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL}};
+    VkDescriptorSetAllocateInfo ai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+    ai.descriptorPool = descriptor_pool_;
+    ai.descriptorSetCount = 1;
+    ai.pSetLayouts = &pack_set_layout_;
+    VkDescriptorSet set = VK_NULL_HANDLE;
+    check(vkAllocateDescriptorSets(device_, &ai, &set), "vkAllocateDescriptorSets");
+    VkWriteDescriptorSet w[2]{};
+    for (uint32_t i = 0; i < 2; ++i) {
+        w[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        w[i].dstSet = set;
+        w[i].dstBinding = i;
+        w[i].descriptorCount = 1;
+        w[i].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        w[i].pImageInfo = &inputs[i];
+    }
+    vkUpdateDescriptorSets(device_, 2, w, 0, nullptr);
+    VkRenderingAttachmentInfo ca{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
+    ca.imageView = to.view;
+    ca.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    ca.loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;  // every texel is written
+    ca.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    VkRenderingInfo rinfo{VK_STRUCTURE_TYPE_RENDERING_INFO};
+    rinfo.renderArea = {{0, 0}, {to.width, to.height}};
+    rinfo.layerCount = 1;
+    rinfo.colorAttachmentCount = 1;
+    rinfo.pColorAttachments = &ca;
+    vkCmdBeginRendering(cmd_, &rinfo);
+    const VkViewport viewport{0, 0, float(to.width), float(to.height), 0, 1};
+    const VkRect2D scissor{{0, 0}, {to.width, to.height}};
+    vkCmdBindPipeline(cmd_, VK_PIPELINE_BIND_POINT_GRAPHICS, pack_pipeline_);
+    vkCmdSetViewport(cmd_, 0, 1, &viewport);
+    vkCmdSetScissor(cmd_, 0, 1, &scissor);
+    vkCmdBindDescriptorSets(cmd_, VK_PIPELINE_BIND_POINT_GRAPHICS, pack_layout_, 0, 1, &set, 0, nullptr);
+    vkCmdDraw(cmd_, 3, 1, 0, 0);
+    vkCmdEndRendering(cmd_);
+    transition(to, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    drawn_.valid = false;  // its pipeline, viewport and scissor are this pass's now
+    return true;
 }
 
 void VulkanRenderer::set_render_target(uint32_t id, uint32_t depth) {

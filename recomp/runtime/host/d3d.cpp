@@ -177,6 +177,14 @@ struct Device {
     // targets, by the guest address of their data.
     struct DepthTarget {
         uint32_t id = 0, width = 0, height = 0;
+        bool linear = false;
+        uint64_t drawn = 0;   // bumped each time it's bound: what it holds may have changed
+        uint64_t guest = 0;   // hash of its guest memory, which the GPU never writes
+        uint32_t checked_swap = ~0u, checked_epoch = ~0u;
+        // Its depth and stencil as the console's memory holds them, for draws
+        // that read the surface as an A8R8G8B8 texture (depth_texture).
+        CachedTexture packed;
+        uint64_t packed_drawn = ~0ull;
     };
     std::map<uint32_t, DepthTarget> depth_targets;
     std::vector<std::string> said;  // notices given once
@@ -629,8 +637,8 @@ void clear(rt::Context& c) {
                            float(color >> 24) / 255.0f};
     apply_target(c, d, "D3DDevice_Clear");
     if (trace_draws(d))
-        trace_line(strf("clear %u rt=%08X flags=%x color=%08X z=%g rects=%zu first=%d,%d %ux%u\n", d.swaps,
-                     ld(c, ld(c, kDeviceStorage + kDevRenderTarget) + 4), flags, color, double(z), list.size(), list[0].x, list[0].y,
+        trace_line(strf("clear %u rt=%08X flags=%x color=%08X z=%g s=%u rects=%zu first=%d,%d %ux%u\n", d.swaps,
+                     ld(c, ld(c, kDeviceStorage + kDevRenderTarget) + 4), flags, color, double(z), stencil & 0xFF, list.size(), list[0].x, list[0].y,
                      list[0].w, list[0].h));
     d.renderer->clear(list.data(), uint32_t(list.size()), f, rgba, z, stencil & 0xFF);
     ret(c, 0, 24);
@@ -1412,12 +1420,14 @@ enum Rs : uint32_t {
 // A texture stage's texture, decoded and uploaded once (and again when its
 // texels change; they're compared once a frame).
 const Device::CachedTexture* target_texture(rt::Context& c, Device& d, uint32_t tex);
+const Device::CachedTexture* depth_texture(rt::Context& c, Device& d, uint32_t tex);
 // A palettized (P8) texture reads the stage's palette, which the device
 // keeps at +0xF88 (SetPalette is inline: the game stores it there): 256
 // A8R8G8B8 entries at most (D3DPalette's size code: 256 >> code), part of
 // what the cached texture is made from.
 const Device::CachedTexture* stage_texture(rt::Context& c, Device& d, const char* fn, uint32_t tex, uint32_t stage) {
     if (const Device::CachedTexture* t = target_texture(c, d, tex)) return t;
+    if (const Device::CachedTexture* t = depth_texture(c, d, tex)) return t;
     const uint32_t format = ld(c, tex + 12), size = ld(c, tex + 16), data = ld(c, tex + 4);
     gfx::TextureShape shape;
     std::string why;
@@ -1602,6 +1612,13 @@ Device::TargetTexture& texture_target(rt::Context& c, Device& d, uint32_t data, 
     const bool linear = fmt == kFmtLinA8R8G8B8 || fmt == kFmtLinX8R8G8B8;
     if (!t.texture.id || t.texture.width != w || t.texture.height != h || t.format != fmt) {
         if (t.texture.id) d.renderer->destroy_texture(t.texture.id);
+        // Its memory was a depth surface: that's over (as apply_target, the other way round).
+        if (auto old = d.depth_targets.find(data); old != d.depth_targets.end()) {
+            if (trace_draws(d)) trace_line(strf("dropped %u depth=%08X now colour\n", d.swaps, data));
+            d.renderer->destroy_texture(old->second.id);
+            if (old->second.packed.id) d.renderer->destroy_texture(old->second.packed.id);
+            d.depth_targets.erase(old);
+        }
         t.texture = {};
         t.texture.id = d.renderer->create_render_target(w, h);
         t.texture.width = w, t.texture.height = h, t.texture.dims = 2;
@@ -1647,10 +1664,29 @@ std::pair<uint32_t, uint32_t> apply_target(rt::Context& c, Device& d, const char
         if (depth == d.depth) {
             depth_id = gfx::Renderer::kDeviceDepth;
         } else {
-            Device::DepthTarget& dt = d.depth_targets[ld(c, depth + 4)];
+            const uint32_t ddata = ld(c, depth + 4);
+            // Its memory was a texture the GPU drew into, or a frame copied
+            // into one: that image isn't what it holds any more (the game
+            // reuses memory a page turn's copy had for a depth surface).
+            if (auto old = d.targets.find(ddata); old != d.targets.end()) {
+                if (trace_draws(d)) trace_line(strf("dropped %u rt=%08X now depth\n", d.swaps, ddata));
+                d.renderer->destroy_texture(old->second.texture.id);
+                d.targets.erase(old);
+            }
+            Device::DepthTarget& dt = d.depth_targets[ddata];
             if (!dt.id || dt.width != dw || dt.height != dh) {
                 if (dt.id) d.renderer->destroy_texture(dt.id);
-                dt = {d.renderer->create_depth_target(dw, dh), dw, dh};
+                if (dt.packed.id) d.renderer->destroy_texture(dt.packed.id);
+                dt = {};
+                dt.id = d.renderer->create_depth_target(dw, dh), dt.width = dw, dt.height = dh;
+                dt.checked_swap = ~0u;
+            }
+            dt.linear = dfmt == kFmtLinD24S8;
+            ++dt.drawn;
+            if (dt.checked_swap != d.swaps || dt.checked_epoch != d.memory_epoch) {
+                if (size_t(ddata) + size_t(dw) * dh * 4 <= c.mem_size)
+                    dt.guest = hash_bytes(c.mem + ddata, size_t(dw) * dh * 4, 0x9E3779B97F4A7C15ull);
+                dt.checked_swap = d.swaps, dt.checked_epoch = d.memory_epoch;
             }
             depth_id = dt.id;
         }
@@ -1662,6 +1698,52 @@ std::pair<uint32_t, uint32_t> apply_target(rt::Context& c, Device& d, const char
     Device::TargetTexture& t = texture_target(c, d, data, w, h, fmt, pitch);
     d.renderer->set_render_target(t.texture.id, depth_id);
     return {w, h};
+}
+
+// A depth surface read as a 32-bit colour texture, or null. The renderer
+// keeps a texture target's depth surface on the GPU (apply_target), not in
+// guest memory; a draw that samples that memory as A8R8G8B8 (the game reads
+// the depth of the scenes it renders into textures this way, through
+// DOT_ZW, to write it into the depth and stencil buffer) gets the depth
+// and stencil packed as the console's memory holds them, made again after
+// the surface is drawn into. Memory the CPU wrote since (the surface freed
+// and the memory reused) ends it.
+const Device::CachedTexture* depth_texture(rt::Context& c, Device& d, uint32_t tex) {
+    const uint32_t data = ld(c, tex + 4);
+    auto it = d.depth_targets.find(data);
+    if (it == d.depth_targets.end()) return nullptr;
+    Device::DepthTarget& dt = it->second;
+    const uint32_t format = ld(c, tex + 12), fmt = (format >> 8) & 0xFF;
+    const bool linear = fmt == kFmtLinA8R8G8B8 || fmt == kFmtLinX8R8G8B8;
+    if (!(linear || fmt == kFmtA8R8G8B8 || fmt == kFmtX8R8G8B8) || linear != dt.linear || ((format >> 16) & 0xF) > 1) return nullptr;
+    const auto [w, h] = surface_size(c, tex);
+    if (w > dt.width || h > dt.height) return nullptr;
+    if (dt.checked_swap != d.swaps || dt.checked_epoch != d.memory_epoch) {
+        const bool cpu_wrote = size_t(data) + size_t(dt.width) * dt.height * 4 > c.mem_size ||
+                               hash_bytes(c.mem + data, size_t(dt.width) * dt.height * 4, 0x9E3779B97F4A7C15ull) != dt.guest;
+        if (cpu_wrote) {  // the memory holds something else now
+            if (trace_draws(d)) trace_line(strf("dropped %u depth=%08X\n", d.swaps, data));
+            d.renderer->destroy_texture(dt.id);
+            if (dt.packed.id) d.renderer->destroy_texture(dt.packed.id);
+            d.depth_targets.erase(it);
+            return nullptr;
+        }
+        dt.checked_swap = d.swaps, dt.checked_epoch = d.memory_epoch;
+    }
+    if (!dt.packed.id || dt.packed.width != w || dt.packed.height != h) {
+        if (dt.packed.id) d.renderer->destroy_texture(dt.packed.id);
+        dt.packed = {};
+        dt.packed.id = d.renderer->create_render_target(w, h);
+        dt.packed.width = w, dt.packed.height = h, dt.packed.dims = 2;
+        dt.packed_drawn = ~0ull;
+    }
+    dt.packed.linear = linear;
+    if (dt.packed_drawn != dt.drawn) {
+        if (!d.renderer->pack_depth(dt.id, dt.packed.id)) return nullptr;  // the device can't sample depth: the memory, as before
+        if (trace_draws(d)) trace_line(strf("packed %u depth=%08X %ux%u\n", d.swaps, data, w, h));
+        dt.packed_drawn = dt.drawn;
+    }
+    return &dt.packed;
 }
 
 // The renderer's image for a texture whose texels were last drawn by the
@@ -2332,6 +2414,27 @@ void issue_draw(rt::Context& c, Device& d, const char* fn, uint32_t prim, Vertic
                  rs(kRsPsRgbInputs), rs(kRsPsRgbOutputs), ld(c, dev + kDevVertexShader),
                  flat ? strf(" flat=%.0f..%.0f", double(flat_x0), double(flat_x1)).c_str() : "");
         trace_line(line);
+        // QILIN_TRACE_DETAIL=1: each logged draw's stencil, alpha test, combiners and positions too.
+        static const bool detail = std::getenv("QILIN_TRACE_DETAIL") != nullptr;
+        if (detail && trace_wanted(line)) {
+            std::string x = strf("  stencil f=%u ref=%u mask=%x/%x ops=%u/%u/%u alpha f=%u ref=%u combiners=%u final=%08X/%08X modes=%x in=%x dot=%x\n",
+                                 rs(kRsStencilFunc), rs(kRsStencilRef), rs(kRsStencilMask), rs(kRsStencilWriteMask), rs(kRsStencilFail),
+                                 rs(kRsStencilZFail), rs(kRsStencilPass), rs(kRsAlphaFunc), rs(kRsAlphaRef), cs.combiner_count, cs.final_abcd,
+                                 cs.final_efgh, cs.texture_modes, cs.input_texture, cs.dot_mapping);
+            for (uint32_t i = 0; i < 8 && i < (cs.combiner_count & 0xFF); ++i)
+                x += strf("  stage %u rgb %08X>%08X alpha %08X>%08X c0=%08X c1=%08X\n", i, cs.rgb_inputs[i], cs.rgb_outputs[i], cs.alpha_inputs[i],
+                          cs.alpha_outputs[i], rs(kRsPsConstant0 + i), rs(kRsPsConstant1 + i));
+            for (uint32_t i = 0; i < v.count && i < 4; ++i) {
+                x += strf("  v%u", i);
+                for (uint32_t n = 0; n < 16; ++n)
+                    if (v.mask & (1u << n)) {
+                        const float* a = v.attr[n].data() + ((v.constant & (1u << n)) ? 0 : i * 4);
+                        x += strf(" a%u=(%.3g %.3g %.3g %.3g)", n, a[0], a[1], a[2], a[3]);
+                    }
+                x += "\n";
+            }
+            std::fputs(x.c_str(), stderr);
+        }
         if (const char* dir = std::getenv("QILIN_TRACE_DUMP"); dir && *dir && trace_wanted(line)) {
             static uint32_t n = 0;
             for (uint32_t stage = 0; stage < 4; ++stage)
