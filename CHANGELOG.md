@@ -11,6 +11,11 @@ Each release is a git tag (`vX.Y.Z`) with a matching GitHub release. The version
 
 ## [Unreleased]
 
+## [0.43.2] - 2026-11-21
+
+### Fixed
+- **v0.43.1's quicker comparisons are off again**: a player saw a fault when picking items up that started with that version. Vertex runs and textures are compared whole once a frame, and runs again after any lock, as before it (`QILIN_QUICK_COMPARE=1` turns the quick looks and the per-buffer lock counts back on, to find what they miss). The fight's saving goes with them, but for the pixel shader key's.
+
 ## [0.43.1] - 2026-11-21
 
 ### Changed

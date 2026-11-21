@@ -1609,7 +1609,13 @@ uint64_t sample_bytes(const uint8_t* p, uint64_t bytes) {
     }
     return h;
 }
-bool quick_look(const Device& d, uint64_t key) { return ((d.swaps + uint32_t(key >> 24)) & 15) != 0; }
+// Off unless QILIN_QUICK_COMPARE=1 (v0.43.2): with it on, a player saw a
+// fault when picking items up that wasn't there before, so everything is
+// compared whole again until that's understood.
+bool quick_look(const Device& d, uint64_t key) {
+    static const bool on = std::getenv("QILIN_QUICK_COMPARE") != nullptr;
+    return on && ((d.swaps + uint32_t(key >> 24)) & 15) != 0;
+}
 bool check_settled() {
     static const bool on = std::getenv("QILIN_CHECK_SETTLED") != nullptr;
     return on;
@@ -1648,7 +1654,9 @@ bool stream_from_arena(rt::Context& c, Device& d, const std::array<Slot, 16>& sl
     // character's shadow: comparing every draw was 30 MB a frame in a
     // fight), and that look is the quick one above unless its buffer was
     // locked since or it's the run's frame for a whole comparison.
-    const uint32_t locked = d.vertex_lock_of(stream_at);
+    // Any lock has a run compared again, as before v0.43.1 (only its own buffer's with QILIN_QUICK_COMPARE).
+    static const bool per_buffer = std::getenv("QILIN_QUICK_COMPARE") != nullptr;
+    const uint32_t locked = per_buffer ? d.vertex_lock_of(stream_at) : d.vertex_epoch;
     const bool kept = r.bytes && r.src.size() == span;
     const bool still = kept && d.swaps - r.changed >= kSettledSwaps && r.checked_epoch >= locked;
     const bool seen = still && r.checked_swap == d.swaps;
