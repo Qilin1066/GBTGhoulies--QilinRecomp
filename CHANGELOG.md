@@ -11,6 +11,11 @@ Each release is a git tag (`vX.Y.Z`) with a matching GitHub release. The version
 
 ## [Unreleased]
 
+## [0.42.2] - 2026-11-21
+
+### Fixed
+- **A swapchain semaphore used again too soon** (with vsync and low latency): the window's next image is taken early with a semaphore, and when something flushed the frame in between (a capture, a frame-buffer lock), the image was presented from the other of the two submissions in flight, so the semaphore could be used for the next acquire while its wait was still queued, which Vulkan forbids (the validation layer's `VUID-vkAcquireNextImageKHR-semaphore-01779`; what a driver does then is its own business). Acquire semaphores are now their own pool, each used again only when the submission that waited on it is done. A scripted fight under the validation layer reports nothing, at the default settings and at 21:9, 2×, SMAA with vsync off.
+
 ### Changed
 - **The repository is now Qilin1066/GBTGhoulies--QilinRecomp** (renamed by the owner, as were the sister projects: ApbArcade--QilinRecomp, PunchOutWii--QilinRecomp, and Beat the Beat's, now RhythmHeavenFever--QilinRecomp; GitHub redirects the old names). Links, docs and the download's name (`GBTGhoulies--QilinRecomp-<version>-windows-x64.zip`, as Punch-Out's follows its repository) follow; the settings folder is unchanged.
 

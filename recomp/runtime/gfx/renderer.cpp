@@ -457,8 +457,17 @@ private:
         std::map<DescriptorKey, VkDescriptorSet> sets;  // allocated from `pool` this submission
         std::vector<std::pair<uint64_t, uint64_t>> arena_freed;  // arena ranges given back while this submission was recorded
         bool pending = false;
+        // Acquire semaphores this submission waits on: free again once it's done.
+        std::vector<VkSemaphore> acquire_waited;
     };
     Slot slots_[kSlots];
+    // Semaphores for vkAcquireNextImageKHR, each used again only when the
+    // submission that waited on it has finished. (Before v0.42.2 an
+    // acquire used the recording slot's own, and an image taken early with
+    // one slot's and presented from the other, after a flush in between,
+    // left that semaphore's wait still queued when its slot acquired again.)
+    std::vector<VkSemaphore> acquire_free_;
+    VkSemaphore take_acquire_semaphore();
     // The vertex arena: one buffer, first-fit over its free ranges.
     VkBuffer arena_ = VK_NULL_HANDLE;
     VkDeviceMemory arena_memory_ = VK_NULL_HANDLE;
@@ -867,12 +876,16 @@ void VulkanRenderer::destroy() {
         for (auto& [k, pl] : pipelines_) vkDestroyPipeline(device_, pl, nullptr);
         for (auto& [k, m] : shaders_) vkDestroyShaderModule(device_, m, nullptr);
         for (auto& [d, smp] : samplers_) vkDestroySampler(device_, smp, nullptr);
+        for (VkSemaphore sem : acquire_free_) vkDestroySemaphore(device_, sem, nullptr);
+        acquire_free_.clear();
+        if (early_signal_) vkDestroySemaphore(device_, early_signal_, nullptr), early_signal_ = VK_NULL_HANDLE;
         for (Slot& sl : slots_) {
             if (sl.ring) vkDestroyBuffer(device_, sl.ring, nullptr);
             if (sl.ring_memory) vkFreeMemory(device_, sl.ring_memory, nullptr);
             if (sl.pool) vkDestroyDescriptorPool(device_, sl.pool, nullptr);
             if (sl.fence) vkDestroyFence(device_, sl.fence, nullptr);
             if (sl.acquired) vkDestroySemaphore(device_, sl.acquired, nullptr);
+            for (VkSemaphore sem : sl.acquire_waited) vkDestroySemaphore(device_, sem, nullptr);
         }
         if (arena_) vkDestroyBuffer(device_, arena_, nullptr);
         if (arena_memory_) vkFreeMemory(device_, arena_memory_, nullptr);
@@ -1032,6 +1045,7 @@ void VulkanRenderer::submit(VkSemaphore wait, VkSemaphore signal) {
     // (once its own submission is done) takes the recording.
     Slot& done = slots_[slot_];
     done.pending = true;
+    if (wait) done.acquire_waited.push_back(wait);
     for (Texture& t : dead_textures_) done.dead.push_back(t);
     dead_textures_.clear();
     for (auto& st : staging_) done.staging.push_back(st);
@@ -1103,8 +1117,22 @@ void VulkanRenderer::drop_early_image() {
     info.waitSemaphoreInfoCount = 1;
     info.pWaitSemaphoreInfos = &w;
     check(vkQueueSubmit2(queue_, 1, &info, VK_NULL_HANDLE), "vkQueueSubmit2");
+    check(vkQueueWaitIdle(queue_), "vkQueueWaitIdle");  // the wait has run: the semaphore is free again (a swapchain made again is rare)
+    acquire_free_.push_back(early_signal_);
     early_index_ = -1;
     early_signal_ = VK_NULL_HANDLE;
+}
+
+VkSemaphore VulkanRenderer::take_acquire_semaphore() {
+    if (!acquire_free_.empty()) {
+        const VkSemaphore sem = acquire_free_.back();
+        acquire_free_.pop_back();
+        return sem;
+    }
+    VkSemaphoreCreateInfo info{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
+    VkSemaphore sem = VK_NULL_HANDLE;
+    check(vkCreateSemaphore(device_, &info, nullptr, &sem), "vkCreateSemaphore");
+    return sem;
 }
 
 bool VulkanRenderer::acquire_early() {
@@ -1113,15 +1141,17 @@ bool VulkanRenderer::acquire_early() {
     if (config_.surface.size) config_.surface.size(&w, &h);
     if (w != swap_extent_.width || h != swap_extent_.height) return false;  // the next present makes the swapchain again
     uint32_t index = 0;
-    const VkResult got = vkAcquireNextImageKHR(device_, swapchain_, UINT64_MAX, acquired_, VK_NULL_HANDLE, &index);
+    const VkSemaphore sem = take_acquire_semaphore();
+    const VkResult got = vkAcquireNextImageKHR(device_, swapchain_, UINT64_MAX, sem, VK_NULL_HANDLE, &index);
     if (got == VK_ERROR_OUT_OF_DATE_KHR) {
+        acquire_free_.push_back(sem);  // nothing was acquired: it won't be signalled
         swap_stale_ = true;
         return false;
     }
     if (got == VK_SUBOPTIMAL_KHR) swap_stale_ = true;
     else check(got, "vkAcquireNextImageKHR");
     early_index_ = index;
-    early_signal_ = acquired_;
+    early_signal_ = sem;
     return true;
 }
 
@@ -1275,14 +1305,16 @@ void VulkanRenderer::show(Target& frame) {
         early_index_ = -1;
         early_signal_ = VK_NULL_HANDLE;
     } else {
-        const VkResult got = vkAcquireNextImageKHR(device_, swapchain_, UINT64_MAX, acquired_, VK_NULL_HANDLE, &index);
+        const VkSemaphore sem = take_acquire_semaphore();
+        const VkResult got = vkAcquireNextImageKHR(device_, swapchain_, UINT64_MAX, sem, VK_NULL_HANDLE, &index);
         if (got == VK_ERROR_OUT_OF_DATE_KHR) {
+            acquire_free_.push_back(sem);
             swap_stale_ = true;
             return submit();
         }
         if (got == VK_SUBOPTIMAL_KHR) swap_stale_ = true;
         else check(got, "vkAcquireNextImageKHR");
-        present_wait_ = acquired_;
+        present_wait_ = sem;
     }
 
     // The frame's shape on screen: its aspect (4:3, or 16:9 for a
@@ -2191,6 +2223,8 @@ void VulkanRenderer::retire(uint32_t i) {
         vkResetDescriptorPool(device_, sl.pool, 0);
         sl.sets.clear();
     }
+    acquire_free_.insert(acquire_free_.end(), sl.acquire_waited.begin(), sl.acquire_waited.end());
+    sl.acquire_waited.clear();
     for (Texture& t : sl.dead) {
         vkDestroyImageView(device_, t.view, nullptr);
         vkDestroyImage(device_, t.image, nullptr);
