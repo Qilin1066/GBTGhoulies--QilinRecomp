@@ -175,6 +175,8 @@ struct Device {
         uint32_t used = 0;               // the swap it was last drawn in
         uint32_t changes = 0;            // its bytes changed this many draws in a row
         uint32_t unstable_until = 0;     // a stream that keeps changing goes the old way until this swap
+        uint32_t changed = 0;            // the swap its bytes last changed in
+        uint32_t checked_swap = UINT32_MAX, checked_epoch = 0;  // when they were last found the same
     };
     std::unordered_map<uint64_t, VertexRun> vertex_runs;
     // Textures the game renders into: the renderer's image for each, by the
@@ -604,7 +606,10 @@ void block_on_resource(rt::Context& c) {
 // BYTE* D3DVertexBuffer_Lock2(D3DVertexBuffer*, DWORD Flags): the data's
 // address in the contiguous-memory window, as the original returns it. (The
 // original also puts a wait for the GPU in the command buffer; see BlockOnResource.)
-void vertex_buffer_lock2(rt::Context& c) { ret(c, ld(c, arg(c, 0) + 4) | rt::kRamCachedAlias, 8); }
+void vertex_buffer_lock2(rt::Context& c) {
+    if (g_device) ++g_device->memory_epoch;  // its vertices may change: compared again at their next draw
+    ret(c, ld(c, arg(c, 0) + 4) | rt::kRamCachedAlias, 8);
+}
 
 // ULONG D3DResource_Release(D3DResource*): as the original. A surface's
 // parent texture is released with it, and a resource the device still holds
@@ -1335,6 +1340,7 @@ void sweep_vertex_runs(Device& d, uint32_t idle) {
 // as converted before if the guest's bytes are the same, else converted
 // into it now. False to convert them for this draw only (a small draw, a
 // stream that keeps changing, or no room).
+constexpr uint32_t kSettledSwaps = 60;
 bool stream_from_arena(rt::Context& c, Device& d, const std::array<Slot, 16>& sl, uint32_t stream, uint32_t stream_at,
                        uint32_t stride, uint32_t count, Vertices& v) {
     static const bool off = [] { const char* e = std::getenv("QILIN_NO_VERTEX_CACHE"); return e && *e == '1'; }();
@@ -1363,9 +1369,16 @@ bool stream_from_arena(rt::Context& c, Device& d, const std::array<Slot, 16>& sl
     }
     r.used = d.swaps;
     if (r.unstable_until > d.swaps) return false;
-    if (r.bytes && r.src.size() == span && std::memcmp(r.src.data(), src, size_t(span)) == 0) {
+    // A run that hasn't changed for kSettledSwaps is compared once a frame,
+    // at its first draw, and again only after a lock (memory_epoch): the
+    // game draws the same floor once more for each character's shadow, and
+    // comparing every draw was 30 MB a frame in a fight.
+    const bool settled = r.bytes && d.swaps - r.changed >= kSettledSwaps && r.checked_swap == d.swaps && r.checked_epoch == d.memory_epoch;
+    if (settled || (r.bytes && r.src.size() == span && std::memcmp(r.src.data(), src, size_t(span)) == 0)) {
         r.changes = 0;
+        r.checked_swap = d.swaps, r.checked_epoch = d.memory_epoch;
     } else {
+        r.changed = d.swaps;
         if (r.bytes && ++r.changes >= kUnstableChanges) {  // changes every time: not worth keeping
             forget_vertex_run(d, r);
             r.src.clear();
@@ -1466,12 +1479,18 @@ gfx::Primitive convert_primitive(const char* fn, uint32_t prim, std::vector<uint
         seq = std::move(out);
         indexed = true;
     };
+    // Kinds Vulkan draws as they are hand the buffer back unused (before,
+    // it went with `out`, and the next fan or quad list allocated anew).
+    auto as_is = [&](gfx::Primitive p) {
+        t_converted = std::move(out);
+        return p;
+    };
     switch (prim) {
-        case 1: return gfx::Primitive::Points;
-        case 2: return gfx::Primitive::Lines;
-        case 4: return gfx::Primitive::LineStrip;
-        case 5: return gfx::Primitive::Triangles;
-        case 6: return gfx::Primitive::TriangleStrip;
+        case 1: return as_is(gfx::Primitive::Points);
+        case 2: return as_is(gfx::Primitive::Lines);
+        case 4: return as_is(gfx::Primitive::LineStrip);
+        case 5: return as_is(gfx::Primitive::Triangles);
+        case 6: return as_is(gfx::Primitive::TriangleStrip);
         case 3:
             for (size_t i = 0; i < n && n >= 2; ++i) out.push_back(seq[i]), out.push_back(seq[(i + 1) % n]);
             done();
@@ -2326,7 +2345,8 @@ void issue_draw(rt::Context& c, Device& d, const char* fn, uint32_t prim, Vertic
     } else {
         const uint32_t start = ld(c, dev + kDevVertexShader + 8);
         if (start >= 136) unmodelled(fn, strf("a vertex program at slot %u", start));
-        std::vector<uint32_t> words{0x2078u};
+        thread_local std::vector<uint32_t> words;  // kept from draw to draw: no allocation each time
+        words.assign(1, 0x2078u);
         for (uint32_t i = start; i < 136; ++i) {
             words.insert(words.end(), d.vs_program[i], d.vs_program[i] + 4);
             if (d.vs_program[i][3] & 1) break;  // FINAL
@@ -2744,7 +2764,8 @@ void begin_push(rt::Context& c) {
 void decode_push(rt::Context& c, Device& d, uint32_t from, uint32_t to) {
     const char* fn = "D3DDevice_EndPush";
     uint32_t open = 0;  // the primitive between SET_BEGIN_END's
-    std::vector<uint32_t> inline_data;
+    thread_local std::vector<uint32_t> inline_data;  // kept from push to push: no allocation each time
+    inline_data.clear();
     for (uint32_t at = from; at < to;) {
         const uint32_t header = ld(c, at);
         at += 4;

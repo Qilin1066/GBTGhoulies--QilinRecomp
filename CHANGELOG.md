@@ -11,6 +11,11 @@ Each release is a git tag (`vX.Y.Z`) with a matching GitHub release. The version
 
 ## [Unreleased]
 
+## [0.41.1] - 2026-11-21
+
+### Changed
+- **Less work on the game's thread each frame**: a vertex buffer that hasn't changed for 60 frames is compared with its copy once a frame (and again after the game locks a buffer), not at every draw: the game draws the floor once more for each character's shadow, and the comparisons were 30 MB a frame in a fight (memcmp from 15% of the thread's time to 9%, on lavapipe). Three per-draw allocations are gone too (the converted index list's buffer was dropped by every draw that didn't need converting, the vertex program's words and the push buffer's vertices were new each time).
+
 ## [0.41.0] - 2026-11-21
 
 ### Fixed
