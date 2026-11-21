@@ -482,6 +482,16 @@ void deliver_frame(Device& d) {
         const std::string path = (g_capture.log ? g_capture.dir.string() : d.config.dump_dir.empty() ? std::string(trace_dir) : d.config.dump_dir) +
                                  strf("/frame_%05llu.png", (unsigned long long)n);
         if (!gfx::write_png(path, im)) std::fprintf(stderr, "qilin: can't write %s\n", path.c_str());
+        // A capture's first four frames at the render resolution too (full_NNNNN.png): what the
+        // reduction to the game's size averages away (thin stripes, edges) shows there.
+        if (g_capture.log && g_capture.until - d.swaps > kCaptureFrames - 4) {
+            gfx::Image full = d.renderer->read_front_buffer_full();
+            for (size_t i = 0; i < full.rgba.size(); i += 4) {
+                for (int k = 0; k < 3; ++k) full.rgba[i + k] = d.gamma[k][full.rgba[i + k]];
+                full.rgba[i + 3] = 255;
+            }
+            gfx::write_png(g_capture.dir.string() + strf("/full_%05llu.png", (unsigned long long)n), full);
+        }
     }
     if (d.config.max_frames && n >= d.config.max_frames) {
         std::fflush(stderr);

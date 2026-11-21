@@ -221,6 +221,8 @@ public:
     // Reads a frame buffer back: the front buffer (the last frame presented)
     // or the back buffer as drawn so far.
     virtual Image read_front_buffer() = 0;
+    // The front buffer as rendered, at the render resolution (read_front_buffer gives it at the game's size).
+    virtual Image read_front_buffer_full() { return read_front_buffer(); }
     virtual Image read_back_buffer() = 0;
     // Frame buffer `index` (0 … back_buffers, as back_index and front_index
     // number them), read back or written from the CPU: on the Xbox they're

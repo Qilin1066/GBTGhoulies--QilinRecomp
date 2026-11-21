@@ -11,6 +11,11 @@ Each release is a git tag (`vX.Y.Z`) with a matching GitHub release. The version
 
 ## [Unreleased]
 
+## [0.43.4] - 2026-11-21
+
+### Added
+- **An F9 capture holds its first frames at the render resolution too** (`full_NNNNN.png`), not only reduced to the game's 640×480: thin stripes and edges the reduction averages away show there. The shadows' stripes on a GTX 1080 Ti didn't show in the reduced frames, and the larger depth offset in 0.43.3 didn't remove them.
+
 ## [0.43.3] - 2026-11-21
 
 ### Fixed

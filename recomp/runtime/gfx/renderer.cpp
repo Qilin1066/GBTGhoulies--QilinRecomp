@@ -170,6 +170,7 @@ public:
     void set_render_target(uint32_t id, uint32_t depth) override;
     bool pack_depth(uint32_t depth_target, uint32_t render_target) override;
     Image read_front_buffer() override { return read(color_[front_]); }
+    Image read_front_buffer_full() override { return read(color_[front_], true); }
     void present_again() override;
     bool acquire_early() override;
     void set_picture(const Picture& p) override {
@@ -271,7 +272,7 @@ private:
     VkShaderModule shader(uint64_t key, const std::vector<uint32_t>* code);
     VkPipeline pipeline(const DrawCmd& cmd);
     VkSampler sampler(const SamplerDesc& d);
-    Image read(Target& t);
+    Image read(Target& t, bool full = false);
     void write(Target& t, const Image& image);
 
     Config config_;
@@ -2031,7 +2032,7 @@ void VulkanRenderer::write(Target& t, const Image& im) {
     if (was_open) begin_pass();
 }
 
-Image VulkanRenderer::read(Target& t) {
+Image VulkanRenderer::read(Target& t, bool full) {
     // The read-back buffer, kept and grown to the largest image read.
     const VkDeviceSize bytes = VkDeviceSize(t.width) * t.height * 4;
     if (bytes > readback_size_) {
@@ -2067,8 +2068,19 @@ Image VulkanRenderer::read(Target& t) {
     submit();
     wait_idle();
 
-    // At the game's size: each pixel the average of the sx × sy it became.
     Image out;
+    if (full) {  // as rendered
+        out.width = t.width, out.height = t.height;
+        out.rgba.resize(size_t(out.width) * out.height * 4);
+        void* mapped = nullptr;
+        check(vkMapMemory(device_, readback_memory_, 0, bytes, 0, &mapped), "vkMapMemory");
+        const uint8_t* bgra = static_cast<const uint8_t*>(mapped);
+        for (size_t i = 0; i < size_t(t.width) * t.height; ++i)
+            out.rgba[i * 4] = bgra[i * 4 + 2], out.rgba[i * 4 + 1] = bgra[i * 4 + 1], out.rgba[i * 4 + 2] = bgra[i * 4], out.rgba[i * 4 + 3] = bgra[i * 4 + 3];
+        vkUnmapMemory(device_, readback_memory_);
+        return out;
+    }
+    // At the game's size: each pixel the average of the sx × sy it became.
     out.width = t.width / t.sx;
     out.height = t.height / t.sy;
     out.rgba.resize(size_t(out.width) * out.height * 4);
