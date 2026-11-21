@@ -25,6 +25,10 @@
 #endif
 #include <cmath>
 #include <cstdint>
+// ffx_a.h calls labs, fabs and fabsf unqualified: the C headers declare them
+// globally (macOS's libc++ doesn't, through <cmath> alone).
+#include <math.h>
+#include <stdlib.h>
 #define A_CPU 1
 #include "../../../../third_party/fsr1/ffx_a.h"
 #include "../../../../third_party/fsr1/ffx_fsr1.h"

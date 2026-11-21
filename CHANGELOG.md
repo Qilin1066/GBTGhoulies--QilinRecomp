@@ -11,6 +11,12 @@ Each release is a git tag (`vX.Y.Z`) with a matching GitHub release. The version
 
 ## [Unreleased]
 
+### Added
+- **Project licence: MIT** (`LICENSE`), as in the other QilinRecomp projects. The README's new Licence section lists what keeps its own licence (the vendored code and SDL3) and that the game is Microsoft's and Rare's.
+
+### Fixed
+- **The macOS (Apple Silicon) build failed** in `fsr_constants.cpp`: FSR 1's `ffx_a.h` calls `labs` unqualified, which macOS's libc++ doesn't declare through `<cmath>`. Include the C headers that declare it. `ffx_a.h` stays unmodified.
+
 ### Changed
 - **The settings menu is laid out as in the other QilinRecomp projects** (Punch-Out!!, Beat the Beat, APB): Close and Quit at the top right of every page (Quit was at the bottom of the Game page), the pages in the order Controls, Display, Game, the connected controllers listed on the Controls page, *Back to the defaults*, a line of the shortcut keys, sections headed Window, Picture and Graphics device, "Frame times (F3)", and an About section with the version and the settings file. The hint reads "F1 or Esc (controller: Back + Start): settings". No setting changed.
 

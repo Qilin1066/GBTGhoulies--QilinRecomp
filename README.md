@@ -108,6 +108,12 @@ This runs the unit tests and the CFG pass, then cross-checks Zydis against LLVM'
 | `third_party/` | Vendored dependencies: Zydis and Zycore (MIT), the Vulkan headers (Apache-2.0 or MIT), volk (MIT), nxdk's kernel export list (CC0). See `third_party/README.md` |
 | `docs/` | Design notes |
 
+## Licence
+
+This project's own code and documentation are under the [MIT licence](LICENSE), as in the other QilinRecomp projects. The vendored code in `third_party/` keeps its own licences, listed in `third_party/README.md`: Zydis and Zycore, Dear ImGui, FSR 1, SMAA, volk and XbSymbolDatabase (MIT), the Vulkan headers (Apache-2.0 or MIT) and nxdk's kernel export list (CC0-1.0). SDL3, fetched by CMake at build time, keeps its zlib licence.
+
+The game itself is Microsoft's and Rare's and is not covered by anything here: you need your own copy, and nothing built from it may be shared.
+
 ## Design targets (short version)
 
 - **Efficiency and reliability come first.** Every choice is judged by whether it makes the game cheaper to run on low-end hardware, and whether it fails loudly instead of misbehaving quietly.
