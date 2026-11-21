@@ -416,7 +416,25 @@ private:
         // The shape it was made with: update_texture takes texels of the same.
         uint32_t width = 0, height = 0, depth = 1, levels = 1, faces = 1;
         Blocks blocks = Blocks::None;
+        // Its memory when that's a piece of a shared block (texture_blocks_): the block's number plus one, and where.
+        uint32_t pooled = 0;
+        VkDeviceSize pool_offset = 0, pool_size = 0;
     };
+    // Textures' memory comes out of blocks of kPoolBlock bytes, shared out
+    // first-fit and merged back as textures go: an allocation from the
+    // driver for each texture took most of the 0.3-0.4 ms a new one cost on
+    // Windows, and a scene brings them in by the dozen in one frame. A
+    // texture too big for a share (over a quarter block), or when the
+    // device has no block left to give, gets memory of its own as before.
+    static constexpr VkDeviceSize kPoolBlock = VkDeviceSize(16) << 20;
+    struct PoolBlock {
+        VkDeviceMemory memory = VK_NULL_HANDLE;
+        uint32_t type = 0;
+        std::map<VkDeviceSize, VkDeviceSize> free;  // offset -> bytes
+    };
+    std::vector<PoolBlock> texture_blocks_;
+    bool pool_take(const VkMemoryRequirements& req, uint32_t type, Texture& t);
+    void free_texture_memory(const Texture& t);
     // The texels into the image through the ring (or a staging buffer of
     // their own when larger than half of it), between barriers: from
     // nothing for a new image, else after the draws that sampled it.
@@ -865,12 +883,15 @@ void VulkanRenderer::destroy() {
         auto drop_texture = [&](Texture& t) {
             if (t.view) vkDestroyImageView(device_, t.view, nullptr);
             if (t.image) vkDestroyImage(device_, t.image, nullptr);
-            if (t.memory) vkFreeMemory(device_, t.memory, nullptr);
+            if (!t.pooled && t.memory) vkFreeMemory(device_, t.memory, nullptr);
         };
         for (auto& [id, t] : textures_) drop_texture(t);
         for (Texture& t : dead_textures_) drop_texture(t);
         for (auto& [b, m] : staging_) vkDestroyBuffer(device_, b, nullptr), vkFreeMemory(device_, m, nullptr);
         for (uint32_t i = 0; i < kSlots; ++i) retire(i);
+        for (PoolBlock& b : texture_blocks_)
+            if (b.memory) vkFreeMemory(device_, b.memory, nullptr);
+        texture_blocks_.clear();
         save_pipeline_cache();
         if (pipeline_cache_) vkDestroyPipelineCache(device_, pipeline_cache_, nullptr);
         for (auto& [k, pl] : pipelines_) vkDestroyPipeline(device_, pl, nullptr);
@@ -2228,7 +2249,7 @@ void VulkanRenderer::retire(uint32_t i) {
     for (Texture& t : sl.dead) {
         vkDestroyImageView(device_, t.view, nullptr);
         vkDestroyImage(device_, t.image, nullptr);
-        vkFreeMemory(device_, t.memory, nullptr);
+        free_texture_memory(t);
     }
     sl.dead.clear();
     for (auto& [b, m] : sl.staging) vkDestroyBuffer(device_, b, nullptr), vkFreeMemory(device_, m, nullptr);
@@ -2598,6 +2619,65 @@ VkSampler VulkanRenderer::sampler(const SamplerDesc& wanted) {
     return s;
 }
 
+// A piece of a block for a texture's image: the first free range of a block
+// of its memory type that holds it at its alignment, a new block when none
+// does. False: it gets memory of its own.
+bool VulkanRenderer::pool_take(const VkMemoryRequirements& req, uint32_t type, Texture& t) {
+    if (req.size > kPoolBlock / 4 || req.size == 0) return false;
+    const VkDeviceSize align = std::max<VkDeviceSize>(req.alignment, 1);
+    auto carve = [&](uint32_t index) {
+        PoolBlock& b = texture_blocks_[index];
+        for (auto it = b.free.begin(); it != b.free.end(); ++it) {
+            const VkDeviceSize at = it->first, bytes = it->second, start = (at + align - 1) / align * align;
+            if (start + req.size > at + bytes) continue;
+            b.free.erase(it);
+            if (start > at) b.free[at] = start - at;
+            if (start + req.size < at + bytes) b.free[start + req.size] = at + bytes - (start + req.size);
+            t.pooled = index + 1, t.pool_offset = start, t.pool_size = req.size;
+            return true;
+        }
+        return false;
+    };
+    uint32_t spare = UINT32_MAX;
+    for (uint32_t k = 0; k < texture_blocks_.size(); ++k) {
+        if (!texture_blocks_[k].memory) spare = k;
+        else if (texture_blocks_[k].type == type && carve(k)) return true;
+    }
+    VkMemoryAllocateInfo alloc{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+    alloc.allocationSize = kPoolBlock;
+    alloc.memoryTypeIndex = type;
+    VkDeviceMemory memory = VK_NULL_HANDLE;
+    if (vkAllocateMemory(device_, &alloc, nullptr, &memory) != VK_SUCCESS) return false;
+    if (spare == UINT32_MAX) spare = uint32_t(texture_blocks_.size()), texture_blocks_.emplace_back();
+    texture_blocks_[spare].memory = memory, texture_blocks_[spare].type = type, texture_blocks_[spare].free = {{0, kPoolBlock}};
+    return carve(spare);
+}
+
+// A dead texture's memory: its piece back to its block (merged with the
+// free ranges beside it; a block left empty goes back to the device unless
+// it's the last of its type), or its own allocation freed.
+void VulkanRenderer::free_texture_memory(const Texture& t) {
+    if (!t.pooled) {
+        if (t.memory) vkFreeMemory(device_, t.memory, nullptr);
+        return;
+    }
+    PoolBlock& b = texture_blocks_[t.pooled - 1];
+    VkDeviceSize at = t.pool_offset, bytes = t.pool_size;
+    if (auto after = b.free.find(at + bytes); after != b.free.end()) bytes += after->second, b.free.erase(after);
+    if (auto before = b.free.lower_bound(at); before != b.free.begin()) {
+        --before;
+        if (before->first + before->second == at) at = before->first, bytes += before->second, b.free.erase(before);
+    }
+    b.free[at] = bytes;
+    if (bytes != kPoolBlock) return;
+    for (const PoolBlock& other : texture_blocks_)
+        if (&other != &b && other.memory && other.type == b.type) {
+            vkFreeMemory(device_, b.memory, nullptr);
+            b.memory = VK_NULL_HANDLE, b.free.clear();
+            return;
+        }
+}
+
 uint32_t VulkanRenderer::create_texture(const TextureData& t) {
     struct Timed {  // into costs_
         Costs& c;
@@ -2630,8 +2710,12 @@ uint32_t VulkanRenderer::create_texture(const TextureData& t) {
     VkMemoryAllocateInfo alloc{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
     alloc.allocationSize = req.size;
     alloc.memoryTypeIndex = memory_type(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-    check(vkAllocateMemory(device_, &alloc, nullptr, &tex.memory), "vkAllocateMemory");
-    check(vkBindImageMemory(device_, tex.image, tex.memory, 0), "vkBindImageMemory");
+    if (pool_take(req, alloc.memoryTypeIndex, tex)) {
+        check(vkBindImageMemory(device_, tex.image, texture_blocks_[tex.pooled - 1].memory, tex.pool_offset), "vkBindImageMemory");
+    } else {
+        check(vkAllocateMemory(device_, &alloc, nullptr, &tex.memory), "vkAllocateMemory");
+        check(vkBindImageMemory(device_, tex.image, tex.memory, 0), "vkBindImageMemory");
+    }
     VkImageViewCreateInfo view{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
     view.image = tex.image;
     view.viewType = t.faces == 6 ? VK_IMAGE_VIEW_TYPE_CUBE : t.dims() == 3 ? VK_IMAGE_VIEW_TYPE_3D : VK_IMAGE_VIEW_TYPE_2D;

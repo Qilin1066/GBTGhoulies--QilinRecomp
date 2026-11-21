@@ -13,7 +13,21 @@ constexpr uint32_t kCushionMs = 60;     // queued ahead of the device: two of th
 constexpr float kMaxTrim = 0.005f;      // the most the playback rate is trimmed by, either way
 }  // namespace
 
-bool AudioOut::start(uint32_t rate, uint32_t channels) {
+std::vector<std::string> AudioOut::playback_devices() {
+    std::vector<std::string> names;
+    const bool was_on = SDL_WasInit(SDL_INIT_AUDIO) != 0;
+    if (!was_on && !SDL_InitSubSystem(SDL_INIT_AUDIO)) return names;
+    int n = 0;
+    if (SDL_AudioDeviceID* ids = SDL_GetAudioPlaybackDevices(&n)) {
+        for (int i = 0; i < n; ++i)
+            if (const char* name = SDL_GetAudioDeviceName(ids[i])) names.emplace_back(name);
+        SDL_free(ids);
+    }
+    if (!was_on) SDL_QuitSubSystem(SDL_INIT_AUDIO);
+    return names;
+}
+
+bool AudioOut::start(uint32_t rate, uint32_t channels, const std::string& device) {
     if (stream_) return true;
     // A small device buffer (about 10 ms at 48 kHz): the cushion queued here
     // already covers the time between catch-ups, so a big one only adds delay.
@@ -22,17 +36,28 @@ bool AudioOut::start(uint32_t rate, uint32_t channels) {
         std::printf("qilin_run: no sound (SDL: %s)\n", SDL_GetError());
         return false;
     }
+    // The device asked for by name, else the system's default.
+    SDL_AudioDeviceID id = SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK;
+    if (!device.empty()) {
+        int n = 0;
+        SDL_AudioDeviceID* ids = SDL_GetAudioPlaybackDevices(&n);
+        for (int i = 0; ids && i < n; ++i)
+            if (const char* name = SDL_GetAudioDeviceName(ids[i]); name && device == name) id = ids[i];
+        SDL_free(ids);
+        if (id == SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK)
+            std::printf("qilin_run: the sound device in the settings (%s) isn't there; using the system's default\n", device.c_str());
+    }
     // 0 channels: the device's own layout, 5.1 where it has six or more
     // speakers (the Xbox's own mix), else stereo.
     if (channels == 0) {
         SDL_AudioSpec dev{};
-        channels = SDL_GetAudioDeviceFormat(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &dev, nullptr) && dev.channels >= 6 ? 6 : 2;
+        channels = SDL_GetAudioDeviceFormat(id, &dev, nullptr) && dev.channels >= 6 ? 6 : 2;
     }
     SDL_AudioSpec spec{};
     spec.format = SDL_AUDIO_F32;
     spec.channels = int(channels);
     spec.freq = int(rate);
-    stream_ = SDL_OpenAudioDeviceStream(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &spec, nullptr, nullptr);
+    stream_ = SDL_OpenAudioDeviceStream(id, &spec, nullptr, nullptr);
     if (!stream_) {
         std::printf("qilin_run: no sound (can't open the playback device: %s)\n", SDL_GetError());
         SDL_QuitSubSystem(SDL_INIT_AUDIO);
@@ -44,7 +69,8 @@ bool AudioOut::start(uint32_t rate, uint32_t channels) {
     SDL_PutAudioStreamData(stream_, silence.data(), int(silence.size() * sizeof(float)));
     SDL_ResumeAudioStreamDevice(stream_);
     const char* name = SDL_GetAudioDeviceName(SDL_GetAudioStreamDevice(stream_));
-    std::printf("qilin_run: sound: %u Hz, %u channels, to %s\n", rate, channels, name ? name : "the default device");
+    std::printf("qilin_run: sound: %u Hz, %u channels, to %s%s\n", rate, channels, name ? name : "the default device",
+                id == SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK ? " (the system's default: followed if it changes)" : " (as the settings say)");
     return true;
 }
 

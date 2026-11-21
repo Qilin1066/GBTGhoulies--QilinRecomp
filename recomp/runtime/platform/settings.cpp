@@ -171,7 +171,10 @@ std::string settings_text(const Settings& s) {
          "# 0-100.\n"
          "volume = " << s.volume << "\n"
          "# 0: the device's own (5.1 where it has six speakers), 2: stereo, 6: 5.1. From the next start.\n"
-         "channels = " << s.channels << "\n\n";
+         "channels = " << s.channels << "\n"
+         "# The playback device, by its name as the settings menu lists it; empty: the\n"
+         "# system's default, followed when that changes. From the next start.\n"
+         "device = " << s.sound_device << "\n\n";
     o << "[console]\n"
          "# The Xbox's language, which the game uses: 1 English, 3 German, 4 French,\n"
          "# 5 Spanish, 6 Italian. From the next start.\n"
@@ -256,6 +259,8 @@ Settings parse_settings(const std::string& text, std::vector<std::string>& warni
                 uint32_t ch = 0;
                 ok = read_uint(v, 0, 6, &ch) && (ch == 0 || ch == 2 || ch == 6);
                 if (ok) s.channels = ch;
+            } else if (key == "device") {
+                s.sound_device = v;
             }
             else ok = false;
         } else if (section == "console") {

@@ -27,6 +27,15 @@
 #include <cstdint>
 #include <cstring>
 
+// The host's vector instructions for MMX's operations (mmx, below).
+#if defined(__x86_64__) || defined(_M_X64)
+#define QILIN_MMX_SSE2 1
+#include <emmintrin.h>
+#elif defined(__aarch64__) || defined(_M_ARM64)
+#define QILIN_MMX_NEON 1
+#include <arm_neon.h>
+#endif
+
 #include "x87_math.hpp"
 
 // ---- Floating point must be bit-exact IEEE single/double: no contraction into
@@ -112,7 +121,14 @@ void mmio_write32(uint32_t addr, uint32_t value, uint32_t at);
 uint64_t rdtsc(uint32_t at);
 
 // ---- MMX: 64-bit registers as 8, 4 or 2 lanes, each operation as the CPU's.
+// mmx::scalar is the definition, lane by lane in plain C++. On x86-64 and
+// ARM64 the operations lifted code calls (mmx::paddw and the rest) are the
+// host's own vector instructions for them (SSE2's on the low half of a
+// register; NEON's 64-bit vectors), which give the same bits: the tests
+// check each against the definition. The game's video decoder (Bink)
+// converts every frame's colours with these, a few million a frame.
 namespace mmx {
+namespace scalar {
 template <typename L, typename F>
 inline uint64_t lanes(uint64_t a, uint64_t b, F f) {
     constexpr int bits = int(sizeof(L) * 8);
@@ -180,8 +196,8 @@ inline uint64_t packuswb(uint64_t a, uint64_t b) {
 // pmaddwd: each pair of signed 16-bit products summed into a 32-bit lane.
 inline uint64_t pmaddwd(uint64_t a, uint64_t b) {
     auto w = [](uint64_t v, int k) { return int32_t(int16_t(uint16_t(v >> (16 * k)))); };
-    const uint32_t lo = uint32_t(w(a, 0) * w(b, 0) + w(a, 1) * w(b, 1));
-    const uint32_t hi = uint32_t(w(a, 2) * w(b, 2) + w(a, 3) * w(b, 3));
+    const uint32_t lo = uint32_t(w(a, 0) * w(b, 0)) + uint32_t(w(a, 1) * w(b, 1));  // unsigned: 0x8000 * 0x8000 twice wraps, as the CPU's
+    const uint32_t hi = uint32_t(w(a, 2) * w(b, 2)) + uint32_t(w(a, 3) * w(b, 3));
     return uint64_t(lo) | uint64_t(hi) << 32;
 }
 // Arithmetic shifts: past the lane's width, every bit the sign.
@@ -204,6 +220,150 @@ inline uint64_t unpack(uint64_t a, uint64_t b, bool high) {
     }
     return r;
 }
+}  // namespace scalar
+
+#if defined(QILIN_MMX_SSE2)
+namespace simd {
+inline __m128i v(uint64_t a) { return _mm_cvtsi64_si128(static_cast<long long>(a)); }
+inline uint64_t u(__m128i x) { return uint64_t(_mm_cvtsi128_si64(x)); }
+inline __m128i count(uint64_t n) { return _mm_cvtsi32_si128(int(n)); }
+}  // namespace simd
+inline uint64_t paddw(uint64_t a, uint64_t b) { return simd::u(_mm_add_epi16(simd::v(a), simd::v(b))); }
+inline uint64_t paddsw(uint64_t a, uint64_t b) { return simd::u(_mm_adds_epi16(simd::v(a), simd::v(b))); }
+inline uint64_t psubusw(uint64_t a, uint64_t b) { return simd::u(_mm_subs_epu16(simd::v(a), simd::v(b))); }
+inline uint64_t psubsw(uint64_t a, uint64_t b) { return simd::u(_mm_subs_epi16(simd::v(a), simd::v(b))); }
+inline uint64_t pmullw(uint64_t a, uint64_t b) { return simd::u(_mm_mullo_epi16(simd::v(a), simd::v(b))); }
+inline uint64_t pmulhw(uint64_t a, uint64_t b) { return simd::u(_mm_mulhi_epi16(simd::v(a), simd::v(b))); }
+inline uint64_t pmaddwd(uint64_t a, uint64_t b) { return simd::u(_mm_madd_epi16(simd::v(a), simd::v(b))); }
+template <typename L>
+inline uint64_t shl(uint64_t a, uint64_t n) {
+    if (n >= sizeof(L) * 8) return 0;
+    if constexpr (sizeof(L) == 2) return simd::u(_mm_sll_epi16(simd::v(a), simd::count(n)));
+    else if constexpr (sizeof(L) == 4) return simd::u(_mm_sll_epi32(simd::v(a), simd::count(n)));
+    else if constexpr (sizeof(L) == 8) return a << n;
+    else return scalar::shl<L>(a, n);
+}
+template <typename L>
+inline uint64_t shr(uint64_t a, uint64_t n) {
+    if (n >= sizeof(L) * 8) return 0;
+    if constexpr (sizeof(L) == 2) return simd::u(_mm_srl_epi16(simd::v(a), simd::count(n)));
+    else if constexpr (sizeof(L) == 4) return simd::u(_mm_srl_epi32(simd::v(a), simd::count(n)));
+    else if constexpr (sizeof(L) == 8) return a >> n;
+    else return scalar::shr<L>(a, n);
+}
+template <typename L>
+inline uint64_t sar(uint64_t a, uint64_t n) {
+    const uint64_t k = n >= sizeof(L) * 8 ? sizeof(L) * 8 - 1 : n;
+    if constexpr (sizeof(L) == 2) return simd::u(_mm_sra_epi16(simd::v(a), simd::count(k)));
+    else if constexpr (sizeof(L) == 4) return simd::u(_mm_sra_epi32(simd::v(a), simd::count(k)));
+    else return scalar::sar<L>(a, n);
+}
+template <typename L>
+inline uint64_t add(uint64_t a, uint64_t b) {
+    if constexpr (sizeof(L) == 1) return simd::u(_mm_add_epi8(simd::v(a), simd::v(b)));
+    else if constexpr (sizeof(L) == 2) return simd::u(_mm_add_epi16(simd::v(a), simd::v(b)));
+    else if constexpr (sizeof(L) == 4) return simd::u(_mm_add_epi32(simd::v(a), simd::v(b)));
+    else return a + b;
+}
+template <typename L>
+inline uint64_t sub(uint64_t a, uint64_t b) {
+    if constexpr (sizeof(L) == 1) return simd::u(_mm_sub_epi8(simd::v(a), simd::v(b)));
+    else if constexpr (sizeof(L) == 2) return simd::u(_mm_sub_epi16(simd::v(a), simd::v(b)));
+    else if constexpr (sizeof(L) == 4) return simd::u(_mm_sub_epi32(simd::v(a), simd::v(b)));
+    else return a - b;
+}
+// The packs: a's lanes then b's, side by side in one register, packed with itself.
+inline uint64_t packssdw(uint64_t a, uint64_t b) {
+    const __m128i x = _mm_unpacklo_epi64(simd::v(a), simd::v(b));
+    return simd::u(_mm_packs_epi32(x, x));
+}
+inline uint64_t packsswb(uint64_t a, uint64_t b) {
+    const __m128i x = _mm_unpacklo_epi64(simd::v(a), simd::v(b));
+    return simd::u(_mm_packs_epi16(x, x));
+}
+inline uint64_t packuswb(uint64_t a, uint64_t b) {
+    const __m128i x = _mm_unpacklo_epi64(simd::v(a), simd::v(b));
+    return simd::u(_mm_packus_epi16(x, x));
+}
+// The unpacks: SSE2's low unpack of the two holds MMX's low unpack in its low half and its high one above.
+template <typename L>
+inline uint64_t unpack(uint64_t a, uint64_t b, bool high) {
+    __m128i x;
+    if constexpr (sizeof(L) == 1) x = _mm_unpacklo_epi8(simd::v(a), simd::v(b));
+    else if constexpr (sizeof(L) == 2) x = _mm_unpacklo_epi16(simd::v(a), simd::v(b));
+    else if constexpr (sizeof(L) == 4) x = _mm_unpacklo_epi32(simd::v(a), simd::v(b));
+    else return scalar::unpack<L>(a, b, high);
+    return simd::u(high ? _mm_srli_si128(x, 8) : x);
+}
+#elif defined(QILIN_MMX_NEON)
+namespace simd {
+inline uint64_t u(uint16x4_t x) { return vget_lane_u64(vreinterpret_u64_u16(x), 0); }
+inline uint64_t u(int16x4_t x) { return vget_lane_u64(vreinterpret_u64_s16(x), 0); }
+inline uint64_t u(uint32x2_t x) { return vget_lane_u64(vreinterpret_u64_u32(x), 0); }
+inline uint64_t u(int32x2_t x) { return vget_lane_u64(vreinterpret_u64_s32(x), 0); }
+inline uint64_t u(uint8x8_t x) { return vget_lane_u64(vreinterpret_u64_u8(x), 0); }
+inline uint64_t u(int8x8_t x) { return vget_lane_u64(vreinterpret_u64_s8(x), 0); }
+}  // namespace simd
+inline uint64_t paddw(uint64_t a, uint64_t b) { return simd::u(vadd_u16(vcreate_u16(a), vcreate_u16(b))); }
+inline uint64_t paddsw(uint64_t a, uint64_t b) { return simd::u(vqadd_s16(vcreate_s16(a), vcreate_s16(b))); }
+inline uint64_t psubusw(uint64_t a, uint64_t b) { return simd::u(vqsub_u16(vcreate_u16(a), vcreate_u16(b))); }
+inline uint64_t psubsw(uint64_t a, uint64_t b) { return simd::u(vqsub_s16(vcreate_s16(a), vcreate_s16(b))); }
+inline uint64_t pmullw(uint64_t a, uint64_t b) { return simd::u(vmul_u16(vcreate_u16(a), vcreate_u16(b))); }
+inline uint64_t pmulhw(uint64_t a, uint64_t b) { return simd::u(vshrn_n_s32(vmull_s16(vcreate_s16(a), vcreate_s16(b)), 16)); }
+inline uint64_t pmaddwd(uint64_t a, uint64_t b) {
+    const int32x4_t p = vmull_s16(vcreate_s16(a), vcreate_s16(b));
+    return simd::u(vpadd_s32(vget_low_s32(p), vget_high_s32(p)));
+}
+template <typename L>
+inline uint64_t shl(uint64_t a, uint64_t n) {
+    if (n >= sizeof(L) * 8) return 0;
+    if constexpr (sizeof(L) == 2) return simd::u(vshl_u16(vcreate_u16(a), vdup_n_s16(int16_t(n))));
+    else if constexpr (sizeof(L) == 4) return simd::u(vshl_u32(vcreate_u32(a), vdup_n_s32(int32_t(n))));
+    else if constexpr (sizeof(L) == 8) return a << n;
+    else return scalar::shl<L>(a, n);
+}
+template <typename L>
+inline uint64_t shr(uint64_t a, uint64_t n) {
+    if (n >= sizeof(L) * 8) return 0;
+    if constexpr (sizeof(L) == 2) return simd::u(vshl_u16(vcreate_u16(a), vdup_n_s16(int16_t(-int(n)))));
+    else if constexpr (sizeof(L) == 4) return simd::u(vshl_u32(vcreate_u32(a), vdup_n_s32(-int32_t(n))));
+    else if constexpr (sizeof(L) == 8) return a >> n;
+    else return scalar::shr<L>(a, n);
+}
+template <typename L>
+inline uint64_t sar(uint64_t a, uint64_t n) {
+    const int k = n >= sizeof(L) * 8 ? int(sizeof(L) * 8 - 1) : int(n);
+    if constexpr (sizeof(L) == 2) return simd::u(vshl_s16(vcreate_s16(a), vdup_n_s16(int16_t(-k))));
+    else if constexpr (sizeof(L) == 4) return simd::u(vshl_s32(vcreate_s32(a), vdup_n_s32(-k)));
+    else return scalar::sar<L>(a, n);
+}
+template <typename L>
+inline uint64_t add(uint64_t a, uint64_t b) {
+    if constexpr (sizeof(L) == 1) return simd::u(vadd_u8(vcreate_u8(a), vcreate_u8(b)));
+    else if constexpr (sizeof(L) == 2) return simd::u(vadd_u16(vcreate_u16(a), vcreate_u16(b)));
+    else if constexpr (sizeof(L) == 4) return simd::u(vadd_u32(vcreate_u32(a), vcreate_u32(b)));
+    else return a + b;
+}
+template <typename L>
+inline uint64_t sub(uint64_t a, uint64_t b) {
+    if constexpr (sizeof(L) == 1) return simd::u(vsub_u8(vcreate_u8(a), vcreate_u8(b)));
+    else if constexpr (sizeof(L) == 2) return simd::u(vsub_u16(vcreate_u16(a), vcreate_u16(b)));
+    else if constexpr (sizeof(L) == 4) return simd::u(vsub_u32(vcreate_u32(a), vcreate_u32(b)));
+    else return a - b;
+}
+inline uint64_t packssdw(uint64_t a, uint64_t b) { return simd::u(vqmovn_s32(vcombine_s32(vcreate_s32(a), vcreate_s32(b)))); }
+inline uint64_t packsswb(uint64_t a, uint64_t b) { return simd::u(vqmovn_s16(vcombine_s16(vcreate_s16(a), vcreate_s16(b)))); }
+inline uint64_t packuswb(uint64_t a, uint64_t b) { return simd::u(vqmovun_s16(vcombine_s16(vcreate_s16(a), vcreate_s16(b)))); }
+template <typename L>
+inline uint64_t unpack(uint64_t a, uint64_t b, bool high) {
+    if constexpr (sizeof(L) == 1) return simd::u(high ? vzip2_u8(vcreate_u8(a), vcreate_u8(b)) : vzip1_u8(vcreate_u8(a), vcreate_u8(b)));
+    else if constexpr (sizeof(L) == 2) return simd::u(high ? vzip2_u16(vcreate_u16(a), vcreate_u16(b)) : vzip1_u16(vcreate_u16(a), vcreate_u16(b)));
+    else if constexpr (sizeof(L) == 4) return simd::u(high ? vzip2_u32(vcreate_u32(a), vcreate_u32(b)) : vzip1_u32(vcreate_u32(a), vcreate_u32(b)));
+    else return scalar::unpack<L>(a, b, high);
+}
+#else
+using namespace scalar;
+#endif
 }  // namespace mmx
 
 #if defined(QILIN_TRACE_WRITES)

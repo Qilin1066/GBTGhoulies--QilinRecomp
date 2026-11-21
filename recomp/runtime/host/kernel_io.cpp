@@ -12,6 +12,7 @@
 // information classes), and I/O completes synchronously. Anything the game
 // asks for that isn't modelled yet (an APC routine, an event handle, an
 // information class) stops the runtime with its name.
+#include <thread>
 #include <atomic>
 #include <set>
 #include <algorithm>
@@ -188,6 +189,7 @@ struct Handle {
     std::unique_ptr<std::fstream> file;
     uint64_t position = 0;
     bool writable = false, delete_on_close = false;
+    std::optional<uint64_t> fixed_size;  // a file that can't change (the disc's): its size, asked once
     bool formatting = false;  // a raw partition handle that has written a FATX volume header
     std::vector<fs::directory_entry> entries;  // directory enumeration, filled on first query
     size_t cursor = 0;
@@ -496,15 +498,24 @@ void transfer(rt::Context& c, bool write, const char* fn) {
         done = *h->file ? len : 0;
         if (!*h->file) status = kAccessDenied;
     } else {
-        const uint64_t size = host_size(h->host);
+        // The disc's files don't change: their size is asked of the host once
+        // (it was two calls to the file system at every read).
+        if (!h->writable && !h->fixed_size) h->fixed_size = host_size(h->host);
+        const uint64_t size = h->fixed_size ? *h->fixed_size : host_size(h->host);
         if (off >= size && len) {
             status = kEndOfFile;
         } else {
+            const auto io0 = std::chrono::steady_clock::now();
             h->file->clear();
             h->file->seekg(std::streamoff(off));
-            const auto io0 = std::chrono::steady_clock::now();
             h->file->read(reinterpret_cast<char*>(c.mem + buf), len);
-            g_io_ns += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - io0).count());
+            const uint64_t ns = uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - io0).count());
+            g_io_ns += ns;
+            // Reads over 3 ms are logged (the first 300): a stutter while a scene loads is often the disk.
+            static uint32_t slow = 0;
+            if (ns > 3'000'000 && slow < 300)
+                ++slow, std::fprintf(stderr, "qilin: reading %u bytes at %llu of %s took %.1f ms\n", len, (unsigned long long)off,
+                                     h->host.filename().string().c_str(), double(ns) / 1e6);
             done = uint32_t(h->file->gcount());
         }
     }
@@ -937,7 +948,32 @@ constexpr IoFn kIo[] = {
 
 }  // namespace
 
+// The disc's files read through once, in the background, as the game
+// starts: the system then has them in memory, and the game's own reads
+// (which it makes on the thread that draws) don't wait for the disk. On a
+// hard disk that wait is 15-20 ms a read, three dropped frames at 144 Hz.
+void warm_disc(fs::path disc) {
+    std::thread([disc = std::move(disc)] {
+        const auto t0 = std::chrono::steady_clock::now();
+        std::vector<char> block(1 << 20);
+        uint64_t total = 0;
+        std::error_code ec;
+        std::vector<fs::path> files;
+        for (auto it = fs::recursive_directory_iterator(disc, fs::directory_options::skip_permission_denied, ec); !ec && it != fs::recursive_directory_iterator();
+             it.increment(ec))
+            if (it->is_regular_file(ec)) files.push_back(it->path());
+        std::ranges::sort(files);
+        for (const fs::path& f : files) {
+            std::ifstream in(f, std::ios::binary);
+            while (in.read(block.data(), std::streamsize(block.size())) || in.gcount() > 0) total += uint64_t(in.gcount());
+        }
+        std::fprintf(stderr, "qilin: the disc's %zu files (%.0f MB) read into the system's memory in %.1f s\n", files.size(), double(total) / 1e6,
+                     std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+    }).detach();
+}
+
 void register_kernel_io(const IoConfig& cfg) {
+    if (cfg.warm_disc) warm_disc(cfg.disc);
     devices().clear();
     links().clear();
     handles().clear();

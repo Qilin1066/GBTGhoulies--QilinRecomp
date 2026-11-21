@@ -10,6 +10,8 @@
 #pragma once
 
 #include <cstdint>
+#include <string>
+#include <vector>
 
 struct SDL_AudioStream;
 
@@ -22,7 +24,13 @@ public:
     // right), or 0 for the device's own (6 where it has that many). False
     // (with a message printed) where there's no sound device; the game then
     // runs silent.
-    bool start(uint32_t rate, uint32_t channels);
+    // `device` names a playback device (as playback_devices lists them) to
+    // use whatever the system's default is; empty, or a name not found (a
+    // message says so), is the default device, which SDL follows when the
+    // system's changes.
+    bool start(uint32_t rate, uint32_t channels, const std::string& device = {});
+    // The playback devices' names, for the settings menu.
+    static std::vector<std::string> playback_devices();
     ~AudioOut();
 
     // Interleaved float frames, in the channel order given to start().

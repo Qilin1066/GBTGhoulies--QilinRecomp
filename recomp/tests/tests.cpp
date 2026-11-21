@@ -601,9 +601,10 @@ int main() {
             CHECK(r->contains("rt::set_lo16(esi, r);"));
             CHECK(r->contains("const uint32_t n0 = 5u;") && r->contains("n ? ((a << n) | (a >> (32 - n))) : a"));  // rol
             CHECK(r->contains("const uint32_t n0 = (ecx & 31u);") && r->contains("n ? ((a >> n) | (a << (32 - n))) : a"));  // ror
-            CHECK(r->contains("c.mm[0] = rt::ld64(m, uint32_t(esi), 0x120A9u);"));
+            CHECK(r->contains("mm0 = rt::ld64(m, uint32_t(esi), 0x120A9u);"));
+            CHECK(r->contains("    uint64_t mm0 = c.mm[0]") && r->contains(" c.mm[0] = mm0;"));  // a local, stored at the exits
             CHECK(r->contains("ftop = 0u; ftag = 0xFFu;") && r->contains("ftag = 0u;"));  // MMX takes the x87 stack; emms frees it
-            CHECK(r->contains("rt::st64(m, uint32_t(edi), c.mm[0], 0x120AFu);"));
+            CHECK(r->contains("rt::st64(m, uint32_t(edi), mm0, 0x120AFu);"));
             CHECK(r->contains("rt::st128(m, uint32_t(edi), xmm0, true, 0x120B4u);"));  // movntps: aligned, as movaps
             CHECK(r->contains("eax = rt::mmio_read32(0xFE80200Cu, 0x120B7u);"));
         }

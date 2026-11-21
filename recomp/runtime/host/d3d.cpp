@@ -325,6 +325,8 @@ void run_vblanks(rt::Context& c, Device& d, uint32_t until, bool swap_done) {
     }
 }
 
+bool g_capture_holds_step = false;  // a capture is being made, or its last frame has just been
+
 // The game's frame clock at 0xFC030 (its per-frame function's first call):
 // the time step in seconds (0x5096C0) and the 300 Hz ticks it makes (count
 // 0x5096C4, carry 0x5096C8), as the original computes them: the vblanks
@@ -366,6 +368,12 @@ void frame_clock(rt::Context& c) {
         }();
         static const auto started = now;
         if (fixed.first > 0 && std::chrono::duration<float>(now - started).count() >= fixed.second) step = fixed.first;
+        // A capture's frames take far longer than the game's (each is read
+        // back and written out): they get the step the game had before it, so
+        // the capture shows what the game draws at the player's frame rate.
+        static float before_capture = 0.0f;
+        if (g_capture_holds_step && before_capture > 0) step = before_capture;
+        else before_capture = step;
     } else {
         // fild of the count (unsigned: 2^32 added to a negative one, 0x32B144), over the rate.
         const uint32_t vblanks = rt::ld32(m, 0x5096D0, 0);
@@ -925,7 +933,7 @@ void long_frames(Device& d, std::chrono::steady_clock::time_point present_from) 
         auto ms = [](auto t) { return std::chrono::duration<double, std::milli>(t).count(); };
         const double total = ms(now - d.frame_began);
         const bool dropped = usual > 0 && total > 10 && total > usual * 2.5 && this_second < 40 && logged < 2000;
-        if (total > 50 || dropped) {
+        if ((total > 50 && total > usual * 1.5) || dropped) {
             ++logged, ++this_second;
             std::fprintf(stderr,
                          "qilin: frame %u took %.1f ms (usually %.1f): the game %.1f ms (reading files %.1f ms; %u pipelines made for draws, %.1f "
@@ -1011,6 +1019,9 @@ void test_run(Device& d) {
 
 // A capture begins at the Swap after F9 and ends kCaptureFrames later.
 void capture_step(rt::Context& c, Device& d) {
+    // The frame after a capture's last still spans the time it took to pack.
+    static bool g_capture_ended = false;
+    if (std::exchange(g_capture_ended, false)) g_capture_holds_step = false;
     if (g_capture.log && d.swaps >= g_capture.until) {
         std::fclose(g_capture.log);
         g_capture.log = nullptr;
@@ -1020,6 +1031,7 @@ void capture_step(rt::Context& c, Device& d) {
         std::fflush(stdout);
         if (d.menu) d.menu->banner("Captured " + std::to_string(kCaptureFrames) + " frames to " + where);
         d.frame_began = {};  // its frames aren't long frames
+        g_capture_ended = true;
     } else if (g_capture.log) {
         std::fprintf(g_capture.log, "swap %u: time step %.5f s\n", d.swaps, double(std::bit_cast<float>(ld(c, 0x5096C0))));
     } else if ((d.menu && d.menu->take_capture()) || std::exchange(g_capture_wanted, false)) {
@@ -1035,6 +1047,7 @@ void capture_step(rt::Context& c, Device& d) {
             return;
         }
         g_capture.until = d.swaps + kCaptureFrames;
+        g_capture_holds_step = true;
         g_capture.version.clear(), g_capture.dumped.clear(), g_capture.files = 0;
         const platform::Settings& s = *d.config.settings;
         std::fprintf(g_capture.log,

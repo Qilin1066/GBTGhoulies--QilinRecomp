@@ -315,14 +315,22 @@ int main(int argc, char** argv) {
     std::unique_ptr<platform::AudioOut> sound;
     if (!headless && !mute) {
         sound = std::make_unique<platform::AudioOut>();
-        if (!sound->start(audio::kOutputRate, audio_channels)) sound.reset();
+        if (!sound->start(audio::kOutputRate, audio_channels, settings.sound_device)) sound.reset();
     }
     host::set_audio_surround(sound && sound->channels() == 6);
     host::register_dsound(dump_audio, sound.get());
     host::register_kernel();
     const std::filesystem::path disc = game_dir ? std::filesystem::path(game_dir) : std::filesystem::path(path).parent_path();
-    const std::filesystem::path data = data_dir ? std::filesystem::path(data_dir) : default_data_dir();
-    host::register_kernel_io({disc.empty() ? std::filesystem::path(".") : disc, data});
+    std::filesystem::path data = data_dir ? std::filesystem::path(data_dir) : default_data_dir();
+    // A test run (selftest.txt, which the Direct3D side plays) gets a hard
+    // disk of its own, empty each time: the player's saves aren't touched,
+    // and the run starts the same way every time.
+    if (std::error_code ec; std::filesystem::exists(data / "selftest.txt", ec)) {
+        data /= "selftest-disk";
+        std::filesystem::remove_all(data, ec);
+        std::filesystem::create_directories(data, ec);
+    }
+    host::register_kernel_io({disc.empty() ? std::filesystem::path(".") : disc, data, !headless});
     std::printf("qilin_run: disc %s, hard disk %s\n", disc.string().c_str(), data.string().c_str());
 
     // The main thread: its information block (fs:[0] = end of the exception

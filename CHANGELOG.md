@@ -11,6 +11,21 @@ Each release is a git tag (`vX.Y.Z`) with a matching GitHub release. The version
 
 ## [Unreleased]
 
+## [0.43.0] - 2026-11-21
+
+### Added
+- **A sound device setting** (the F1 menu's Game page, `device` under `[sound]`): the playback device by name, from the next start. Left at the system's default, the game follows whatever Windows makes the default while it runs, which a streaming app, a headset or a monitor can take over (on the PC this was looked at on, the default at the game's start was the monitor's speakers, with a USB interface, a VR headset and a streaming app's device beside it). The log says which device was opened and whether it was the default or the one in the settings.
+- **The disc read into memory as the game starts**, in the background: the game reads its data on the thread that draws, 128 KB at a time, and on a hard disk a read that has to seek took 15-22 ms, three dropped frames at 144 Hz each time a scene's data came in. After the first seconds the reads come from the system's file cache. A read over 3 ms is logged with its file, offset and time (the first 300).
+
+### Changed
+- **The game's video decoder (Bink) runs three times as fast**: its colour conversion is MMX code, which lifted code ran one 16-bit lane at a time with each register loaded from and stored to memory around every operation. MMX registers are now locals of the lifted function, as the others are, and each MMX operation is the host's own vector instruction for it (SSE2 on x86-64, NEON's 64-bit vectors on ARM64; the lane-by-lane versions stay as the definition, and where neither exists). During a video the decoder took half of the game thread's time and now takes a quarter (measured on the software renderer's machine: the conversion itself is 6.5 times as fast). It runs for the logos and through the story's pages, where a slow video frame was a dropped display frame at a high refresh rate. The 25 functions that use MMX pass the differential test against the original code, and the vector operations are checked against their definitions on x86-64 and on ARM64 (emulated). The lifted code is recompiled the first time this version is started.
+- **Memory the game hands back is kept for it**: the game's heap decommits and commits megabytes as scenes change, and each page handed back to the system came back as a fresh one, with a fault and a zeroing as the game first touched it, in the frame that loads the scene (50 ms of one, measured). Up to 64 MB of decommitted pages now stay with the process, inaccessible until committed again (a stray access still faults) and cleared then as before.
+- **Textures' memory comes out of shared blocks** (16 MB each, first fit) rather than one allocation from the driver per texture, which took most of the 0.3-0.4 ms a new texture cost on Windows: a scene brings in dozens in one frame (35 in 14 ms as the first fight began).
+- **A capture holds the game's time step**: its frames take far longer than the game's (each is read back and written out), so the game moved a twelfth of a second between them and the capture didn't show what it draws at the player's frame rate. The step the game had before the capture is now kept through it.
+- **A test run uses a hard disk of its own** (`selftest-disk` in the settings folder, emptied each time), so it starts a new game the same way every time and the player's saves aren't touched.
+- A disc file's size is asked of the system once, not at every read.
+- The long-frame log leaves out frames over 50 ms on a machine where that's the usual.
+
 ## [0.42.2] - 2026-11-21
 
 ### Fixed

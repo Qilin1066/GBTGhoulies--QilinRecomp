@@ -1,3 +1,4 @@
+#include "audio_out.hpp"
 #include "menu.hpp"
 
 #include <SDL3/SDL.h>
@@ -476,6 +477,16 @@ void Menu::game_page() {
     static const char* kChannels[] = {"The device's own (5.1 where it has six speakers)", "Stereo", "5.1"};
     int channels = s_.channels == 2 ? 1 : s_.channels == 6 ? 2 : 0;
     if (ImGui::Combo("Sound output (from the next start)", &channels, kChannels, 3)) s_.channels = channels == 1 ? 2 : channels == 2 ? 6 : 0;
+    // The playback device: the system's default (followed when it changes:
+    // a controller with a headset socket, a streaming app or a monitor can
+    // take the default over while the game runs), or one by name.
+    static const std::vector<std::string> devices = platform::AudioOut::playback_devices();
+    if (ImGui::BeginCombo("Sound device (from the next start)", s_.sound_device.empty() ? "The system's default" : s_.sound_device.c_str())) {
+        if (ImGui::Selectable("The system's default", s_.sound_device.empty())) s_.sound_device.clear(), changed();
+        for (const std::string& name : devices)
+            if (ImGui::Selectable(name.c_str(), s_.sound_device == name)) s_.sound_device = name, changed();
+        ImGui::EndCombo();
+    }
     const char* current = "English";
     for (const Language& l : kLanguages)
         if (l.value == s_.language) current = l.name;

@@ -145,6 +145,32 @@ int main() {
             CHECK(g[rt::kRamCachedAlias + 0x1234] == 0x5A && g[rt::kRamWriteCombinedAlias + 0x1234] == 0x5A);
             g[rt::kRamWriteCombinedAlias + 0xFFFF0] = 0xA5;
             CHECK(g[0xFFFF0] == 0xA5);
+            // The virtual memory above RAM, on the host's pages: committed
+            // pages read zero, and again after a decommit (whose pages the
+            // host side keeps, to give out again), a release, and a
+            // commit across pages kept and pages never used.
+            host::VirtualMemory hv;
+            hv.init(g, 0x100000, 0x400000, true);
+            const uint32_t a = hv.reserve(0, 0x40000, 4, false);
+            CHECK(a == 0x100000 && hv.commit(a, 0x8000, 4));
+            bool zero = true;
+            for (uint32_t k = 0; k < 0x8000; ++k) zero = zero && g[a + k] == 0;
+            CHECK(zero);
+            std::memset(g + a, 0xEE, 0x8000);
+            CHECK(hv.decommit(a + 0x2000, 0x4000) && g[a + 0x1FFF] == 0xEE && g[a + 0x6000] == 0xEE);
+            CHECK(hv.commit(a + 0x1000, 0x20000, 4));  // some still committed, some kept, most new
+            zero = g[a + 0x1000] == 0xEE && g[a + 0x7FFF] == 0xEE;
+            for (uint32_t k = 0x2000; k < 0x6000; ++k) zero = zero && g[a + k] == 0;
+            for (uint32_t k = 0x8000; k < 0x21000; ++k) zero = zero && g[a + k] == 0;
+            CHECK(zero);
+            std::memset(g + a, 0xDD, 0x21000);
+            CHECK(hv.release(a));
+            const uint32_t b = hv.reserve(0, 0x40000, 4, false);
+            CHECK(b == a && hv.commit(b, 0x40000, 4));
+            zero = true;
+            for (uint32_t k = 0; k < 0x40000; ++k) zero = zero && g[b + k] == 0;
+            CHECK(zero);
+            CHECK(hv.release(b));
         } else {
             std::fprintf(stderr, "map_guest_ram: %s\n", error.c_str());
         }
@@ -280,6 +306,50 @@ int main() {
         CHECK(mmx::packuswb(0x0100'FFFF'007F'0080ull, 0) == 0x00000000'FF00'7F80ull);
         CHECK(mmx::pmaddwd(0x0002'0003'FFFF'0004ull, 0x0005'0006'0007'0008ull) == (uint64_t(2 * 5 + 3 * 6) << 32 | uint32_t(-7 + 32)));
         CHECK(mmx::add<uint32_t>(0xFFFF'FFFF'0000'0001ull, 0x0000'0001'0000'0001ull) == 0x0000'0000'0000'0002ull);
+        // Each operation's host vector instruction against its definition:
+        // the edges of every lane (the saturations, the signs) and 200,000
+        // random pairs, with every shift count there is.
+        {
+            uint64_t x = 0x9E3779B97F4A7C15ull;
+            auto next = [&] { return x ^= x << 13, x ^= x >> 7, x ^= x << 17; };
+            static const uint16_t edges[] = {0, 1, 2, 0x7F, 0x80, 0xFF, 0x100, 0x7FFE, 0x7FFF, 0x8000, 0x8001, 0xFF7F, 0xFF80, 0xFFFE, 0xFFFF};
+            auto same = [&](uint64_t a, uint64_t b) {
+                namespace s = mmx::scalar;
+                bool ok = mmx::paddw(a, b) == s::paddw(a, b) && mmx::paddsw(a, b) == s::paddsw(a, b) && mmx::psubusw(a, b) == s::psubusw(a, b) &&
+                          mmx::psubsw(a, b) == s::psubsw(a, b) && mmx::pmullw(a, b) == s::pmullw(a, b) && mmx::pmulhw(a, b) == s::pmulhw(a, b) &&
+                          mmx::pmaddwd(a, b) == s::pmaddwd(a, b) && mmx::packssdw(a, b) == s::packssdw(a, b) &&
+                          mmx::packsswb(a, b) == s::packsswb(a, b) && mmx::packuswb(a, b) == s::packuswb(a, b);
+                ok = ok && mmx::add<uint8_t>(a, b) == s::add<uint8_t>(a, b) && mmx::add<uint16_t>(a, b) == s::add<uint16_t>(a, b) &&
+                     mmx::add<uint32_t>(a, b) == s::add<uint32_t>(a, b) && mmx::add<uint64_t>(a, b) == s::add<uint64_t>(a, b) &&
+                     mmx::sub<uint8_t>(a, b) == s::sub<uint8_t>(a, b) && mmx::sub<uint16_t>(a, b) == s::sub<uint16_t>(a, b) &&
+                     mmx::sub<uint32_t>(a, b) == s::sub<uint32_t>(a, b) && mmx::sub<uint64_t>(a, b) == s::sub<uint64_t>(a, b);
+                for (const bool high : {false, true})
+                    ok = ok && mmx::unpack<uint8_t>(a, b, high) == s::unpack<uint8_t>(a, b, high) &&
+                         mmx::unpack<uint16_t>(a, b, high) == s::unpack<uint16_t>(a, b, high) &&
+                         mmx::unpack<uint32_t>(a, b, high) == s::unpack<uint32_t>(a, b, high);
+                return ok;
+            };
+            auto shifts = [&](uint64_t a, uint64_t n) {
+                namespace s = mmx::scalar;
+                return mmx::shl<uint16_t>(a, n) == s::shl<uint16_t>(a, n) && mmx::shl<uint32_t>(a, n) == s::shl<uint32_t>(a, n) &&
+                       mmx::shl<uint64_t>(a, n) == s::shl<uint64_t>(a, n) && mmx::shr<uint16_t>(a, n) == s::shr<uint16_t>(a, n) &&
+                       mmx::shr<uint32_t>(a, n) == s::shr<uint32_t>(a, n) && mmx::shr<uint64_t>(a, n) == s::shr<uint64_t>(a, n) &&
+                       mmx::sar<int16_t>(a, n) == s::sar<int16_t>(a, n) && mmx::sar<int32_t>(a, n) == s::sar<int32_t>(a, n);
+            };
+            bool pairs = true, counts = true;
+            for (const uint16_t e1 : edges)
+                for (const uint16_t e2 : edges) {
+                    const uint64_t a = uint64_t(e1) * 0x0001'0001'0001'0001ull, b = uint64_t(e2) | uint64_t(e2) << 16 | uint64_t(e1) << 32 | uint64_t(e2) << 48;
+                    pairs = pairs && same(a, b) && same(b, a);
+                }
+            for (int k = 0; k < 200000; ++k) {
+                const uint64_t a = next(), b = next();
+                pairs = pairs && same(a, b);
+                counts = counts && shifts(a, uint64_t(k) % 70) && shifts(b, k % 1000 == 0 ? next() : uint64_t(k) % 33);
+            }
+            CHECK(pairs);
+            CHECK(counts);
+        }
     }
 
     if (failures) std::fprintf(stderr, "%d check(s) failed\n", failures);

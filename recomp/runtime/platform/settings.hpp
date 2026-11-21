@@ -64,6 +64,7 @@ struct Settings {
     // [sound]
     uint32_t volume = 100;             // 0-100
     uint32_t channels = 0;             // 0 the device's own (5.1 where it has six speakers), 2 stereo, 6 5.1
+    std::string sound_device;          // the playback device by its name; empty: the system's default, followed when it changes
     // [console]: what the game reads as the Xbox's own settings
     uint32_t language = 1;             // XC_LANGUAGE: 1 English, 3 German, 4 French, 5 Spanish, 6 Italian
 };

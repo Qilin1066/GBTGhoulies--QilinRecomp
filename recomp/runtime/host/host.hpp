@@ -199,6 +199,7 @@ void register_kernel_crypto();  // XcSHA*, XcHMAC (kernel_crypto.cpp); register_
 // hard disk's partitions are data/partition1..6.
 struct IoConfig {
     std::filesystem::path disc, data;
+    bool warm_disc = false;  // read the disc's files through once in the background, so the system has them in memory
 };
 void register_kernel_io(const IoConfig& cfg);
 // Fills in the object behind a kernel data export (XeImageFileName,

@@ -9,11 +9,13 @@
 // title's virtual memory: host pages there are inaccessible until the
 // title commits them (commit_guest_pages), and RAM is charged for what's
 // committed, not for the address space (host.cpp's physical budget).
+#include <algorithm>
 #include <cerrno>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <vector>
 
 #include "host.hpp"
 
@@ -95,6 +97,15 @@ void host_commit(uint8_t* p, size_t n) {
     }
 }
 void host_free(uint8_t* p, size_t n) { VirtualFree(p, n, MEM_DECOMMIT); }
+// Kept: still the process's, but no access (committed pages only).
+void host_keep(uint8_t* p, size_t n) {
+    DWORD was = 0;
+    if (!VirtualProtect(p, n, PAGE_NOACCESS, &was)) VirtualFree(p, n, MEM_DECOMMIT);
+}
+void host_take_back(uint8_t* p, size_t n) {
+    DWORD was = 0;
+    if (!VirtualProtect(p, n, PAGE_READWRITE, &was)) host_commit(p, n);
+}
 size_t host_page() { return 0x1000; }
 #else
 uint8_t* map(uint32_t ram, std::string* error) {
@@ -143,6 +154,10 @@ void host_commit(uint8_t* p, size_t n) {
 void host_free(uint8_t* p, size_t n) {  // fresh inaccessible pages, the old ones returned to the host
     mmap(p, n, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED | MAP_NORESERVE, -1, 0);
 }
+void host_keep(uint8_t* p, size_t n) {  // the same pages, no access
+    if (mprotect(p, n, PROT_NONE) != 0) host_free(p, n);
+}
+void host_take_back(uint8_t* p, size_t n) { host_commit(p, n); }
 #endif
 
 uint8_t* g_base = nullptr;
@@ -168,19 +183,75 @@ uint8_t* map_guest_ram(uint32_t ram_size, std::string* error) {
 
 // The host pages under guest pages [at, at + size) of the virtual memory:
 // committing makes every host page they touch accessible (a host page
-// may be larger than the guest's 4 KB); freeing returns only the host
+// may be larger than the guest's 4 KB); freeing takes only the host
 // pages they cover whole, as others may hold committed guest pages too.
+//
+// Freed pages aren't handed back to the host at once: up to kKeep bytes of
+// them stay the process's, with no access (a stray read still faults), and
+// are given out again as they are when the title next commits them. The
+// game's heap decommits and commits megabytes as scenes change, and pages
+// fresh from the host cost a fault and a zeroing each as they're first
+// touched, in the frame that loads the scene: 50 ms of it in one, measured.
+// What the title reads in a page it commits is zeros either way
+// (VirtualMemory::commit clears it).
+namespace {
+constexpr size_t kKeep = size_t(64) << 20;
+struct Pages {
+    std::vector<bool> committed, kept;  // by host page, from the reservation's start
+    size_t kept_bytes = 0;
+};
+Pages& pages() {
+    static Pages p;
+    return p;
+}
+// Calls f(first, count) for each run of pages in [lo, hi) for which is(page) holds.
+template <typename Is, typename F>
+void runs(size_t lo, size_t hi, Is is, F f) {
+    for (size_t k = lo; k < hi;) {
+        if (!is(k)) {
+            ++k;
+            continue;
+        }
+        size_t end = k + 1;
+        while (end < hi && is(end)) ++end;
+        f(k, end - k);
+        k = end;
+    }
+}
+}  // namespace
+
 void commit_guest_pages(uint32_t at, uint32_t size) {
     if (!g_base || !size) return;
     const size_t page = host_page();
-    const size_t lo = size_t(at) & ~(page - 1), hi = (size_t(at) + size + page - 1) & ~(page - 1);
-    host_commit(g_base + lo, hi - lo);
+    const size_t lo = (size_t(at) & ~(page - 1)) / page, hi = ((size_t(at) + size + page - 1) & ~(page - 1)) / page;
+    Pages& p = pages();
+    if (p.committed.size() < hi) p.committed.resize(hi), p.kept.resize(hi);
+    runs(lo, hi, [&](size_t k) { return bool(p.kept[k]); }, [&](size_t first, size_t n) {
+        host_take_back(g_base + first * page, n * page);
+        p.kept_bytes -= n * page;
+        for (size_t k = first; k < first + n; ++k) p.kept[k] = false;
+    });
+    runs(lo, hi, [&](size_t k) { return !p.committed[k]; }, [&](size_t first, size_t n) {
+        host_commit(g_base + first * page, n * page);
+        for (size_t k = first; k < first + n; ++k) p.committed[k] = true;
+    });
 }
 void free_guest_pages(uint32_t at, uint32_t size) {
     if (!g_base || !size) return;
     const size_t page = host_page();
-    const size_t lo = (size_t(at) + page - 1) & ~(page - 1), hi = (size_t(at) + size) & ~(page - 1);
-    if (hi > lo) host_free(g_base + lo, hi - lo);
+    const size_t lo = ((size_t(at) + page - 1) & ~(page - 1)) / page, hi = std::min(((size_t(at) + size) & ~(page - 1)) / page, pages().committed.size());
+    Pages& p = pages();
+    // The ones in use until now: kept while there's room, else handed back.
+    runs(lo, hi, [&](size_t k) { return p.committed[k] && !p.kept[k]; }, [&](size_t first, size_t n) {
+        if (p.kept_bytes + n * page <= kKeep) {
+            host_keep(g_base + first * page, n * page);
+            p.kept_bytes += n * page;
+            for (size_t k = first; k < first + n; ++k) p.kept[k] = true;
+        } else {
+            host_free(g_base + first * page, n * page);
+            for (size_t k = first; k < first + n; ++k) p.committed[k] = false;
+        }
+    });
 }
 
 }  // namespace qilin::host

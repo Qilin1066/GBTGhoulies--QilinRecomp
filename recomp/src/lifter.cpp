@@ -1714,11 +1714,27 @@ std::string FnEmitter::run() {
         if (written_ & (1u << (16 + k))) wb += std::format(" c.{0} = {0};", kX87[size_t(k)]);
     }
 
+    // The MMX registers the function names: locals too, loaded as it's
+    // entered, stored at every exit and call, and read again after a call
+    // (all of them: which it changes isn't tracked). In the context each
+    // operation loaded and stored its register, as the host compiler can't
+    // tell that guest memory isn't the context.
+    std::string mms, mm_reload;
+    for (int k = 0; k < 8; ++k) {
+        const std::string in_context = std::format("c.mm[{}]", k), local = std::format("mm{}", k);
+        if (out_.find(in_context) == std::string::npos) continue;
+        for (size_t at = 0; (at = out_.find(in_context, at)) != std::string::npos; at += local.size()) out_.replace(at, in_context.size(), local);
+        mms += std::format("{}{} = {}", mms.empty() ? "" : ", ", local, in_context);
+        wb += std::format(" {} = {};", in_context, local);
+        mm_reload += std::format(" {} = {};", local, in_context);
+    }
+
     std::string fn = std::format("void {}(rt::Context& c) {{\n", Lifter::name(f_.start));
     fn += std::format("    QILIN_FRAME(0x{:X}u, c.esp);\n", f_.start);
     fn += "    [[maybe_unused]] const rt::Mem m{c.mem, c.mem_size};\n";
     if (!gprs.empty()) fn += std::format("    uint32_t {};\n", gprs);
     if (!xmms.empty()) fn += std::format("    rt::Xmm {};\n", xmms);
+    if (!mms.empty()) fn += std::format("    uint64_t {};\n", mms);
     if (!fx.empty()) fn += std::format("    uint32_t {};\n", fx);
     if (x87_) fn += "    [[maybe_unused]] auto ST = [&](uint32_t k) -> double& { return c.st[(ftop + k) & 7u]; };\n";
     fn += "    [[maybe_unused]] bool cf = false, pf = false, af = false, zf = false, sf = false, of = false;\n";
@@ -1732,6 +1748,7 @@ std::string FnEmitter::run() {
             if (used_ & (1u << (8 + x))) rl += std::format(" xmm{0} = c.xmm[{0}];", x);
         for (int k = 0; k < 4; ++k)
             if (used_ & (1u << (16 + k))) rl += std::format(" {0} = c.{0};", kX87[size_t(k)]);
+        rl += mm_reload;
         fn += std::format("    [[maybe_unused]] auto reload = [&] {{{} }};\n", rl);
     }
     fn += out_;
