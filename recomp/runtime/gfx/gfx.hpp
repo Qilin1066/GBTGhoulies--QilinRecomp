@@ -293,6 +293,14 @@ public:
 
     // Validation messages of error severity so far (0 without the layers).
     virtual uint32_t validation_errors() const = 0;
+    // What the renderer spent since the last call on work a frame can't
+    // count on: pipelines made for draws (the GPU's compiler) and textures
+    // made or written. For the long-frame log.
+    struct Costs {
+        uint32_t pipelines = 0, textures = 0;
+        double pipeline_ms = 0, texture_ms = 0;
+    };
+    virtual Costs take_costs() = 0;
     // The render resolution (Config's scale_x, scale_y): every frame buffer
     // and render target made again at the new size, their pictures scaled
     // into it (depth starts cleared). Clears, scissors, copies, line widths

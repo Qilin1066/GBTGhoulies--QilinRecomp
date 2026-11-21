@@ -122,6 +122,7 @@ struct Device {
     // render target's memory is compared again only after one of these,
     // or once a frame (as textures are).
     uint32_t memory_epoch = 0;
+    std::chrono::steady_clock::time_point frame_began{};  // for the long-frame log
     std::chrono::steady_clock::time_point epoch;  // vblank 0
     uint8_t gamma[3][256];
     uint32_t heap = 0, heap_used = 0, heap_size = 0;  // guest memory for resource headers
@@ -845,6 +846,26 @@ void pump_window(const Device& d) {
     }
 }
 
+// Each frame over 50 ms is logged (stderr, which the player kit keeps in
+// run.log), with where its time went: the game's own work up to Swap
+// (and, within it, pipelines the GPU's compiler made for its draws and
+// textures made or written), and presenting and pacing. A stutter report
+// then says which it was.
+void long_frames(Device& d, std::chrono::steady_clock::time_point present_from) {
+    const auto now = std::chrono::steady_clock::now();
+    const gfx::Renderer::Costs costs = d.renderer->take_costs();
+    if (d.frame_began != std::chrono::steady_clock::time_point{}) {
+        auto ms = [](auto t) { return std::chrono::duration<double, std::milli>(t).count(); };
+        if (const double total = ms(now - d.frame_began); total > 50)
+            std::fprintf(stderr,
+                         "qilin: frame %u took %.0f ms: the game %.0f ms (%u pipelines made for draws, %.0f ms; %u textures made or "
+                         "written, %.0f ms), presenting %.0f ms\n",
+                         d.swaps, total, ms(present_from - d.frame_began), costs.pipelines, costs.pipeline_ms, costs.textures,
+                         costs.texture_ms, ms(now - present_from));
+    }
+    d.frame_began = now;
+}
+
 // DWORD D3DDevice_Swap(DWORD Flags): shows the frame at the vblank the
 // presentation interval asks for (D3DSWAP_DEFAULT) and returns the swap count.
 void swap(rt::Context& c) {
@@ -855,6 +876,7 @@ void swap(rt::Context& c) {
     if (!d.cpu_frames.empty()) flush_cpu_frames(c, d);
     d.cpu_frames.clear();  // a lock lasts until the next Swap
     if (d.menu) d.menu->tick();  // what's drawn over this frame (the hint, the frame rate counter)
+    const auto present_from = std::chrono::steady_clock::now();
     d.renderer->present();
     if (d.menu && d.config.settings && d.config.settings->performance_overlay) {
         const auto now = std::chrono::steady_clock::now();
@@ -902,6 +924,7 @@ void swap(rt::Context& c) {
         d.clock_last += std::chrono::steady_clock::now() - paused;  // the unlocked clock too
         d.last_shown = {};
         d.menu->restart_frame_times();
+        d.frame_began = {};
     }
     update_aspect(c, d, std::exchange(d.settings_changed, false));
     d.flat_before.swap(d.flat_now);
@@ -917,8 +940,8 @@ void swap(rt::Context& c) {
         st(c, kDeviceStorage + kDevRenderTarget, now);
     }
     frame_pacing(c, d);
-    // QILIN_FPS=1: frames per second, and the game's time step, once a second,
-    // and each frame that took over 50 ms.
+    long_frames(d, present_from);
+    // QILIN_FPS=1: frames per second, and the game's time step, once a second.
     static const bool fps = std::getenv("QILIN_FPS") != nullptr;
     if (fps) {
         static auto since = std::chrono::steady_clock::now();
@@ -927,10 +950,6 @@ void swap(rt::Context& c) {
         static float lo = 1e9f, hi = 0.0f;
         const float step = std::bit_cast<float>(ld(c, 0x5096C0));
         lo = std::min(lo, step), hi = std::max(hi, step);
-        static auto last = now;  // and each frame that took over 50 ms
-        if (const double ms = std::chrono::duration<double, std::milli>(now - last).count(); ms > 50)
-            std::fprintf(stderr, "qilin: frame %u took %.0f ms\n", d.swaps, ms);
-        last = now;
         if (now - since >= std::chrono::seconds(1)) {
             const double s = std::chrono::duration<double>(now - since).count();
             std::fprintf(stderr, "qilin: %.1f frames a second, time step %.4f s (%.5f to %.5f)\n", (d.swaps - from) / s, double(step),

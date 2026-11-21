@@ -11,6 +11,11 @@ Each release is a git tag (`vX.Y.Z`) with a matching GitHub release. The version
 
 ## [Unreleased]
 
+## [0.41.2] - 2026-11-21
+
+### Added
+- **Long frames logged**: each frame that takes over 50 ms is written to the log (`run.log` in the player kit), with where its time went: the game's own work, and within it the pipelines the GPU's compiler had to make for draws and the textures made or written, and presenting. A stutter report then says what the stutter was. (It replaces `QILIN_FPS`'s list of long frames.)
+
 ## [0.41.1] - 2026-11-21
 
 ### Changed

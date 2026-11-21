@@ -19,6 +19,7 @@
 #include <cstring>
 
 #include <map>
+#include <utility>
 #include <stdexcept>
 #include <string_view>
 #include <type_traits>
@@ -205,6 +206,7 @@ public:
     }
     void set_gamma_ramp(const uint8_t ramp[3][256]) override;
     uint32_t validation_errors() const override { return validation_errors_; }
+    Costs take_costs() override { return std::exchange(costs_, {}); }
     void set_resolution_scale(uint32_t x, uint32_t y) override;
     uint32_t resolution_scale_x() const override { return config_.scale_x; }
     uint32_t resolution_scale_y() const override { return config_.scale_y; }
@@ -376,6 +378,7 @@ private:
         auto operator<=>(const PipelineKey&) const = default;
     };
     std::map<PipelineKey, VkPipeline> pipelines_;
+    Costs costs_;
     VkPipeline make_pipeline(const PipelineKey& k, VkShaderModule vs, VkShaderModule fs) const;
     // The pipeline library: what each pipeline was made from (the vertex
     // program and the combiners, not their SPIR-V, which changes with the
@@ -2317,9 +2320,9 @@ VkPipeline VulkanRenderer::pipeline(const DrawCmd& c) {
     const VkPipeline p = make_pipeline(k, shader(c.vs_key, c.vs_code), shader(c.fs_key, c.fs_code));
     // QILIN_TRACE_PIPELINES=1: each pipeline made as a draw needs it, and how long that took.
     static const bool trace = std::getenv("QILIN_TRACE_PIPELINES") != nullptr;
-    if (trace)
-        std::fprintf(stderr, "qilin: pipeline %zu made for a draw in %.2f ms\n", pipelines_.size() + 1,
-                     std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
+    const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    ++costs_.pipelines, costs_.pipeline_ms += ms;
+    if (trace) std::fprintf(stderr, "qilin: pipeline %zu made for a draw in %.2f ms\n", pipelines_.size() + 1, ms);
     pipelines_[k] = p;
     ++unsaved_pipelines_;
     last_pipeline_ = std::chrono::steady_clock::now();
@@ -2562,6 +2565,11 @@ VkSampler VulkanRenderer::sampler(const SamplerDesc& wanted) {
 }
 
 uint32_t VulkanRenderer::create_texture(const TextureData& t) {
+    struct Timed {  // into costs_
+        Costs& c;
+        std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
+        ~Timed() { ++c.textures, c.texture_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count(); }
+    } timed{costs_};
     const uint32_t layers = t.faces;
     VkImageCreateInfo info{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
     info.imageType = t.dims() == 3 ? VK_IMAGE_TYPE_3D : VK_IMAGE_TYPE_2D;
@@ -2606,6 +2614,11 @@ uint32_t VulkanRenderer::create_texture(const TextureData& t) {
 }
 
 bool VulkanRenderer::update_texture(uint32_t id, const TextureData& t) {
+    struct Timed {  // into costs_
+        Costs& c;
+        std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
+        ~Timed() { ++c.textures, c.texture_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count(); }
+    } timed{costs_};
     auto it = textures_.find(id);
     if (it == textures_.end()) return false;
     const Texture& x = it->second;
