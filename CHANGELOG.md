@@ -11,6 +11,11 @@ Each release is a git tag (`vX.Y.Z`) with a matching GitHub release. The version
 
 ## [Unreleased]
 
+## [0.43.3] - 2026-11-21
+
+### Fixed
+- **Striped, flickering shadows on NVIDIA**: a biased draw that doesn't write depth (the projected shadows, drawn as the floor again by another vertex program) gets eight times the console's constant depth offset (32 steps of 24-bit depth). On a GTX 1080 Ti the two programs' depths still differed by more than the console's 4 steps in bands across the floor, at every resolution, frame rate and with SMAA and FSR off.
+
 ## [0.43.2] - 2026-11-21
 
 ### Fixed

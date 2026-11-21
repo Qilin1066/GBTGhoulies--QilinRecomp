@@ -1895,6 +1895,7 @@ gfx::StencilOp stencil_op(const char* fn, uint32_t v) {
     }
 }
 
+constexpr float kOverlayBias = 8.0f;  // see D3DRS_ZBIAS below
 // D3DRS_ZBIAS's slot, which SetRenderState_ZBias keeps.
 constexpr uint32_t kRsZBiasSlot = 0x181DC4;
 // D3DRS_LINEWIDTH's slot (a float), which SetRenderState_LineWidth keeps.
@@ -2893,6 +2894,15 @@ void issue_draw(rt::Context& c, Device& d, const char* fn, uint32_t prim, Vertic
     if (const int32_t zbias = int32_t(ld(c, kRsZBiasSlot))) {
         cmd.depth_bias = -float(zbias);
         cmd.depth_slope = -float(zbias) * 0.25f;
+        // A biased draw that doesn't write depth lays something on a surface
+        // already drawn (the projected shadows: the floor again, by another
+        // vertex program). Its depth and the surface's are computed by
+        // different programs, and on NVIDIA (GTX 1080 Ti) they still differ
+        // by more than the console's 4 units in bands across the floor: the
+        // shadows striped and flickered at every resolution and frame rate.
+        // Eight times the console's constant offset (32 steps of 24-bit
+        // depth: under 2 micro-units, nothing in front comes that close).
+        if (!cmd.depth_write) cmd.depth_bias *= kOverlayBias;
     }
     // D3DRS_LINEWIDTH, as SetRenderState_LineWidth (0x171570) gives the
     // GPU: the width times the supersampling scale, in eighths of a pixel
