@@ -1038,7 +1038,7 @@ void capture_step(rt::Context& c, Device& d) {
         g_capture.version.clear(), g_capture.dumped.clear(), g_capture.files = 0;
         const platform::Settings& s = *d.config.settings;
         std::fprintf(g_capture.log,
-                     "GBTGhoulies-QilinRecomp " QILIN_VERSION ", %s; render scale %ux%u, aspect %u:%u, frame rate setting %d, vsync %d, "
+                     "GBTGhoulies--QilinRecomp " QILIN_VERSION ", %s; render scale %ux%u, aspect %u:%u, frame rate setting %d, vsync %d, "
                      "smaa %d, fsr %d; draws numbered %u to %u, each shown in the frame numbered one more\n",
                      d.renderer->device_name().c_str(), d.renderer->resolution_scale_x(), d.renderer->resolution_scale_y(), s.aspect_w, s.aspect_h,
                      int(s.frame_rate), int(s.vsync), int(s.smaa), int(s.fsr), d.swaps,

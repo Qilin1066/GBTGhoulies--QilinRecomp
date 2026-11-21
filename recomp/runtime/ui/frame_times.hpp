@@ -1,4 +1,4 @@
-// From PunchOutWii-QilinRecomp (the same project family), unchanged but its namespace.
+// From PunchOutWii--QilinRecomp (the same project family), unchanged but its namespace.
 // Frame times: the intervals between frames shown, over a rolling window,
 // and what players compare (average fps, 1% and 0.1% lows, the worst frame).
 //

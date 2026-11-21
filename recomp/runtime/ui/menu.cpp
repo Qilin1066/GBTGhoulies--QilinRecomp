@@ -229,7 +229,7 @@ void Menu::frame_shown(double ms, std::vector<std::string> details) {
 
 // F3: how fast and how evenly frames reach the screen, top left. The lows
 // are the frame rates of the slowest 1% and 0.1% of frames over the last
-// 20 s (as PunchOutWii-QilinRecomp's counter).
+// 20 s (as PunchOutWii--QilinRecomp's counter).
 void Menu::draw_frame_times() {
     const FrameTimes::Summary s = frame_times_.summary();
     const ImGuiViewport* vp = ImGui::GetMainViewport();

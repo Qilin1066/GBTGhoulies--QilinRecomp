@@ -11,6 +11,9 @@ Each release is a git tag (`vX.Y.Z`) with a matching GitHub release. The version
 
 ## [Unreleased]
 
+### Changed
+- **The repository is now Qilin1066/GBTGhoulies--QilinRecomp** (renamed by the owner, as were the sister projects: ApbArcade--QilinRecomp, PunchOutWii--QilinRecomp, and Beat the Beat's, now RhythmHeavenFever--QilinRecomp; GitHub redirects the old names). Links, docs and the download's name (`GBTGhoulies--QilinRecomp-<version>-windows-x64.zip`, as Punch-Out's follows its repository) follow; the settings folder is unchanged.
+
 ## [0.42.1] - 2026-11-21
 
 ### Added

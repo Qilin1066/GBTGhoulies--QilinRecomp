@@ -1,5 +1,5 @@
-// The settings menu (Dear ImGui over the game's window), as ApbArcade-QilinRecomp and
-// PunchOutWii-QilinRecomp have theirs: F1 or Esc, or Back and Start together on a
+// The settings menu (Dear ImGui over the game's window), as ApbArcade--QilinRecomp and
+// PunchOutWii--QilinRecomp have theirs: F1 or Esc, or Back and Start together on a
 // controller, open it, and the game pauses under it. Its pages are the
 // settings file's sections (platform/settings.hpp); closing it saves them.
 // A hint names the keys for the first seconds of a run.

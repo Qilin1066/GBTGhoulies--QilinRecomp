@@ -1,5 +1,5 @@
 # Play Grabbed by the Ghoulies (the Windows download's "Play Ghoulies.bat"
-# runs this), as ApbArcade-QilinRecomp's and PunchOutWii-QilinRecomp's downloads.
+# runs this), as ApbArcade--QilinRecomp's and PunchOutWii--QilinRecomp's downloads.
 #
 # The download holds everything but the game's own code: that is made here,
 # from your own disc, the first time (and again after an update): qilin

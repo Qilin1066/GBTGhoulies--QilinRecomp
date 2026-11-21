@@ -1,10 +1,10 @@
 #!/bin/sh
 # Builds the Windows download: tools/player-kit/package.sh <version> <out.zip>
-# (as ApbArcade-QilinRecomp's and PunchOutWii-QilinRecomp's).
+# (as ApbArcade--QilinRecomp's and PunchOutWii--QilinRecomp's).
 #
 # Cross-compiles on Linux with llvm-mingw, then lays out:
-#   GBTGhoulies-QilinRecomp/Play Ghoulies.bat, README.txt, LICENSES/
-#   GBTGhoulies-QilinRecomp/kit/  qilin.exe, lib/libghoulies_kit.a, include/, kit.ninja,
+#   GBTGhoulies--QilinRecomp/Play Ghoulies.bat, README.txt, LICENSES/
+#   GBTGhoulies--QilinRecomp/kit/  qilin.exe, lib/libghoulies_kit.a, include/, kit.ninja,
 #                            play.ps1, ninja.exe, toolchain/ (llvm-mingw, trimmed), VERSION
 # Nothing in it is made from the game: the player's PC lifts their own
 # default.xbe and compiles that code with the bundled compiler (play.ps1).
@@ -21,7 +21,7 @@ out=$(cd "$(dirname "$2")" && pwd)/$(basename "$2")
 root=$(cd "$(dirname "$0")/../.." && pwd)
 build=${BUILD_DIR:-$root/build-player-kit}
 stage=$(mktemp -d)
-pkg="$stage/GBTGhoulies-QilinRecomp"
+pkg="$stage/GBTGhoulies--QilinRecomp"
 
 # shellcheck disable=SC2086
 cmake -S "$root" -B "$build" -G Ninja -DCMAKE_TOOLCHAIN_FILE="$root/tools/player-kit/mingw-cross.cmake" \
@@ -41,8 +41,8 @@ lic="$pkg/LICENSES"
 mkdir -p "$lic/llvm-mingw" "$lic/ninja" "$lic/SDL3" "$lic/Vulkan-Headers" "$lic/volk" "$lic/Zydis" "$lic/Dear ImGui" "$lic/FidelityFX FSR" "$lic/SMAA"
 mv "$pkg/kit/toolchain/licenses/"* "$lic/llvm-mingw/"
 rmdir "$pkg/kit/toolchain/licenses"
-mkdir -p "$lic/GBTGhoulies-QilinRecomp"
-sed 's/$/\r/' "$root/LICENSE" > "$lic/GBTGhoulies-QilinRecomp/LICENSE.txt"  # GPL-3.0
+mkdir -p "$lic/GBTGhoulies--QilinRecomp"
+sed 's/$/\r/' "$root/LICENSE" > "$lic/GBTGhoulies--QilinRecomp/LICENSE.txt"  # GPL-3.0
 cp "$NINJA_WINDOWS/COPYING" "$lic/ninja/"
 sdl=$(sed -n 's/^FETCHCONTENT_SOURCE_DIR_SDL3:PATH=//p' "$build/CMakeCache.txt")
 [ -n "$sdl" ] || sdl="$build/_deps/sdl3-src"
@@ -57,6 +57,6 @@ cp "$root"/third_party/zydis/dependencies/zycore/LICENSE "$lic/Zydis/LICENSE-Zyc
 # (nxdk's kernel export list, CC0-1.0, is in the runtime too: third_party/README.md.)
 
 rm -f "$out"
-(cd "$stage" && zip -q -r -9 "$out" GBTGhoulies-QilinRecomp)
+(cd "$stage" && zip -q -r -9 "$out" GBTGhoulies--QilinRecomp)
 rm -rf "$stage"
 echo "Packaged $out ($(du -h "$out" | cut -f1))"

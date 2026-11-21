@@ -4,8 +4,8 @@
 
 | Thing | Name | Why |
 |---|---|---|
-| The repo / project | GBTGhoulies-QilinRecomp (github.com/Qilin1066/GBTGhoulies-QilinRecomp) | The game plus the toolchain that ports it, named like its sister projects ApbArcade-QilinRecomp, BeatTheBeat-QilinRecomp and PunchOutWii-QilinRecomp |
-| The Windows download | `GBTGhoulies-QilinRecomp-<version>-windows-x64.zip` | After the project |
+| The repo / project | GBTGhoulies--QilinRecomp (github.com/Qilin1066/GBTGhoulies--QilinRecomp) | The game plus the toolchain that ports it, named like its sister projects ApbArcade--QilinRecomp, RhythmHeavenFever--QilinRecomp and PunchOutWii--QilinRecomp |
+| The Windows download | `GBTGhoulies--QilinRecomp-<version>-windows-x64.zip` | After the project |
 | The recompiler CLI | `qilin` | The author's tool: short, unique, easy to type |
 | C++ namespaces of the recompiler and runtime | `qilin`, `qilin::rt`, `qilin::gen` | Project namespace; avoids collisions with game, Zydis or system names |
 | Build options, macros, CMake targets | `QILIN_*`, `qilin_*` | Same prefix as the namespace, so it's obvious what owns them |

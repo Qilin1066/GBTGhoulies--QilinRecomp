@@ -1,6 +1,6 @@
 // The settings file: ghoulies.ini in the data folder, as the sister
-// projects keep theirs (punchout.ini in PunchOutWii-QilinRecomp, apb.ini in
-// ApbArcade-QilinRecomp): [display], [controls], [sound] and [console]
+// projects keep theirs (punchout.ini in PunchOutWii--QilinRecomp, apb.ini in
+// ApbArcade--QilinRecomp): [display], [controls], [sound] and [console]
 // sections, written with every key and comments the first time the game runs. The settings menu (F1 or Esc in the game)
 // changes them and saves them back; the file can be edited by hand too. A
 // line that can't be read is named in the log and left at its default.

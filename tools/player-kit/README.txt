@@ -84,4 +84,4 @@ kit\ninja.exe       Ninja, which drives the compiler
 work\               made when building: the recompiled code (from your disc)
 LICENSES\           the licences of everything included
 
-Source, changes and issues: https://github.com/Qilin1066/GBTGhoulies-QilinRecomp
+Source, changes and issues: https://github.com/Qilin1066/GBTGhoulies--QilinRecomp
