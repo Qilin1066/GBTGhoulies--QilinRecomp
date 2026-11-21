@@ -251,10 +251,19 @@ Settings parse_settings(const std::string& text, std::vector<std::string>& warni
             }
         } else if (section == "sound") {
             if (key == "volume") ok = read_uint(v, 0, 100, &s.volume);
-            else if (key == "channels") ok = read_uint(v, 0, 6, &s.channels) && (s.channels == 0 || s.channels == 2 || s.channels == 6);
+            else if (key == "channels") {
+                // Read aside: a value refused (4, say) leaves the setting as it was, as the warning says.
+                uint32_t ch = 0;
+                ok = read_uint(v, 0, 6, &ch) && (ch == 0 || ch == 2 || ch == 6);
+                if (ok) s.channels = ch;
+            }
             else ok = false;
         } else if (section == "console") {
-            if (key == "language") ok = read_uint(v, 1, 6, &s.language) && s.language != 2;  // 2 Japanese: not on this disc
+            if (key == "language") {
+                uint32_t lang = 0;
+                ok = read_uint(v, 1, 6, &lang) && lang != 2;  // 2 Japanese: not on this disc
+                if (ok) s.language = lang;
+            }
             else if (key == "widescreen") ok = read_bool(v, &widescreen);
             else ok = false;
         } else {

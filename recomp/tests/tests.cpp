@@ -338,11 +338,22 @@ int main() {
         CHECK(fc && fc->flags_written == 63 && fc->flags_defined == 63 && fc->flags_read == 0);
     }
     {
+        // Every byte of the synthetic code section accounted for. (It lies
+        // outside the game's text regions, so it comes back as one region
+        // that isn't marked lifted; counting only lifted regions, as this
+        // did, counted nothing.)
+        // The one span left is 113EB-113F1, the two functions off the
+        // 16-byte grid that the lifter test below describes by hand, which
+        // nothing calls.
         auto cov = cfg.coverage();
-        uint64_t unknown = 0;
-        for (auto& r : cov)
-            if (r.lifted) unknown += r.unknown;
-        CHECK(unknown == 0);
+        uint64_t unknown = 0, code = 0;
+        std::vector<std::pair<uint32_t, uint32_t>> spans;
+        for (auto& r : cov) {
+            unknown += r.unknown, code += r.code;
+            for (auto& g : r.unknown_spans) spans.emplace_back(g.addr, uint32_t(g.size));
+        }
+        CHECK(!cov.empty() && code > 0);
+        CHECK(unknown == 7 && (spans == std::vector<std::pair<uint32_t, uint32_t>>{{0x113EBu, 7u}}));
     }
     if (f.contains(0x11010)) {
         auto& fn = f.at(0x11010);
