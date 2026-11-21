@@ -90,12 +90,17 @@ int16_t flip(int16_t v) { return int16_t(v == -32768 ? 32767 : -v); }
 // Two inputs on one stick axis (controller and keyboard): the larger push wins.
 int16_t stronger(int16_t a, int16_t b) { return std::abs(int(a)) >= std::abs(int(b)) ? a : b; }
 
+// Keys a test run holds (hold_key), by scancode.
+std::array<bool, SDL_SCANCODE_COUNT> g_held{};
+
 // The keyboard, as a controller, by the settings' keys (docs/input.md has the defaults).
 PadState keyboard(const std::array<std::vector<int>, kControlCount>& keys) {
     PadState k;
     const bool* key = SDL_GetKeyboardState(nullptr);
     if (!key) return k;
-    auto down = [&](Control c) { return std::ranges::any_of(keys[c], [&](int s) { return key[s]; }); };
+    auto down = [&](Control c) {
+        return std::ranges::any_of(keys[c], [&](int s) { return key[s] || (s >= 0 && s < int(SDL_SCANCODE_COUNT) && g_held[size_t(s)]); });
+    };
     auto axis = [&](Control neg, Control pos) { return int16_t((down(pos) ? 32767 : 0) - (down(neg) ? 32767 : 0)); };
     static constexpr std::pair<Control, uint16_t> kButtons[] = {
         {kCtlUp, kPadUp}, {kCtlDown, kPadDown}, {kCtlLeft, kPadLeft}, {kCtlRight, kPadRight}, {kCtlStart, kPadStart},
@@ -310,6 +315,13 @@ void Input::rumble(uint32_t port, uint16_t left, uint16_t right) {
     // with each change and each call (the game sends its rumble every
     // frame), so it lasts until changed, as the Xbox's.
     SDL_RumbleGamepad(p.pad, left, right, 0xFFFF);
+}
+
+bool hold_key(const std::string& name, bool down) {
+    const SDL_Scancode code = SDL_GetScancodeFromName(name.c_str());
+    if (code == SDL_SCANCODE_UNKNOWN) return false;
+    g_held[size_t(code)] = down;
+    return true;
 }
 
 }  // namespace qilin::platform

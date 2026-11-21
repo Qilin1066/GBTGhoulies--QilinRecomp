@@ -78,4 +78,9 @@ private:
     bool any_sdl_pad() const;  // a gamepad is open through SDL (Windows' XInput is read directly only when none is)
 };
 
+// A key held as if on the keyboard (a test run's script presses the game's
+// keys this way): `name` is SDL's name for it ("Return", "Space", "W",
+// "Keypad 4"). False if SDL knows no such key.
+bool hold_key(const std::string& name, bool down);
+
 }  // namespace qilin::platform

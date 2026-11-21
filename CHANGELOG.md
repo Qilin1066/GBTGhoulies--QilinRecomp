@@ -11,6 +11,14 @@ Each release is a git tag (`vX.Y.Z`) with a matching GitHub release. The version
 
 ## [Unreleased]
 
+## [0.42.1] - 2026-11-21
+
+### Added
+- **A scripted test run**: a `selftest.txt` in the settings folder is played when the game starts (keys held at given times, captures, quit), once: the file is renamed `selftest.ran`. With it a build can be tried on a player's own graphics card without them playing; the log and the captures say what happened.
+
+### Changed
+- **Captures are a tenth the size**: every draw of the first frame, and of the rest only those that draw into a texture, sample one, or have a depth bias (the shadows and effects), each with its details and the vertex program's first constants.
+
 ## [0.42.0] - 2026-11-21
 
 ### Added

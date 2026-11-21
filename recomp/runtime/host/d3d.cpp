@@ -14,6 +14,7 @@
 //
 // Anything not modelled yet (a Swap flag, a partial colour clear, a call
 // that isn't registered) stops the runtime with its name.
+#include <sstream>
 #include <fstream>
 #include <filesystem>
 #include <ctime>
@@ -937,6 +938,77 @@ void long_frames(Device& d, std::chrono::steady_clock::time_point present_from) 
     d.frame_began = now;
 }
 
+bool g_capture_wanted = false;  // a test run asks for a capture
+
+// A test run: if the data folder has selftest.txt when the game starts, its
+// lines are played, each "SECONDS what": `key NAME [held SECONDS]` holds a
+// key (SDL's name, as in the settings file; a quarter of a second unless
+// said), `capture` is F9, `quit` ends the run. Seconds count from the first
+// frame. The file is renamed selftest.ran first, so it runs once. It lets a
+// build be tried on a player's machine, on their GPU, without them playing
+// it: the log and the captures say what happened.
+struct TestStep {
+    double at = 0;
+    enum What : uint8_t { Down, Up, Capture, Quit } what = Down;
+    std::string key;
+};
+void test_run(Device& d) {
+    static std::vector<TestStep> steps;
+    static size_t next = 0;
+    static const auto began = std::chrono::steady_clock::now();
+    static const bool loaded = [&] {
+        const std::filesystem::path file = std::filesystem::path(d.config.settings_folder) / "selftest.txt";
+        std::ifstream in(file);
+        if (!in) return false;
+        for (std::string line; std::getline(in, line);) {
+            std::istringstream words(line);
+            TestStep s;
+            std::string what;
+            if (!(words >> s.at >> what)) continue;
+            if (what == "key") {
+                double held = 0.25;
+                std::string name, more;
+                if (!(words >> name)) continue;
+                // A name of two words ("Keypad 4", "Left Shift"), then perhaps the time held.
+                while (words >> more) {
+                    if (more == "held") words >> held;
+                    else name += " " + more;
+                }
+                steps.push_back({s.at, TestStep::Down, name});
+                steps.push_back({s.at + held, TestStep::Up, name});
+            } else if (what == "capture") {
+                steps.push_back({s.at, TestStep::Capture, {}});
+            } else if (what == "quit") {
+                steps.push_back({s.at, TestStep::Quit, {}});
+            }
+        }
+        in.close();
+        std::ranges::stable_sort(steps, {}, &TestStep::at);
+        std::error_code ec;
+        std::filesystem::rename(file, std::filesystem::path(file).replace_extension(".ran"), ec);
+        std::printf("qilin_run: a test run from %s: %zu steps\n", file.string().c_str(), steps.size());
+        std::fflush(stdout);
+        return true;
+    }();
+    if (!loaded) return;
+    const double now = std::chrono::duration<double>(std::chrono::steady_clock::now() - began).count();
+    for (; next < steps.size() && steps[next].at <= now; ++next) {
+        const TestStep& s = steps[next];
+        switch (s.what) {
+            case TestStep::Down:
+            case TestStep::Up:
+                if (!platform::hold_key(s.key, s.what == TestStep::Down)) std::printf("qilin_run: the test run names a key SDL doesn't know: %s\n", s.key.c_str());
+                break;
+            case TestStep::Capture: g_capture_wanted = true; break;
+            case TestStep::Quit:
+                std::fflush(stderr);
+                std::printf("qilin_run: the test run ended after %u frames\n", d.swaps);
+                std::fflush(stdout);
+                std::exit(0);
+        }
+    }
+}
+
 // A capture begins at the Swap after F9 and ends kCaptureFrames later.
 void capture_step(rt::Context& c, Device& d) {
     if (g_capture.log && d.swaps >= g_capture.until) {
@@ -950,7 +1022,7 @@ void capture_step(rt::Context& c, Device& d) {
         d.frame_began = {};  // its frames aren't long frames
     } else if (g_capture.log) {
         std::fprintf(g_capture.log, "swap %u: time step %.5f s\n", d.swaps, double(std::bit_cast<float>(ld(c, 0x5096C0))));
-    } else if (d.menu && d.menu->take_capture()) {
+    } else if ((d.menu && d.menu->take_capture()) || std::exchange(g_capture_wanted, false)) {
         std::error_code ec;
         const auto now = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
         char stamp[32] = "capture";
@@ -1066,6 +1138,7 @@ void swap(rt::Context& c) {
         }
     }
     deliver_frame(d);
+    test_run(d);
     capture_step(c, d);
     pump_audio(c);
     pump_window(d);
@@ -2755,10 +2828,21 @@ void issue_draw(rt::Context& c, Device& d, const char* fn, uint32_t prim, Vertic
                  rs(kRsStencilEnable), ld(c, kRsZBiasSlot), cw, rs(kRsAlphaTestEnable), rs(kRsAlphaRef), cull, cs.texture_modes,
                  rs(kRsPsRgbInputs), rs(kRsPsRgbOutputs), ld(c, dev + kDevVertexShader),
                  flat ? strf(" flat=%.0f..%.0f", double(flat_x0), double(flat_x1)).c_str() : "");
-        trace_line(line);
+        // A capture has every draw of its first frame, and of the others
+        // those that draw into a texture, sample one the game draws into, or
+        // have a depth bias (the shadows, the effects), with their details:
+        // a whole frame's details are 4 MB.
+        bool noteworthy = true;
+        if (g_capture.log) {
+            noteworthy = ld(c, kRsZBiasSlot) != 0 || std::ranges::find(d.frame_buffers, target) == d.frame_buffers.end();
+            for (uint32_t stage = 0; stage < 4 && !noteworthy; ++stage)
+                for (const auto& [addr, tt] : d.targets)
+                    if (cmd.textures[stage] && tt.texture.id == cmd.textures[stage]) noteworthy = true;
+        }
+        if (noteworthy || d.swaps + kCaptureFrames == g_capture.until) trace_line(line);
         // QILIN_TRACE_DETAIL=1: each logged draw's stencil, alpha test, combiners and positions too.
         static const bool detail = std::getenv("QILIN_TRACE_DETAIL") != nullptr;
-        if (g_capture.log || (detail && trace_wanted(line))) {
+        if (g_capture.log ? noteworthy : (detail && trace_wanted(line))) {
             std::string x = strf("  stencil f=%u ref=%u mask=%x/%x ops=%u/%u/%u alpha f=%u ref=%u combiners=%u final=%08X/%08X modes=%x in=%x dot=%x\n",
                                  rs(kRsStencilFunc), rs(kRsStencilRef), rs(kRsStencilMask), rs(kRsStencilWriteMask), rs(kRsStencilFail),
                                  rs(kRsStencilZFail), rs(kRsStencilPass), rs(kRsAlphaFunc), rs(kRsAlphaRef), cs.combiner_count, cs.final_abcd,
@@ -2766,6 +2850,13 @@ void issue_draw(rt::Context& c, Device& d, const char* fn, uint32_t prim, Vertic
             for (uint32_t i = 0; i < 8 && i < (cs.combiner_count & 0xFF); ++i)
                 x += strf("  stage %u rgb %08X>%08X alpha %08X>%08X c0=%08X c1=%08X\n", i, cs.rgb_inputs[i], cs.rgb_outputs[i], cs.alpha_inputs[i],
                           cs.alpha_outputs[i], rs(kRsPsConstant0 + i), rs(kRsPsConstant1 + i));
+            if (g_capture.log) {  // the program's first constants and the viewport's (c-38, c-37)
+                for (int k : {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, -38, -37}) {
+                    const float* q = &vsu[size_t(96 + k) * 4];
+                    x += strf("%sc%d=(%.9g %.9g %.9g %.9g)", k % 4 == 0 || k == -38 ? "\n  " : " ", k, double(q[0]), double(q[1]), double(q[2]), double(q[3]));
+                }
+                x += "\n";
+            }
             for (uint32_t i = 0; i < v.count && i < 4; ++i) {
                 x += strf("  v%u", i);
                 for (uint32_t n = 0; n < 16; ++n)
