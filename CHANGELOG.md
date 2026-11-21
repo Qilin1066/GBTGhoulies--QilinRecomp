@@ -11,7 +11,16 @@ Each release is a git tag (`vX.Y.Z`) with a matching GitHub release. The version
 
 ## [Unreleased]
 
+## [0.42.0] - 2026-11-21
+
+### Added
+- **F9 captures the picture for a report**: the next 12 frames as images, every draw in them with its state, combiners and first vertices, and what each render target a draw samples holds, packed into one file in the settings folder's `captures` folder (the game shows where). A picture fault that only shows on one graphics card can then be looked at from here. The download's README says so.
+- **Dropped frames logged**: the long-frame log now also has frames over 10 ms that took two and a half times the usual (a dropped frame at a high refresh rate; at most 40 a second), and each line says how long the game spent reading files.
+- **The sound log** runs five minutes and says how many frames the sound device took and how many were dropped because it wasn't taking them, and how many streams are held.
+- `QILIN_NO_DRAW=1` (nothing drawn, so a slow machine reaches a fast one's frame rates) and `QILIN_CHECK_SETTLED=1` (reports a vertex buffer the game changed without a lock) for testing.
+
 ### Fixed
+- **`FlushEx` on a stream that isn't playing does nothing**, as the original (`0x1CA751`). Since v0.40.2 it held such a stream (flag 4), which then played nothing until XACT flushed it; one it didn't flush stayed silent.
 - **A refused sound or language setting was kept**: `channels = 4` (or `language = 2`) in the settings file was reported as unreadable, but the value had already been stored, so the game ran with it. A refused value now leaves the setting as it was. (Found in the BarbieWildHorseRescue port, which shares the settings code.)
 - **The coverage test checked nothing**: it counted unknown bytes only in lifted regions, and the synthetic test image's code section lies outside the game's regions, so it was never counted. It now counts every byte there and expects exactly the one known gap (two hand-described functions nothing calls).
 - **Every controller works the F1 menu**, not only the first one SDL lists (which can be a virtual pad or a wheel's base): Dear ImGui's SDL3 backend is set to read them all, as APB's menu now does.

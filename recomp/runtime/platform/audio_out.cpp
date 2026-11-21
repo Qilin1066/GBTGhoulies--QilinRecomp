@@ -69,9 +69,10 @@ void AudioOut::push(const float* frames, uint32_t count) {
     const int before = SDL_GetAudioStreamQueued(stream_);
     const uint32_t queued_frames = before > 0 ? uint32_t(before) / (channels_ * uint32_t(sizeof(float))) : 0;
     const uint32_t limit = target_frames_ * 4, room = queued_frames < limit ? limit - queued_frames : 0;
-    if (count > room) frames += size_t(count - room) * channels_, count = room;
+    if (count > room) dropped_ += count - room, frames += size_t(count - room) * channels_, count = room;
     if (!count) return;
     SDL_PutAudioStreamData(stream_, frames, int(size_t(count) * channels_ * sizeof(float)));
+    pushed_ += count;
     // Hold the queue at the cushion: a longer queue plays a little faster,
     // a shorter one a little slower. The trim moves slowly, so it follows the
     // clocks' drift, not each catch-up's step.

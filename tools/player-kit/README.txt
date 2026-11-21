@@ -27,6 +27,10 @@ Playing
        Ghoulies.exe --game-dir "<disc folder>" "<disc folder>\default.xbe"
 3. What the game prints goes into run.log in this folder: send that file
    when you report a problem.
+4. If the picture is wrong (something flickers, a shadow or an effect looks
+   off), press F9 while it shows: the next 12 frames and what the game drew
+   in them are saved to a file in the settings folder's captures folder
+   (the game says where). Send that file too.
 
 If Windows says "Windows protected your PC": More info, then Run anyway.
 (The download isn't signed.) Or before unpacking, right-click the zip,

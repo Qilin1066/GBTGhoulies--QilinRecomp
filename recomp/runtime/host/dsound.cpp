@@ -948,11 +948,13 @@ void stream_flush_ex(rt::Context& c) {
                 if (flags & 4) b.hold_after_release = false, b.held = true;
                 else flush_stream(a, b);
             }
-        } else if (flags & 4) {
-            b.held = true;  // nothing playing to release: held now
-        } else {
+        } else if (b.voice.playing()) {
             flush_stream(a, b);
         }
+        // A stream whose voice isn't running (never started, or stopped) is
+        // left as it is, as the original (0x1CA751: nothing unless the
+        // voice's state is 3). Before v0.42.0 flag 4 held such a stream, and
+        // one XACT then didn't flush stayed silent for good.
     }
     deliver(c);
     ret(c, kDsOk, 16);
@@ -1135,20 +1137,25 @@ void pump_audio(rt::Context& c) {
             (void)looping;
             std::printf("qilin_run: audio: %d streams, %d buffers playing;%s\n", streams, buffers, list.c_str());
         }
-        // The sound log: for the first two minutes, every 10 s, what's
+        // The sound log: for the first five minutes, every 10 s, what's
         // playing, how loud the mix was, and whether the device is taking
         // it (frames queued for it, the rate trim), in run.log.
         static const auto started = std::chrono::steady_clock::now();
         static auto logged = started;
         const auto now = std::chrono::steady_clock::now();
-        if (now - started <= std::chrono::minutes(2) && now - logged >= std::chrono::seconds(10)) {
+        if (now - started <= std::chrono::minutes(5) && now - logged >= std::chrono::seconds(10)) {
             logged = now;
             DirectSound& d = ds();
             int playing = 0;
             for (auto& [addr, b] : d.buffers)
                 if (!b->voice.submix() && b->voice.playing()) ++playing;
-            std::printf("qilin_run: sound at %.0f s: %d voices playing, %llu frames mixed, peak %.3f, %d frames queued for the device, trim %.4f\n",
-                        std::chrono::duration<double>(now - started).count(), playing, (unsigned long long)d.mixed, double(d.peak),
+            int held = 0;
+            for (auto& [addr, b] : d.buffers)
+                if (b->held || b->hold_after_release) ++held;
+            std::printf("qilin_run: sound at %.0f s: %d voices playing (%d streams held), %llu frames mixed, peak %.3f; the device: %llu frames "
+                        "taken, %llu dropped, %d queued, trim %.4f\n",
+                        std::chrono::duration<double>(now - started).count(), playing, held, (unsigned long long)d.mixed, double(d.peak),
+                        (unsigned long long)(d.out ? d.out->pushed() : 0), (unsigned long long)(d.out ? d.out->dropped() : 0),
                         d.out ? d.out->queued_frames() : -1, d.out ? double(d.out->trim()) : 0.0);
             std::fflush(stdout);
             d.peak = 0;

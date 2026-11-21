@@ -33,12 +33,17 @@ public:
     // the playback-rate trim.
     int queued_frames() const;
     float trim() const { return ratio_; }
+    // Frames given to the device's queue so far, and frames dropped because
+    // the queue was full (the device not taking them).
+    uint64_t pushed() const { return pushed_; }
+    uint64_t dropped() const { return dropped_; }
 
 private:
     ::SDL_AudioStream* stream_ = nullptr;
     uint32_t rate_ = 0, channels_ = 0;
     uint32_t target_frames_ = 0;  // the cushion held queued
     float ratio_ = 1.0f;
+    uint64_t pushed_ = 0, dropped_ = 0;
 };
 
 }  // namespace qilin::platform

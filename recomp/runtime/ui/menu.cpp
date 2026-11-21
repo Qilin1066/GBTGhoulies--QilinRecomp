@@ -130,6 +130,10 @@ bool Menu::handle(const SDL_Event& e) {
                 toggle();
                 return true;
             }
+            if (!e.key.repeat && e.key.key == SDLK_F9) {  // a capture of the next frames, for a report
+                capture_frames_ = true;
+                return true;
+            }
             if (!e.key.repeat && e.key.key == SDLK_F3) {  // the frame rate counter, kept in the settings
                 s_.performance_overlay = !s_.performance_overlay;
                 if (!platform::save_settings(folder_, s_))
@@ -191,7 +195,7 @@ void Menu::tick() {
     if (!ok_) return;
     const uint64_t now = SDL_GetTicks();
     if (capture_ >= 0 && now >= capture_until_) capture_ = -1, note_ = "Nothing was pressed: unchanged.";
-    const bool hint = !open_ && now < hint_until_;
+    const bool hint = !open_ && (now < hint_until_ || now < banner_until_);
     const bool counter = !open_ && s_.performance_overlay;
     if (!open_ && !hint && !counter) {
         if (drawing_) renderer_.set_overlay({}), drawing_ = false;
@@ -211,6 +215,11 @@ void Menu::tick() {
     else if (open_ && !peek_) draw_menu();
     ImGui::Render();
     if (close_asked_) close_asked_ = false, close();
+}
+
+void Menu::banner(std::string text) {
+    banner_ = std::move(text);
+    banner_until_ = SDL_GetTicks() + 6000;
 }
 
 void Menu::frame_shown(double ms, std::vector<std::string> details) {
@@ -249,7 +258,7 @@ void Menu::draw_hint() {
     ImGui::Begin("##hint", nullptr,
                  ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoInputs | ImGuiWindowFlags_NoNav |
                      ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoSavedSettings);
-    ImGui::TextUnformatted(kHint);
+    ImGui::TextUnformatted(SDL_GetTicks() < banner_until_ ? banner_.c_str() : kHint);
     ImGui::End();
 }
 
@@ -457,7 +466,7 @@ void Menu::controls_page() {
         note_.clear();
         changed();
     }
-    ImGui::TextDisabled("F1 or Esc (controller: Back + Start): this menu. F3: frame times. F11 or Alt+Enter: full screen.");
+    ImGui::TextDisabled("F1 or Esc (controller: Back + Start): this menu. F3: frame times. F9: capture frames for a report. F11 or Alt+Enter: full screen.");
 }
 
 void Menu::game_page() {

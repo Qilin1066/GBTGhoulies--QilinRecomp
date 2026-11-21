@@ -138,6 +138,8 @@ void out_of_memory(const char* what, uint32_t bytes);
 void register_xapi();
 // Natively replaced game functions with latent bugs (game_fixes.cpp).
 void register_game_fixes();
+// Nanoseconds spent reading the game's files since the last call (the long-frame log's).
+uint64_t take_file_read_ns();
 // Direct3D (d3d.cpp), over the Vulkan renderer.
 struct D3dConfig {
     std::string dump_dir;     // write each presented frame there as frame_NNNNN.png (--dump-frames)

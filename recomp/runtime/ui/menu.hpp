@@ -7,6 +7,7 @@
 
 #include "frame_times.hpp"
 #include <string>
+#include <utility>
 #include <vector>
 #include <cstdint>
 #include <filesystem>
@@ -52,6 +53,10 @@ public:
     void frame_shown(double ms, std::vector<std::string> details);
     // Frames between these two aren't counted (the menu's pause).
     void restart_frame_times() { frame_times_.clear(); }
+    // F9 was pressed since the last call: a capture of the next frames is wanted.
+    bool take_capture() { return std::exchange(capture_frames_, false); }
+    // A line shown bottom left for a few seconds (where the hint goes).
+    void banner(std::string text);
 
 private:
     void toggle();
@@ -73,6 +78,9 @@ private:
     bool ok_ = false, sdl_backend_ = false, vulkan_backend_ = false;
     bool open_ = false, quit_ = false, close_asked_ = false, peek_ = false, drawing_ = false;
     uint64_t hint_until_ = 0;
+    bool capture_frames_ = false;
+    std::string banner_;
+    uint64_t banner_until_ = 0;
     FrameTimes frame_times_;
     std::vector<std::string> frame_details_;
     int capture_ = -1;            // the control waiting for a key, or -1

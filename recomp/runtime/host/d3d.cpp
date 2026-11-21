@@ -14,6 +14,9 @@
 //
 // Anything not modelled yet (a Swap flag, a partial colour clear, a call
 // that isn't registered) stops the runtime with its name.
+#include <fstream>
+#include <filesystem>
+#include <ctime>
 #include <bit>
 #include <cmath>
 #include <algorithm>
@@ -219,6 +222,20 @@ void apply_settings(Device& d, const platform::Settings& s);
 bool trace_draws(const Device& d);
 bool trace_wanted(const std::string& line);
 bool g_trace_matched = false;  // a line was logged this frame: QILIN_TRACE_DUMP keeps it
+
+// A capture (F9): the next kCaptureFrames frames as the draw trace gives
+// them, with every detail, the frames themselves and what each render
+// target a draw samples holds, in one .tar in the data folder's captures/.
+// It's how a picture fault on a GPU this was never run on is seen: the
+// player presses F9 while it shows and sends the file.
+constexpr uint32_t kCaptureFrames = 12;
+struct Capture {
+    std::filesystem::path dir;
+    FILE* log = nullptr;  // open while capturing
+    uint32_t until = 0;   // the last swap captured
+    std::unordered_map<uint32_t, uint32_t> version, dumped;  // a render target's draws so far, and at its last dump
+    uint32_t files = 0;
+} g_capture;
 void update_aspect(rt::Context& c, Device& d, bool settings_changed);
 
 Device& device(const char* fn) {
@@ -422,13 +439,14 @@ void frame_pacing(rt::Context& c, Device& d) {
 void deliver_frame(Device& d) {
     const uint64_t n = d.renderer->frames_presented();
     static const char* trace_dir = std::getenv("QILIN_TRACE_DUMP");
-    if (!d.config.dump_dir.empty() || (trace_dir && trace_draws(d) && std::exchange(g_trace_matched, false))) {
+    if (!d.config.dump_dir.empty() || g_capture.log || (trace_dir && trace_draws(d) && std::exchange(g_trace_matched, false))) {
         gfx::Image im = d.renderer->read_front_buffer();
         for (size_t i = 0; i < im.rgba.size(); i += 4) {  // as the TV gets it: through the gamma ramp, alpha unused
             for (int k = 0; k < 3; ++k) im.rgba[i + k] = d.gamma[k][im.rgba[i + k]];
             im.rgba[i + 3] = 255;
         }
-        const std::string path = (d.config.dump_dir.empty() ? std::string(trace_dir) : d.config.dump_dir) + strf("/frame_%05llu.png", (unsigned long long)n);
+        const std::string path = (g_capture.log ? g_capture.dir.string() : d.config.dump_dir.empty() ? std::string(trace_dir) : d.config.dump_dir) +
+                                 strf("/frame_%05llu.png", (unsigned long long)n);
         if (!gfx::write_png(path, im)) std::fprintf(stderr, "qilin: can't write %s\n", path.c_str());
     }
     if (d.config.max_frames && n >= d.config.max_frames) {
@@ -719,7 +737,7 @@ bool trace_draws(const Device& d) {
         const uint32_t a = uint32_t(std::strtoul(e, &end, 10));
         return std::pair<uint32_t, uint32_t>{a, *end == ',' ? uint32_t(std::strtoul(end + 1, nullptr, 10)) : a};
     }();
-    return d.swaps >= range.first && d.swaps <= range.second;
+    return g_capture.log || (d.swaps >= range.first && d.swaps <= range.second);
 }
 
 // QILIN_TRACE_MATCH=a|b: only the lines with one of them in.
@@ -734,7 +752,48 @@ bool trace_wanted(const std::string& line) {
     return false;
 }
 void trace_line(const std::string& line) {
+    if (g_capture.log) {
+        std::fputs(line.c_str(), g_capture.log);
+        g_trace_matched = true;
+        // What a render target holds changes with each draw and clear into it.
+        if (line.starts_with("draw ") || line.starts_with("clear "))
+            if (const size_t at = line.find(" rt="); at != std::string::npos) ++g_capture.version[uint32_t(std::strtoul(line.c_str() + at + 4, nullptr, 16))];
+        return;
+    }
     if (trace_wanted(line)) std::fputs(line.c_str(), stderr), g_trace_matched = true;
+}
+
+// A capture's files packed into one (a ustar archive, nothing compressed),
+// and the folder removed.
+void pack_capture(const std::filesystem::path& dir) {
+    const std::filesystem::path tar = std::filesystem::path(dir).concat(".tar");
+    std::ofstream out(tar, std::ios::binary);
+    std::error_code ec;
+    for (const auto& entry : std::filesystem::directory_iterator(dir, ec)) {
+        std::ifstream in(entry.path(), std::ios::binary);
+        const std::string data((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+        char h[512] = {};
+        std::snprintf(h, 100, "%s", entry.path().filename().string().c_str());
+        std::snprintf(h + 100, 8, "%07o", 0644u);
+        std::snprintf(h + 108, 8, "%07o", 0u);
+        std::snprintf(h + 116, 8, "%07o", 0u);
+        std::snprintf(h + 124, 12, "%011llo", (unsigned long long)data.size());
+        std::snprintf(h + 136, 12, "%011o", 0u);
+        std::memset(h + 148, ' ', 8);
+        h[156] = '0';
+        std::memcpy(h + 257, "ustar", 6);
+        std::memcpy(h + 263, "00", 2);
+        unsigned sum = 0;
+        for (unsigned char ch : h) sum += ch;
+        std::snprintf(h + 148, 8, "%06o", sum);
+        out.write(h, 512).write(data.data(), std::streamsize(data.size()));
+        static const char zeros[512] = {};
+        if (data.size() % 512) out.write(zeros, std::streamsize(512 - data.size() % 512));
+    }
+    const char end[1024] = {};
+    out.write(end, sizeof end);
+    out.close();
+    std::filesystem::remove_all(dir, ec);
 }
 
 void clear(rt::Context& c) {
@@ -846,24 +905,73 @@ void pump_window(const Device& d) {
     }
 }
 
-// Each frame over 50 ms is logged (stderr, which the player kit keeps in
-// run.log), with where its time went: the game's own work up to Swap
-// (and, within it, pipelines the GPU's compiler made for its draws and
-// textures made or written), and presenting and pacing. A stutter report
-// then says which it was.
+// Long frames are logged (stderr, which the player kit keeps in run.log),
+// with where their time went: the game's own work up to Swap (and, within
+// it, pipelines the GPU's compiler made for its draws and textures made
+// or written), and presenting and pacing. A stutter report then says
+// which it was. Long is over 50 ms, or over 10 ms and two and a half times
+// what frames have been taking (a dropped frame at a high refresh rate);
+// at most 40 of the second kind a second, and 2000 a run.
 void long_frames(Device& d, std::chrono::steady_clock::time_point present_from) {
     const auto now = std::chrono::steady_clock::now();
     const gfx::Renderer::Costs costs = d.renderer->take_costs();
+    const double read_ms = double(take_file_read_ns()) / 1e6;
+    static double usual = 0;  // ms, a running average
+    static uint32_t logged = 0, this_second = 0;
+    static auto second = now;
+    if (now - second >= std::chrono::seconds(1)) second = now, this_second = 0;
     if (d.frame_began != std::chrono::steady_clock::time_point{}) {
         auto ms = [](auto t) { return std::chrono::duration<double, std::milli>(t).count(); };
-        if (const double total = ms(now - d.frame_began); total > 50)
+        const double total = ms(now - d.frame_began);
+        const bool dropped = usual > 0 && total > 10 && total > usual * 2.5 && this_second < 40 && logged < 2000;
+        if (total > 50 || dropped) {
+            ++logged, ++this_second;
             std::fprintf(stderr,
-                         "qilin: frame %u took %.0f ms: the game %.0f ms (%u pipelines made for draws, %.0f ms; %u textures made or "
-                         "written, %.0f ms), presenting %.0f ms\n",
-                         d.swaps, total, ms(present_from - d.frame_began), costs.pipelines, costs.pipeline_ms, costs.textures,
-                         costs.texture_ms, ms(now - present_from));
+                         "qilin: frame %u took %.1f ms (usually %.1f): the game %.1f ms (reading files %.1f ms; %u pipelines made for draws, %.1f "
+                         "ms; %u textures made or written, %.1f ms), presenting %.1f ms; ended at %.3f s on the steady clock\n",
+                         d.swaps, total, usual, ms(present_from - d.frame_began), read_ms, costs.pipelines, costs.pipeline_ms, costs.textures,
+                         costs.texture_ms, ms(now - present_from), std::chrono::duration<double>(now.time_since_epoch()).count());
+        }
+        usual = usual > 0 ? usual + (std::min(total, usual * 4) - usual) * 0.05 : total;
     }
     d.frame_began = now;
+}
+
+// A capture begins at the Swap after F9 and ends kCaptureFrames later.
+void capture_step(rt::Context& c, Device& d) {
+    if (g_capture.log && d.swaps >= g_capture.until) {
+        std::fclose(g_capture.log);
+        g_capture.log = nullptr;
+        pack_capture(g_capture.dir);
+        const std::string where = std::filesystem::path(g_capture.dir).concat(".tar").string();
+        std::printf("qilin_run: captured %u frames to %s\n", kCaptureFrames, where.c_str());
+        std::fflush(stdout);
+        if (d.menu) d.menu->banner("Captured " + std::to_string(kCaptureFrames) + " frames to " + where);
+        d.frame_began = {};  // its frames aren't long frames
+    } else if (g_capture.log) {
+        std::fprintf(g_capture.log, "swap %u: time step %.5f s\n", d.swaps, double(std::bit_cast<float>(ld(c, 0x5096C0))));
+    } else if (d.menu && d.menu->take_capture()) {
+        std::error_code ec;
+        const auto now = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
+        char stamp[32] = "capture";
+        if (const std::tm* tm = std::localtime(&now)) std::strftime(stamp, sizeof stamp, "%Y%m%d-%H%M%S", tm);
+        g_capture.dir = std::filesystem::path(d.config.settings_folder) / "captures" / stamp;
+        std::filesystem::create_directories(g_capture.dir, ec);
+        g_capture.log = std::fopen((g_capture.dir / "trace.txt").string().c_str(), "w");
+        if (!g_capture.log) {
+            std::printf("qilin_run: can't write a capture to %s\n", g_capture.dir.string().c_str());
+            return;
+        }
+        g_capture.until = d.swaps + kCaptureFrames;
+        g_capture.version.clear(), g_capture.dumped.clear(), g_capture.files = 0;
+        const platform::Settings& s = *d.config.settings;
+        std::fprintf(g_capture.log,
+                     "GBTGhoulies-QilinRecomp " QILIN_VERSION ", %s; render scale %ux%u, aspect %u:%u, frame rate setting %d, vsync %d, "
+                     "smaa %d, fsr %d; draws numbered %u to %u, each shown in the frame numbered one more\n",
+                     d.renderer->device_name().c_str(), d.renderer->resolution_scale_x(), d.renderer->resolution_scale_y(), s.aspect_w, s.aspect_h,
+                     int(s.frame_rate), int(s.vsync), int(s.smaa), int(s.fsr), d.swaps,
+                     g_capture.until - 1);
+    }
 }
 
 // DWORD D3DDevice_Swap(DWORD Flags): shows the frame at the vblank the
@@ -958,6 +1066,7 @@ void swap(rt::Context& c) {
         }
     }
     deliver_frame(d);
+    capture_step(c, d);
     pump_audio(c);
     pump_window(d);
     ret(c, d.swaps, 4);
@@ -1393,6 +1502,11 @@ bool stream_from_arena(rt::Context& c, Device& d, const std::array<Slot, 16>& sl
     // game draws the same floor once more for each character's shadow, and
     // comparing every draw was 30 MB a frame in a fight.
     const bool settled = r.bytes && d.swaps - r.changed >= kSettledSwaps && r.checked_swap == d.swaps && r.checked_epoch == d.memory_epoch;
+    // QILIN_CHECK_SETTLED=1: a settled run compared all the same, and a
+    // difference reported (the game wrote vertices without a lock).
+    static const bool check_settled = std::getenv("QILIN_CHECK_SETTLED") != nullptr;
+    if (check_settled && settled && (r.src.size() != span || std::memcmp(r.src.data(), src, size_t(span)) != 0))
+        std::fprintf(stderr, "qilin: a settled vertex run changed without a lock: %08X stride %u count %u, swap %u\n", stream_at, stride, count, d.swaps);
     if (settled || (r.bytes && r.src.size() == span && std::memcmp(r.src.data(), src, size_t(span)) == 0)) {
         r.changes = 0;
         r.checked_swap = d.swaps, r.checked_epoch = d.memory_epoch;
@@ -2644,7 +2758,7 @@ void issue_draw(rt::Context& c, Device& d, const char* fn, uint32_t prim, Vertic
         trace_line(line);
         // QILIN_TRACE_DETAIL=1: each logged draw's stencil, alpha test, combiners and positions too.
         static const bool detail = std::getenv("QILIN_TRACE_DETAIL") != nullptr;
-        if (detail && trace_wanted(line)) {
+        if (g_capture.log || (detail && trace_wanted(line))) {
             std::string x = strf("  stencil f=%u ref=%u mask=%x/%x ops=%u/%u/%u alpha f=%u ref=%u combiners=%u final=%08X/%08X modes=%x in=%x dot=%x\n",
                                  rs(kRsStencilFunc), rs(kRsStencilRef), rs(kRsStencilMask), rs(kRsStencilWriteMask), rs(kRsStencilFail),
                                  rs(kRsStencilZFail), rs(kRsStencilPass), rs(kRsAlphaFunc), rs(kRsAlphaRef), cs.combiner_count, cs.final_abcd,
@@ -2661,13 +2775,19 @@ void issue_draw(rt::Context& c, Device& d, const char* fn, uint32_t prim, Vertic
                     }
                 x += "\n";
             }
-            std::fputs(x.c_str(), stderr);
+            std::fputs(x.c_str(), g_capture.log ? g_capture.log : stderr);
         }
-        if (const char* dir = std::getenv("QILIN_TRACE_DUMP"); dir && *dir && trace_wanted(line)) {
+        const std::string capture_dir = g_capture.log ? g_capture.dir.string() : std::string();
+        if (const char* dir = g_capture.log ? capture_dir.c_str() : std::getenv("QILIN_TRACE_DUMP"); dir && *dir && (g_capture.log || trace_wanted(line))) {
             static uint32_t n = 0;
             for (uint32_t stage = 0; stage < 4; ++stage)
                 for (const auto& [addr, tt] : d.targets)
                     if (cmd.textures[stage] && tt.texture.id == cmd.textures[stage]) {
+                        if (g_capture.log) {  // once for each state of the target, and not without end
+                            if (g_capture.dumped[addr] == g_capture.version[addr] + 1 || g_capture.files >= 400) continue;
+                            g_capture.dumped[addr] = g_capture.version[addr] + 1, ++g_capture.files;
+                            std::fprintf(g_capture.log, "  target %08X as %u_%04u_%08X.pam\n", addr, d.swaps, n, addr);
+                        }
                         const gfx::Image im = d.renderer->read_render_target(tt.texture.id);
                         if (FILE* f = std::fopen(strf("%s/%u_%04u_%08X.pam", dir, d.swaps, n++, addr).c_str(), "wb")) {
                             std::fprintf(f, "P7\nWIDTH %u\nHEIGHT %u\nDEPTH 4\nMAXVAL 255\nTUPLTYPE RGB_ALPHA\nENDHDR\n", im.width, im.height);
@@ -2677,7 +2797,10 @@ void issue_draw(rt::Context& c, Device& d, const char* fn, uint32_t prim, Vertic
                     }
         }
     }
-    d.renderer->draw(cmd);
+    // QILIN_NO_DRAW=1: nothing drawn (clears and presents only), so a slow
+    // test machine reaches the frame rates a fast one does.
+    static const bool no_draw = std::getenv("QILIN_NO_DRAW") != nullptr;
+    if (!no_draw) d.renderer->draw(cmd);
     t_spare_vertices = std::move(v);
     t_spare_sequence = std::move(seq);
 }

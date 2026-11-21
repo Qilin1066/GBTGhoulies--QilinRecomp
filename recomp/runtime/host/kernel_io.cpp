@@ -12,6 +12,7 @@
 // information classes), and I/O completes synchronously. Anything the game
 // asks for that isn't modelled yet (an APC routine, an event handle, an
 // information class) stops the runtime with its name.
+#include <atomic>
 #include <set>
 #include <algorithm>
 #include <chrono>
@@ -36,6 +37,7 @@
 namespace qilin::host {
 namespace fs = std::filesystem;
 namespace {
+std::atomic<uint64_t> g_io_ns{0};  // time spent reading files, for the long-frame log
 
 // ---------------------------------------------------------------- statuses
 constexpr uint32_t kSuccess = 0, kNoMoreFiles = 0x80000006, kBufferOverflow = 0x80000005,
@@ -500,7 +502,9 @@ void transfer(rt::Context& c, bool write, const char* fn) {
         } else {
             h->file->clear();
             h->file->seekg(std::streamoff(off));
+            const auto io0 = std::chrono::steady_clock::now();
             h->file->read(reinterpret_cast<char*>(c.mem + buf), len);
+            g_io_ns += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - io0).count());
             done = uint32_t(h->file->gcount());
         }
     }
@@ -951,5 +955,7 @@ void register_kernel_io(const IoConfig& cfg) {
         register_hle(kernel_addr(e->ordinal), e->name, k.fn);
     }
 }
+
+uint64_t take_file_read_ns() { return g_io_ns.exchange(0); }
 
 }  // namespace qilin::host
