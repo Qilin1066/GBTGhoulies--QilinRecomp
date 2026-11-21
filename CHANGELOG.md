@@ -11,6 +11,9 @@ Each release is a git tag (`vX.Y.Z`) with a matching GitHub release. The version
 
 ## [Unreleased]
 
+### Changed
+- **The settings menu is laid out as in the other QilinRecomp projects** (Punch-Out!!, Beat the Beat, APB): Close and Quit at the top right of every page (Quit was at the bottom of the Game page), the pages in the order Controls, Display, Game, the connected controllers listed on the Controls page, *Back to the defaults*, a line of the shortcut keys, sections headed Window, Picture and Graphics device, "Frame times (F3)", and an About section with the version and the settings file. The hint reads "F1 or Esc (controller: Back + Start): settings". No setting changed.
+
 ## [0.40.2] - 2026-11-20
 
 ### Fixed

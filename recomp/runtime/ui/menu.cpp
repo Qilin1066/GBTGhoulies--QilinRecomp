@@ -26,7 +26,7 @@ void check_vk(VkResult r) {
     if (r != VK_SUCCESS) std::fprintf(stderr, "qilin: Vulkan error %d in the settings menu\n", int(r));
 }
 
-constexpr const char* kHint = "F1 or Esc (controller: Back and Start together): settings    F3: frame rate counter";
+constexpr const char* kHint = "F1 or Esc (controller: Back + Start): settings";
 
 struct Language {
     uint32_t value;
@@ -257,17 +257,25 @@ void Menu::draw_menu() {
     ImGui::SetNextWindowBgAlpha(0.88f);
     ImGui::Begin("Settings", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings);
     ImGui::TextUnformatted("Grabbed by the Ghoulies - settings (the game is paused)");
-    ImGui::SameLine(ImGui::GetContentRegionAvail().x - ImGui::CalcTextSize("Close (Esc)").x);
+    // Close and Quit, top right on every page, as in the other recomps.
+    const ImGuiStyle& st = ImGui::GetStyle();
+    const float buttons = ImGui::CalcTextSize("Close (Esc)").x + ImGui::CalcTextSize("Quit the game").x + 4 * st.FramePadding.x + st.ItemSpacing.x;
+    ImGui::SameLine(ImGui::GetContentRegionAvail().x - buttons + ImGui::GetCursorPosX());
     if (ImGui::Button("Close (Esc)")) close_asked_ = true;
+    ImGui::SameLine();
+    if (ImGui::Button("Quit the game")) {
+        close();
+        quit_ = true;
+    }
     ImGui::Separator();
     ImGui::PushItemWidth(ImGui::GetContentRegionAvail().x * 0.45f);
     if (ImGui::BeginTabBar("pages")) {
-        if (ImGui::BeginTabItem("Display")) {
-            display_page();
-            ImGui::EndTabItem();
-        }
         if (ImGui::BeginTabItem("Controls")) {
             controls_page();
+            ImGui::EndTabItem();
+        }
+        if (ImGui::BeginTabItem("Display")) {
+            display_page();
             ImGui::EndTabItem();
         }
         if (ImGui::BeginTabItem("Game")) {
@@ -326,12 +334,13 @@ void Menu::aspect_combo() {
 }
 
 void Menu::display_page() {
+    ImGui::SeparatorText("Window");
     bool full = window_.fullscreen();
     if (ImGui::Checkbox("Full screen (F11 or Alt+Enter)", &full)) {
         window_.set_fullscreen(full);
         s_.fullscreen = full;
     }
-    ImGui::SeparatorText("The picture");
+    ImGui::SeparatorText("Picture");
     aspect_combo();
     int scaling = int(s_.scaling);
     bool any = false;
@@ -370,7 +379,7 @@ void Menu::display_page() {
         if (ImGui::Combo("Frame rate", &rate, kRates, 4)) s_.frame_rate = platform::Settings::FrameRate(rate), changed();
     }
     if (ImGui::Checkbox("Low latency (with vsync: at most one frame waiting)", &s_.low_latency)) changed();
-    if (ImGui::Checkbox("Frame rate counter (F3)", &s_.performance_overlay)) changed();
+    if (ImGui::Checkbox("Frame times (F3)", &s_.performance_overlay)) changed();
     if (ImGui::Button("Look at the picture")) peek_ = true;
     ImGui::SameLine();
     ImGui::TextDisabled("(any key or button comes back)");
@@ -388,11 +397,22 @@ void Menu::display_page() {
     } else {
         ImGui::TextDisabled("Anisotropic filtering: this GPU doesn't have it.");
     }
-    ImGui::TextDisabled("Graphics device: %s", renderer_.device_name().c_str());
+    ImGui::SeparatorText("Graphics device");
+    ImGui::TextDisabled("In use: %s.", renderer_.device_name().c_str());
 }
 
 void Menu::controls_page() {
+    ImGui::SeparatorText("Controllers");
+    int n = 0;
+    SDL_JoystickID* ids = SDL_GetGamepads(&n);
+    if (n == 0) ImGui::TextDisabled("None connected: the keyboard plays controller 1.");
+    for (int i = 0; i < n; ++i) {
+        const char* name = SDL_GetGamepadNameForID(ids[i]);
+        ImGui::BulletText("%s", name ? name : "A controller");
+    }
+    SDL_free(ids);
     if (ImGui::Checkbox("Rumble", &s_.rumble)) changed();
+    ImGui::SeparatorText("Keys");
     ImGui::TextWrapped("Controllers use the Xbox controller's layout (Black and White are the shoulder buttons). "
                        "The keyboard is controller 1; click a control's keys to add one, right-click a key to remove it.");
     if (!note_.empty()) ImGui::TextColored(ImVec4(1, 0.85f, 0.4f, 1), "%s", note_.c_str());
@@ -429,14 +449,16 @@ void Menu::controls_page() {
         }
         ImGui::EndTable();
     }
-    if (ImGui::Button("Keys back to the defaults")) {
+    if (ImGui::Button("Back to the defaults")) {
         platform::default_keys(s_);
         note_.clear();
         changed();
     }
+    ImGui::TextDisabled("F1 or Esc (controller: Back + Start): this menu. F3: frame times. F11 or Alt+Enter: full screen.");
 }
 
 void Menu::game_page() {
+    ImGui::SeparatorText("Sound and language");
     int volume = int(s_.volume);
     if (ImGui::SliderInt("Volume", &volume, 0, 100, "%d%%", ImGuiSliderFlags_AlwaysClamp)) s_.volume = uint32_t(volume), changed();
     static const char* kChannels[] = {"The device's own (5.1 where it has six speakers)", "Stereo", "5.1"};
@@ -450,13 +472,12 @@ void Menu::game_page() {
             if (ImGui::Selectable(l.name, l.value == s_.language)) s_.language = l.value;
         ImGui::EndCombo();
     }
-    ImGui::Separator();
-    ImGui::TextDisabled("Grabbed by the Ghoulies QilinRecomp %s", QILIN_VERSION);
-    ImGui::TextDisabled("Settings: %s", platform::settings_file(folder_).string().c_str());
-    if (ImGui::Button("Quit the game")) {
-        close();
-        quit_ = true;
-    }
+
+    ImGui::SeparatorText("About");
+    ImGui::TextWrapped("Grabbed by the Ghoulies QilinRecomp %s: a static recompilation, the game's own code compiled for this computer.",
+                       QILIN_VERSION);
+    ImGui::TextWrapped("Graphics: Vulkan. Window, sound and input: SDL3 (zlib). Menu: Dear ImGui (MIT).");
+    ImGui::TextWrapped("Settings file: %s", platform::settings_file(folder_).string().c_str());
 }
 
 }  // namespace qilin::ui
