@@ -123,6 +123,7 @@ struct DirectSound {
     std::thread mixer;
     std::atomic<bool> quit{false};
     float volume = 1.0f;                                 // the settings' volume, on what goes to the device
+    float peak = 0;                                      // the mix's loudest sample since the sound log last looked
     bool paused = false;                                 // the settings menu is up: nothing mixed, the clock stopped
     std::chrono::steady_clock::time_point paused_at;
     std::condition_variable wake;
@@ -221,6 +222,7 @@ void mix_block(DirectSound& d, uint32_t n) {
     }
     d.limiter.process(d.stereo.data(), n);
     if (d.wav) d.wav->write(d.stereo.data(), n);
+    for (float x : d.stereo) d.peak = std::max(d.peak, std::fabs(x));
     const float v = d.volume;
     if (d.out && d.out->channels() == 6) {
         d.speakers.resize(size_t(n) * 6);
@@ -1132,6 +1134,24 @@ void pump_audio(rt::Context& c) {
             }
             (void)looping;
             std::printf("qilin_run: audio: %d streams, %d buffers playing;%s\n", streams, buffers, list.c_str());
+        }
+        // The sound log: for the first two minutes, every 10 s, what's
+        // playing, how loud the mix was, and whether the device is taking
+        // it (frames queued for it, the rate trim), in run.log.
+        static const auto started = std::chrono::steady_clock::now();
+        static auto logged = started;
+        const auto now = std::chrono::steady_clock::now();
+        if (now - started <= std::chrono::minutes(2) && now - logged >= std::chrono::seconds(10)) {
+            logged = now;
+            DirectSound& d = ds();
+            int playing = 0;
+            for (auto& [addr, b] : d.buffers)
+                if (!b->voice.submix() && b->voice.playing()) ++playing;
+            std::printf("qilin_run: sound at %.0f s: %d voices playing, %llu frames mixed, peak %.3f, %d frames queued for the device, trim %.4f\n",
+                        std::chrono::duration<double>(now - started).count(), playing, (unsigned long long)d.mixed, double(d.peak),
+                        d.out ? d.out->queued_frames() : -1, d.out ? double(d.out->trim()) : 0.0);
+            std::fflush(stdout);
+            d.peak = 0;
         }
     }
     deliver(c);

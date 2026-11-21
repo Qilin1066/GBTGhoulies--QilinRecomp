@@ -4,6 +4,8 @@
 
 #include <algorithm>
 #include <SDL3/SDL.h>
+
+#include <cstdio>
 #define SDL_MAIN_HANDLED  // the runtime's own main() starts everything; SDL is told it's ready
 #include <SDL3/SDL_main.h>
 #include <SDL3/SDL_vulkan.h>
@@ -116,6 +118,21 @@ void Window::pump(Input* input, const std::function<bool(const SDL_Event&)>& hoo
         if (input) input->on_event(e);  // controllers coming and going, whatever else sees it
         if (hook && hook(e)) continue;
         switch (e.type) {
+        // Sound devices coming and going, for the log (a stop in the sound
+        // with one of these near it is the device's doing).
+        case SDL_EVENT_AUDIO_DEVICE_ADDED:
+        case SDL_EVENT_AUDIO_DEVICE_REMOVED:
+        case SDL_EVENT_AUDIO_DEVICE_FORMAT_CHANGED:
+            if (!e.adevice.recording) {
+                const char* name = SDL_GetAudioDeviceName(e.adevice.which);
+                std::printf("qilin_run: sound device %s: %s\n",
+                            e.type == SDL_EVENT_AUDIO_DEVICE_ADDED     ? "added"
+                            : e.type == SDL_EVENT_AUDIO_DEVICE_REMOVED ? "removed"
+                                                                       : "format changed",
+                            name ? name : "(unnamed)");
+                std::fflush(stdout);
+            }
+            break;
         case SDL_EVENT_QUIT:
         case SDL_EVENT_WINDOW_CLOSE_REQUESTED: quit_ = true; break;
         case SDL_EVENT_KEY_DOWN:

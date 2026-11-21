@@ -11,6 +11,11 @@ Each release is a git tag (`vX.Y.Z`) with a matching GitHub release. The version
 
 ## [Unreleased]
 
+## [0.41.3] - 2026-11-21
+
+### Added
+- **A sound log** in `run.log`: for the first two minutes, every 10 seconds, how many voices are playing, how loud the mix was, and how much is queued for the sound device (and its rate trim); and sound devices added, removed or changing format at any time. A report of sound stopping then says whether the game stopped making it or the device stopped taking it.
+
 ### Changed
 - **Licence: GPL-3.0** (`LICENSE`), as in all the QilinRecomp projects, in place of MIT: anyone may use, share, change and sell it, but whatever they distribute that is built from it must come with its full source under the same licence. Earlier versions stay under MIT.
 

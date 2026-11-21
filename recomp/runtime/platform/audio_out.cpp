@@ -54,6 +54,12 @@ AudioOut::~AudioOut() {
     SDL_QuitSubSystem(SDL_INIT_AUDIO);
 }
 
+int AudioOut::queued_frames() const {
+    if (!stream_) return -1;
+    const int bytes = SDL_GetAudioStreamQueued(stream_);
+    return bytes < 0 ? -1 : bytes / int(channels_ * sizeof(float));
+}
+
 void AudioOut::push(const float* frames, uint32_t count) {
     if (!stream_ || !count) return;
     // After a stall (the game loading without reaching DirectSound or a

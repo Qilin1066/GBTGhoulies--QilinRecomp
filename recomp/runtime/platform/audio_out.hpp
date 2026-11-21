@@ -29,6 +29,10 @@ public:
     void push(const float* frames, uint32_t count);
 
     uint32_t channels() const { return channels_; }
+    // For the sound log: frames queued for the device (-1 if unknown), and
+    // the playback-rate trim.
+    int queued_frames() const;
+    float trim() const { return ratio_; }
 
 private:
     ::SDL_AudioStream* stream_ = nullptr;
