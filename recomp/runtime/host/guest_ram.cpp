@@ -155,7 +155,14 @@ uint8_t* map_guest_ram(uint32_t ram_size, std::string* error) {
         return nullptr;
     }
     uint8_t* base = map(ram_size, error);
-    if (base) rt::g_ram_aliases = true, rt::g_ram_size = ram_size, g_base = base;
+    if (!base) return nullptr;
+    rt::g_ram_aliases = true, rt::g_ram_size = ram_size, g_base = base;
+    // Every page of RAM made now, not when the game first touches it: the
+    // host's first touch of each (a fault, and a page zeroed) otherwise
+    // lands in the frames where a new scene's data comes in, a stutter.
+    // The memory is the game's own to fill, all of it in use soon anyway.
+    const size_t page = host_page();
+    for (size_t at = 0; at < ram_size; at += page) base[at] = 0;
     return base;
 }
 

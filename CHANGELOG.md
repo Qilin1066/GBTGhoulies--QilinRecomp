@@ -11,11 +11,17 @@ Each release is a git tag (`vX.Y.Z`) with a matching GitHub release. The version
 
 ## [Unreleased]
 
-### Added
-- **Project licence: MIT** (`LICENSE`), as in the other QilinRecomp projects. The README's new Licence section lists what keeps its own licence (the vendored code and SDL3) and that the game is Microsoft's and Rare's.
+## [0.41.0] - 2026-11-21
 
 ### Fixed
+- **Shadows flickering in and out**, and dying imps' shadows flickering: the game draws each shadow as the floor drawn again, by another vertex program, where its depth meets the floor's within a small bias. Three things let the two depths drift apart by more than that bias, in patches that came and went as the camera moved: the GPU's own order for dot products, its own precision for the perspective divide's reciprocal (Vulkan allows 2.5 ULP), and the bias's slope part, which is per pixel and so shrank at higher render resolutions (a third of the console's at 3×). Dot products now add up in a fixed order, the reciprocal is refined to within about one ULP, and the slope factor scales with the render resolution.
+- **Stutter when a fight starts or a new scene comes in** (page turns), from shaders compiled the first time they're needed: see the pipeline library below. Guest RAM and the vertex buffer memory are also touched once at start, not page by page as a new scene's data first goes in.
 - **The macOS (Apple Silicon) build failed** in `fsr_constants.cpp`: FSR 1's `ffx_a.h` calls `labs` unqualified, which macOS's libc++ doesn't declare through `<cmath>`. Include the C headers that declare it. `ffx_a.h` stays unmodified.
+
+### Added
+- **Pipeline library**: `pipeline_library.bin` in the data folder records what each GPU pipeline was made from (its state, the game's vertex program and combiner setup), and at start a background thread makes them all again, so pipelines the game has used before are ready before it needs them, even after an update (which changes the shaders' translation, and so empties the driver's own cache). `QILIN_TRACE_PIPELINES=1` logs each pipeline a draw still had to make.
+- `QILIN_FPS=1` also logs each frame that took over 50 ms.
+- **Project licence: MIT** (`LICENSE`), as in the other QilinRecomp projects. The README's new Licence section lists what keeps its own licence (the vendored code and SDL3) and that the game is Microsoft's and Rare's.
 
 ### Changed
 - **The settings menu is laid out as in the other QilinRecomp projects** (Punch-Out!!, Beat the Beat, APB): Close and Quit at the top right of every page (Quit was at the bottom of the Game page), the pages in the order Controls, Display, Game, the connected controllers listed on the Controls page, *Back to the defaults*, a line of the shortcut keys, sections headed Window, Picture and Graphics device, "Frame times (F3)", and an About section with the version and the settings file. The hint reads "F1 or Esc (controller: Back + Start): settings". No setting changed.

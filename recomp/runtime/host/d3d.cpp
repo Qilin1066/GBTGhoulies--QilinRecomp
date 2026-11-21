@@ -148,6 +148,9 @@ struct Device {
     // Draws decoded since the last Swap, until the renderer draws them.
     // Shaders made so far, by key, and textures uploaded, by their header and address.
     std::unordered_map<uint64_t, std::vector<uint32_t>> shaders;
+    // What each was made from, for the renderer's pipeline library (gfx::DrawCmd::vs_program).
+    std::unordered_map<uint64_t, gfx::vsh::Program> vs_programs;
+    std::unordered_map<uint64_t, gfx::nv2a::CombinerSetup> fs_setups;
     // Programs that place vertices by one matrix, oPos = (v0·c[n], …, v0·c[n+3])
     // as the first four instructions: n (0-191), or -1 (flat_overlay).
     std::unordered_map<uint64_t, int> position_matrix;
@@ -909,7 +912,8 @@ void swap(rt::Context& c) {
         st(c, kDeviceStorage + kDevRenderTarget, now);
     }
     frame_pacing(c, d);
-    // QILIN_FPS=1: frames per second, and the game's time step, once a second.
+    // QILIN_FPS=1: frames per second, and the game's time step, once a second,
+    // and each frame that took over 50 ms.
     static const bool fps = std::getenv("QILIN_FPS") != nullptr;
     if (fps) {
         static auto since = std::chrono::steady_clock::now();
@@ -918,6 +922,10 @@ void swap(rt::Context& c) {
         static float lo = 1e9f, hi = 0.0f;
         const float step = std::bit_cast<float>(ld(c, 0x5096C0));
         lo = std::min(lo, step), hi = std::max(hi, step);
+        static auto last = now;  // and each frame that took over 50 ms
+        if (const double ms = std::chrono::duration<double, std::milli>(now - last).count(); ms > 50)
+            std::fprintf(stderr, "qilin: frame %u took %.0f ms\n", d.swaps, ms);
+        last = now;
         if (now - since >= std::chrono::seconds(1)) {
             const double s = std::chrono::duration<double>(now - since).count();
             std::fprintf(stderr, "qilin: %.1f frames a second, time step %.4f s (%.5f to %.5f)\n", (d.swaps - from) / s, double(step),
@@ -2339,6 +2347,7 @@ void issue_draw(rt::Context& c, Device& d, const char* fn, uint32_t prim, Vertic
         } catch (const std::exception& e) {
             unmodelled(fn, e.what());
         }
+        d.vs_programs[vs_key] = *prog;
     }
 
     // The register combiners as the render states hold them.
@@ -2405,7 +2414,7 @@ void issue_draw(rt::Context& c, Device& d, const char* fn, uint32_t prim, Vertic
     }
     const uint64_t fs_key = cs.hash() ^ 2;
     auto& fs_code = d.shaders[fs_key];
-    if (fs_code.empty()) fs_code = gfx::nv2a::combiners(cs);
+    if (fs_code.empty()) fs_code = gfx::nv2a::combiners(cs), d.fs_setups[fs_key] = cs;
     if (!fixed_pixels) {
         for (uint32_t i = 0; i < 8; ++i) {
             color_to_float(rs(kRsPsConstant0 + i), &fsu[(gfx::nv2a::kFsC0 + i) * 4]);
@@ -2565,6 +2574,8 @@ void issue_draw(rt::Context& c, Device& d, const char* fn, uint32_t prim, Vertic
 
     cmd.primitive = convert_primitive(fn, prim, seq, indexed);
     cmd.vs_key = vs_key, cmd.fs_key = fs_key, cmd.vs_code = &vs_code, cmd.fs_code = &fs_code;
+    if (auto it = d.vs_programs.find(vs_key); it != d.vs_programs.end()) cmd.vs_program = &it->second;
+    if (auto it = d.fs_setups.find(fs_key); it != d.fs_setups.end()) cmd.fs_setup = &it->second;
     cmd.inputs = v.mask;
     cmd.vertex_count = v.count;
     for (uint32_t n = 0; n < 16; ++n)
@@ -2605,7 +2616,7 @@ void issue_draw(rt::Context& c, Device& d, const char* fn, uint32_t prim, Vertic
             for (uint32_t i = 0; i < v.count && i < 4; ++i) {
                 x += strf("  v%u", i);
                 for (uint32_t n = 0; n < 16; ++n)
-                    if (v.mask & (1u << n)) {
+                    if ((v.mask & (1u << n)) && v.attr[n].size() >= ((v.constant & (1u << n)) ? 0 : i * 4) + 4) {  // not those in the arena
                         const float* a = v.attr[n].data() + ((v.constant & (1u << n)) ? 0 : i * 4);
                         x += strf(" a%u=(%.3g %.3g %.3g %.3g)", n, a[0], a[1], a[2], a[3]);
                     }

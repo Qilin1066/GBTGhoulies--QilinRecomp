@@ -15,6 +15,9 @@
 
 namespace qilin::gfx {
 
+namespace vsh { struct Program; }
+namespace nv2a { struct CombinerSetup; }
+
 struct Config {
     uint32_t width = 640, height = 480;  // the frame buffers' size in pixels
     uint32_t back_buffers = 1;           // D3DPRESENT_PARAMETERS.BackBufferCount; with the front buffer, one more image
@@ -115,6 +118,11 @@ struct DrawCmd {
     uint64_t vs_key = 0, fs_key = 0;
     const std::vector<uint32_t>* vs_code = nullptr;
     const std::vector<uint32_t>* fs_code = nullptr;
+    // What the two were made from (the vertex program, for the inputs
+    // below, and the combiners), if known: the renderer keeps them with each
+    // pipeline it makes, and makes those again early in the next run.
+    const vsh::Program* vs_program = nullptr;
+    const nv2a::CombinerSetup* fs_setup = nullptr;
     uint32_t inputs = 0;  // attribute n present: bit n
     Primitive primitive = Primitive::Triangles;
 

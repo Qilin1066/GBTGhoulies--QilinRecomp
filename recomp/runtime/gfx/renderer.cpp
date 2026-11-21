@@ -19,6 +19,14 @@
 #include <cstring>
 
 #include <map>
+#include <stdexcept>
+#include <string_view>
+#include <type_traits>
+#include <set>
+#include <mutex>
+#include <condition_variable>
+#include <atomic>
+#include <thread>
 #include <span>
 #include <unordered_map>
 
@@ -27,6 +35,7 @@
 #include "nv2a_shaders.hpp"
 #include "spirv.hpp"
 #include "texture.hpp"
+#include "vsh.hpp"
 #include "volk.h"
 
 // Vulkan structures are zero-initialised by naming only their sType
@@ -367,6 +376,35 @@ private:
         auto operator<=>(const PipelineKey&) const = default;
     };
     std::map<PipelineKey, VkPipeline> pipelines_;
+    VkPipeline make_pipeline(const PipelineKey& k, VkShaderModule vs, VkShaderModule fs) const;
+    // The pipeline library: what each pipeline was made from (the vertex
+    // program and the combiners, not their SPIR-V, which changes with the
+    // translators), kept in a file beside the pipeline cache. A thread
+    // makes them all again from it at the start, the shaders translated
+    // afresh, so a draw finds its pipeline made rather than waiting for
+    // the GPU's compiler (a stutter the first time each is seen).
+    struct Library {
+        std::filesystem::path path;
+        std::ofstream out;  // new entries, appended
+        // Each pipeline's shaders' sources (library_sources), by key, in
+        // the order first seen; stale: one changed, so the file is
+        // written again whole at the end.
+        std::map<PipelineKey, std::string> sources;
+        std::vector<PipelineKey> order;
+        bool stale = false;
+        std::thread worker;
+        std::mutex lock;
+        std::condition_variable done;
+        std::map<PipelineKey, VkPipeline> made;  // by the worker, not yet taken
+        std::set<PipelineKey> claimed;           // made, or being made, by the draws
+        bool busy = false;                       // the worker is making `current`
+        PipelineKey current{};
+        std::atomic<bool> stop{false};
+    } library_;
+    void write_library_entry(std::ostream& out, const PipelineKey& k, const std::string& sources);
+    void start_library();
+    void record_in_library(const PipelineKey& k, const DrawCmd& c);
+    void stop_library();
     std::vector<std::pair<SamplerDesc, VkSampler>> samplers_;
     struct Texture {
         VkImage image = VK_NULL_HANDLE;
@@ -779,11 +817,13 @@ bool VulkanRenderer::init(const Config& config, std::string* error) {
         vkCmdClearDepthStencilImage(cmd_, depth_.image, depth_.layout, &zero_depth, 1, &range);
     }
     submit();
+    start_library();
     return true;
 }
 
 void VulkanRenderer::destroy() {
     if (device_) {
+        stop_library();
         vkDeviceWaitIdle(device_);
         auto drop = [&](Target& t) {
             if (t.view) vkDestroyImageView(device_, t.view, nullptr);
@@ -1025,6 +1065,7 @@ void VulkanRenderer::load_pipeline_cache() {
 // Written to a new file and renamed over the old one, so a run stopped
 // halfway leaves the last whole cache.
 void VulkanRenderer::save_pipeline_cache() {
+    if (library_.out.is_open()) library_.out.flush();
     if (!pipeline_cache_ || !unsaved_pipelines_ || config_.pipeline_cache.empty()) return;
     size_t size = 0;
     if (vkGetPipelineCacheData(device_, pipeline_cache_, &size, nullptr) != VK_SUCCESS || !size) return;
@@ -2084,6 +2125,9 @@ void VulkanRenderer::create_draw_objects() {
         check(vkMapMemory(device_, arena_memory_, 0, kArenaBytes, 0, &mapped), "vkMapMemory");
         arena_mapped_ = static_cast<uint8_t*>(mapped);
         arena_free_ = {{0, kArenaBytes}};
+        // Its pages touched now, not as the first scene's vertices go in (a
+        // fault for each page then, mid-frame).
+        std::memset(arena_mapped_, 0, kArenaBytes);
     }
     use_slot(0);
 }
@@ -2190,6 +2234,59 @@ VkShaderModule VulkanRenderer::shader(uint64_t key, const std::vector<uint32_t>*
     return m;
 }
 
+namespace {
+
+// The library's record of a pipeline's shaders: the vertex program, field
+// by field, and the combiners as they are.
+constexpr char kLibraryMagic[8] = {'Q', 'I', 'L', 'I', 'N', 'P', 'L', '1'};
+std::string library_sources(const vsh::Program& p, const nv2a::CombinerSetup& cs) {
+    std::string out;
+    auto put32 = [&](uint32_t v) { out.append(reinterpret_cast<const char*>(&v), 4); };
+    put32(p.header);
+    put32(uint32_t(p.code.size()));
+    for (const vsh::Instruction& in : p.code) {
+        out += char(in.mac), out += char(in.ilu);
+        for (const vsh::Operand* o : {&in.a, &in.b, &in.c}) {
+            out += char(o->kind), out += char(o->index);
+            for (uint8_t k : o->swizzle) out += char(k);
+            out += char(o->negate);
+        }
+        for (uint8_t v : {in.constant, uint8_t(in.relative), in.temp, in.mac_temp_mask, in.ilu_temp_mask, in.out_mask, uint8_t(in.out_is_const),
+                          in.out_address, uint8_t(in.out_from_ilu), uint8_t(in.final)})
+            out += char(v);
+    }
+    static_assert(std::is_trivially_copyable_v<nv2a::CombinerSetup>);
+    out.append(reinterpret_cast<const char*>(&cs), sizeof cs);
+    return out;
+}
+bool library_read(std::string_view& in, vsh::Program& p, nv2a::CombinerSetup& cs) {
+    auto take = [&](void* to, size_t n) {
+        if (in.size() < n) return false;
+        std::memcpy(to, in.data(), n);
+        in.remove_prefix(n);
+        return true;
+    };
+    uint32_t count = 0;
+    if (!take(&p.header, 4) || !take(&count, 4) || count > 136) return false;
+    p.code.assign(count, {});
+    for (vsh::Instruction& i : p.code) {
+        uint8_t b[2 + 3 * 7 + 10];
+        if (!take(b, sizeof b)) return false;
+        const uint8_t* q = b;
+        i.mac = vsh::Mac(*q++), i.ilu = vsh::Ilu(*q++);
+        for (vsh::Operand* o : {&i.a, &i.b, &i.c}) {
+            o->kind = vsh::Src(*q++), o->index = *q++;
+            for (uint8_t& k : o->swizzle) k = *q++;
+            o->negate = *q++ != 0;
+        }
+        i.constant = *q++, i.relative = *q++ != 0, i.temp = *q++, i.mac_temp_mask = *q++, i.ilu_temp_mask = *q++, i.out_mask = *q++;
+        i.out_is_const = *q++ != 0, i.out_address = *q++, i.out_from_ilu = *q++ != 0, i.final = *q++ != 0;
+    }
+    return take(&cs, sizeof cs);
+}
+
+}  // namespace
+
 VkPipeline VulkanRenderer::pipeline(const DrawCmd& c) {
     PipelineKey k;
     k.vs = c.vs_key, k.fs = c.fs_key, k.inputs = c.inputs, k.constant_inputs = c.constant_inputs & c.inputs, k.primitive = uint8_t(c.primitive);
@@ -2199,23 +2296,55 @@ VkPipeline VulkanRenderer::pipeline(const DrawCmd& c) {
         k.ops[0] = uint8_t(c.color_op), k.ops[1] = uint8_t(c.alpha_op);
     }
     if (auto it = pipelines_.find(k); it != pipelines_.end()) return it->second;
+    // Made by the library's worker, or being made: taken (or waited for),
+    // if it was made from what this draw's shaders are.
+    if (library_.worker.joinable()) {
+        std::unique_lock<std::mutex> hold(library_.lock);
+        library_.done.wait(hold, [&] { return !library_.busy || library_.current != k; });
+        if (auto it = library_.made.find(k); it != library_.made.end()) {
+            const VkPipeline p = it->second;
+            library_.made.erase(it);
+            const auto known = library_.sources.find(k);
+            if (c.vs_program && c.fs_setup && known != library_.sources.end() && known->second == library_sources(*c.vs_program, *c.fs_setup)) {
+                pipelines_[k] = p;
+                return p;
+            }
+            vkDestroyPipeline(device_, p, nullptr);  // never used
+        }
+        library_.claimed.insert(k);
+    }
+    const auto t0 = std::chrono::steady_clock::now();
+    const VkPipeline p = make_pipeline(k, shader(c.vs_key, c.vs_code), shader(c.fs_key, c.fs_code));
+    // QILIN_TRACE_PIPELINES=1: each pipeline made as a draw needs it, and how long that took.
+    static const bool trace = std::getenv("QILIN_TRACE_PIPELINES") != nullptr;
+    if (trace)
+        std::fprintf(stderr, "qilin: pipeline %zu made for a draw in %.2f ms\n", pipelines_.size() + 1,
+                     std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
+    pipelines_[k] = p;
+    ++unsaved_pipelines_;
+    last_pipeline_ = std::chrono::steady_clock::now();
+    record_in_library(k, c);
+    return p;
+}
 
+// A draw pipeline for the key's state and these shaders. Reads only what
+// stays the same after init, so the library's worker makes them too.
+VkPipeline VulkanRenderer::make_pipeline(const PipelineKey& k, VkShaderModule vs, VkShaderModule fs) const {
     VkPipelineShaderStageCreateInfo stages[2]{};
     stages[0].sType = stages[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
     stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
-    stages[0].module = shader(c.vs_key, c.vs_code);
+    stages[0].module = vs;
     stages[0].pName = "main";
     stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
-    stages[1].module = shader(c.fs_key, c.fs_code);
+    stages[1].module = fs;
     stages[1].pName = "main";
-
     std::vector<VkVertexInputBindingDescription> bindings;
     std::vector<VkVertexInputAttributeDescription> attributes;
     for (uint32_t n = 0; n < 16; ++n)
-        if (c.inputs & (1u << n)) {
+        if (k.inputs & (1u << n)) {
             // A constant attribute is one element at the instance rate: every
             // vertex of the draw's one instance reads the same vec4.
-            bindings.push_back({n, 16, (c.constant_inputs >> n & 1) ? VK_VERTEX_INPUT_RATE_INSTANCE : VK_VERTEX_INPUT_RATE_VERTEX});
+            bindings.push_back({n, 16, (k.constant_inputs >> n & 1) ? VK_VERTEX_INPUT_RATE_INSTANCE : VK_VERTEX_INPUT_RATE_VERTEX});
             attributes.push_back({n, n, VK_FORMAT_R32G32B32A32_SFLOAT, 0});
         }
     VkPipelineVertexInputStateCreateInfo vi{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
@@ -2227,7 +2356,7 @@ VkPipeline VulkanRenderer::pipeline(const DrawCmd& c) {
                                                        VK_PRIMITIVE_TOPOLOGY_LINE_STRIP, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST,
                                                        VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP};
     VkPipelineInputAssemblyStateCreateInfo ia{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
-    ia.topology = kTopology[size_t(c.primitive)];
+    ia.topology = kTopology[k.primitive];
     VkPipelineViewportStateCreateInfo vp{VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
     vp.viewportCount = vp.scissorCount = 1;
     VkPipelineRasterizationStateCreateInfo rs{VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
@@ -2237,14 +2366,16 @@ VkPipeline VulkanRenderer::pipeline(const DrawCmd& c) {
     ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
     VkPipelineDepthStencilStateCreateInfo ds{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
     VkPipelineColorBlendAttachmentState att{};
-    att.blendEnable = c.blend;
-    att.srcColorBlendFactor = VkBlendFactor(c.src_color);
-    att.dstColorBlendFactor = VkBlendFactor(c.dst_color);
-    att.colorBlendOp = VkBlendOp(c.color_op);
-    att.srcAlphaBlendFactor = VkBlendFactor(c.src_alpha);
-    att.dstAlphaBlendFactor = VkBlendFactor(c.dst_alpha);
-    att.alphaBlendOp = VkBlendOp(c.alpha_op);
-    att.colorWriteMask = c.write_mask;
+    att.blendEnable = k.blend;
+    if (k.blend) {
+        att.srcColorBlendFactor = VkBlendFactor(k.factors[0]);
+        att.dstColorBlendFactor = VkBlendFactor(k.factors[1]);
+        att.srcAlphaBlendFactor = VkBlendFactor(k.factors[2]);
+        att.dstAlphaBlendFactor = VkBlendFactor(k.factors[3]);
+        att.colorBlendOp = VkBlendOp(k.ops[0]);
+        att.alphaBlendOp = VkBlendOp(k.ops[1]);
+    }
+    att.colorWriteMask = k.write_mask;
     VkPipelineColorBlendStateCreateInfo cb{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
     cb.attachmentCount = 1;
     cb.pAttachments = &att;
@@ -2276,10 +2407,130 @@ VkPipeline VulkanRenderer::pipeline(const DrawCmd& c) {
     info.layout = pipeline_layout_;
     VkPipeline p = VK_NULL_HANDLE;
     check(vkCreateGraphicsPipelines(device_, pipeline_cache_, 1, &info, nullptr, &p), "vkCreateGraphicsPipelines");
-    pipelines_[k] = p;
-    ++unsaved_pipelines_;
-    last_pipeline_ = std::chrono::steady_clock::now();
     return p;
+}
+
+// The library file: a header (kLibraryMagic, then the sizes of the key's
+// and the combiners' records, which tell an older layout), then entries,
+// each the key's fields and its shaders' sources with their length.
+void VulkanRenderer::write_library_entry(std::ostream& out, const PipelineKey& k, const std::string& sources) {
+    out.write(reinterpret_cast<const char*>(&k.vs), 8).write(reinterpret_cast<const char*>(&k.fs), 8);
+    out.write(reinterpret_cast<const char*>(&k.inputs), 4).write(reinterpret_cast<const char*>(&k.constant_inputs), 4);
+    const uint8_t bytes[10] = {k.primitive, k.blend, k.write_mask, k.factors[0], k.factors[1], k.factors[2], k.factors[3], k.ops[0], k.ops[1], k.depth};
+    out.write(reinterpret_cast<const char*>(bytes), sizeof bytes);
+    const uint32_t n = uint32_t(sources.size());
+    out.write(reinterpret_cast<const char*>(&n), 4).write(sources.data(), std::streamsize(n));
+}
+
+void VulkanRenderer::start_library() {
+    if (config_.pipeline_cache.empty()) return;
+    library_.path = std::filesystem::path(config_.pipeline_cache).replace_filename("pipeline_library.bin");
+    const uint32_t layout[2] = {34, uint32_t(sizeof(nv2a::CombinerSetup))};
+    std::string data;
+    if (std::ifstream in(library_.path, std::ios::binary); in) data.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+    struct Entry {
+        PipelineKey key;
+        vsh::Program program;
+        nv2a::CombinerSetup setup;
+    };
+    std::vector<Entry> entries;
+    bool whole = data.size() >= 16 && std::memcmp(data.data(), kLibraryMagic, 8) == 0 && std::memcmp(data.data() + 8, layout, 8) == 0;
+    if (whole) {
+        std::string_view in(data);
+        in.remove_prefix(16);
+        while (!in.empty()) {
+            Entry e;
+            PipelineKey& k = e.key;
+            uint8_t b[10];
+            uint32_t n = 0;
+            if (in.size() < 38) break;
+            std::memcpy(&k.vs, in.data(), 8), std::memcpy(&k.fs, in.data() + 8, 8);
+            std::memcpy(&k.inputs, in.data() + 16, 4), std::memcpy(&k.constant_inputs, in.data() + 20, 4);
+            std::memcpy(b, in.data() + 24, 10), std::memcpy(&n, in.data() + 34, 4);
+            in.remove_prefix(38);
+            k.primitive = b[0], k.blend = b[1], k.write_mask = b[2], k.factors[0] = b[3], k.factors[1] = b[4], k.factors[2] = b[5];
+            k.factors[3] = b[6], k.ops[0] = b[7], k.ops[1] = b[8], k.depth = b[9];
+            if (in.size() < n || k.primitive > 4) break;
+            std::string_view src = in.substr(0, n);
+            in.remove_prefix(n);
+            if (!library_read(src, e.program, e.setup) || !src.empty() || library_.sources.count(k)) continue;
+            library_.sources[k] = library_sources(e.program, e.setup);
+            library_.order.push_back(k);
+            entries.push_back(std::move(e));
+        }
+        whole = in.empty();  // else what's after a damaged entry is dropped, and the file written again
+    }
+    if (!whole) {
+        std::ofstream out(library_.path, std::ios::binary | std::ios::trunc);
+        out.write(kLibraryMagic, 8).write(reinterpret_cast<const char*>(layout), 8);
+        for (const PipelineKey& k : library_.order) write_library_entry(out, k, library_.sources[k]);
+    }
+    library_.out.open(library_.path, std::ios::binary | std::ios::app);
+    if (entries.empty()) return;
+    library_.worker = std::thread([this, entries = std::move(entries)] {
+        const auto t0 = std::chrono::steady_clock::now();
+        uint32_t count = 0;
+        for (const Entry& e : entries) {
+            if (library_.stop) break;
+            {
+                std::lock_guard<std::mutex> hold(library_.lock);
+                if (library_.claimed.count(e.key)) continue;
+                library_.busy = true, library_.current = e.key;
+            }
+            VkPipeline p = VK_NULL_HANDLE;
+            VkShaderModule modules[2] = {};
+            try {
+                const std::vector<uint32_t> code[2] = {nv2a::vertex_program(e.program, e.key.inputs), nv2a::combiners(e.setup)};
+                for (int i = 0; i < 2; ++i) {
+                    VkShaderModuleCreateInfo info{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+                    info.codeSize = code[i].size() * 4;
+                    info.pCode = code[i].data();
+                    if (vkCreateShaderModule(device_, &info, nullptr, &modules[i]) != VK_SUCCESS) throw std::runtime_error("vkCreateShaderModule");
+                }
+                p = make_pipeline(e.key, modules[0], modules[1]);
+            } catch (const std::exception&) {
+                p = VK_NULL_HANDLE;  // made when a draw wants it, or reported then
+            }
+            for (VkShaderModule m : modules)
+                if (m) vkDestroyShaderModule(device_, m, nullptr);
+            {
+                std::lock_guard<std::mutex> hold(library_.lock);
+                library_.busy = false;
+                if (p) library_.made[e.key] = p, ++count;
+            }
+            library_.done.notify_all();
+        }
+        if (std::getenv("QILIN_TRACE_PIPELINES"))
+            std::fprintf(stderr, "qilin: %u of the library's %zu pipelines made ahead, in %.2f s\n", count, entries.size(),
+                         std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+    });
+}
+
+void VulkanRenderer::record_in_library(const PipelineKey& k, const DrawCmd& c) {
+    if (!library_.out.is_open() || !c.vs_program || !c.fs_setup) return;
+    std::string src = library_sources(*c.vs_program, *c.fs_setup);
+    auto it = library_.sources.find(k);
+    if (it == library_.sources.end()) {
+        write_library_entry(library_.out, k, src);
+        library_.sources.emplace(k, std::move(src));
+        library_.order.push_back(k);
+    } else if (it->second != src) {
+        it->second = std::move(src), library_.stale = true;
+    }
+}
+
+void VulkanRenderer::stop_library() {
+    library_.stop = true;
+    if (library_.worker.joinable()) library_.worker.join();
+    for (auto& [k, p] : library_.made) vkDestroyPipeline(device_, p, nullptr);
+    library_.made.clear();
+    library_.out.close();
+    if (library_.stale) {
+        const uint32_t layout[2] = {34, uint32_t(sizeof(nv2a::CombinerSetup))};
+        std::ofstream out(library_.path, std::ios::binary | std::ios::trunc);
+        out.write(kLibraryMagic, 8).write(reinterpret_cast<const char*>(layout), 8);
+        for (const PipelineKey& k : library_.order) write_library_entry(out, k, library_.sources[k]);
+    }
 }
 
 VkSampler VulkanRenderer::sampler(const SamplerDesc& wanted) {
@@ -2887,11 +3138,16 @@ void VulkanRenderer::draw(const DrawCmd& c) {
     if (all || std::memcmp(was.blend, c.blend_constant, sizeof was.blend) != 0)
         vkCmdSetBlendConstants(cmd_, c.blend_constant), std::memcpy(was.blend, c.blend_constant, sizeof was.blend);
     // ZBias (the NV2A's polygon offset): glPolygonOffset's factor and units
-    // are Vulkan's slope and constant factors.
-    const bool bias_on = c.depth_bias != 0 || c.depth_slope != 0;
+    // are Vulkan's slope and constant factors. The slope is the depth's
+    // change per pixel, which at a render resolution s times the game's is
+    // 1/s of the console's: the factor times s keeps the offset the
+    // console's (or, with s across and down differing, no less), else a
+    // floor's projected shadows sink into the floor in patches.
+    const float slope = c.depth_slope * float(std::max(ssx, ssy));
+    const bool bias_on = c.depth_bias != 0 || slope != 0;
     if (all || was.bias_on != bias_on) vkCmdSetDepthBiasEnable(cmd_, bias_on), was.bias_on = bias_on;
-    if (bias_on && (all || was.bias != c.depth_bias || was.slope != c.depth_slope))
-        vkCmdSetDepthBias(cmd_, c.depth_bias, 0.0f, c.depth_slope), was.bias = c.depth_bias, was.slope = c.depth_slope;
+    if (bias_on && (all || was.bias != c.depth_bias || was.slope != slope))
+        vkCmdSetDepthBias(cmd_, c.depth_bias, 0.0f, slope), was.bias = c.depth_bias, was.slope = slope;
     const float line = wide_lines_ ? std::clamp(c.line_width * float(ssy), 1.0f, line_width_max_) : 1.0f;
     if (all || was.line != line) vkCmdSetLineWidth(cmd_, line), was.line = line;
     was.valid = true;

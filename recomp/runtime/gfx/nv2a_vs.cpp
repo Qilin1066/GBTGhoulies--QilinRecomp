@@ -64,9 +64,28 @@ struct Vs {
     Id y(Id v) { return b.extract(f, v, 1); }
     Id z(Id v) { return b.extract(f, v, 2); }
     Id w(Id v) { return b.extract(f, v, 3); }
-    Id dot3(Id a, Id c) {
-        const Id v3 = b.t_vec(3);
-        return b.op(op::Dot, f, {b.shuffle(v3, a, a, {0, 1, 2}), b.shuffle(v3, c, c, {0, 1, 2})});
+    // Dot products as products and sums in a fixed order, each rounded as
+    // IEEE has it: OpDot's order and fusing are each GPU's own, and the
+    // depths of a surface drawn twice by two programs (a floor and its
+    // projected shadow) must round alike on every GPU.
+    Id dot(Id a, Id c, uint32_t n) {
+        const Id p = b.op(op::FMul, v4, {a, c});
+        Id sum = b.extract(f, p, 0);
+        for (uint32_t k = 1; k < n; ++k) sum = b.op(op::FAdd, f, {sum, b.extract(f, p, k)});
+        return sum;
+    }
+    Id dot3(Id a, Id c) { return dot(a, c, 3); }
+    // 1/s, refined by a Newton step: Vulkan's division may be 2.5 ULP out,
+    // a GPU's own amount; the step brings it to within about one (left
+    // alone for zeros, infinities and the extremes, where it can't help).
+    Id reciprocal(Id s) {
+        const Id r = b.op(op::FDiv, f, {b.c_float(1), s});
+        const Id e = b.op(op::FSub, f, {b.c_float(1), b.op(op::FMul, f, {s, r})});
+        const Id refined = b.op(op::FAdd, f, {r, b.op(op::FMul, f, {r, e})});
+        const Id m = b.ext(glsl::FAbs, f, {s});
+        const Id ok = b.op(op::LogicalAnd, boolean, {b.op(op::FOrdGreaterThan, boolean, {m, b.c_float(1e-30f)}),
+                                                     b.op(op::FOrdLessThan, boolean, {m, b.c_float(1e30f)})});
+        return b.op(op::Select, f, {ok, refined, r});
     }
     Id cmp(uint16_t compare, Id a, Id c) {  // 1.0 per component where it holds, else 0.0
         const Id bv = b.t_bvec(4);
@@ -81,7 +100,7 @@ struct Vs {
             case vsh::Mac::Mad: return b.op(op::FAdd, v4, {b.op(op::FMul, v4, {a, bb}), c});
             case vsh::Mac::Dp3: return b.splat(dot3(a, bb));
             case vsh::Mac::Dph: return b.splat(b.op(op::FAdd, f, {dot3(a, bb), w(bb)}));
-            case vsh::Mac::Dp4: return b.splat(b.op(op::Dot, f, {a, bb}));
+            case vsh::Mac::Dp4: return b.splat(dot(a, bb, 4));
             case vsh::Mac::Dst: return b.vec4(b.c_float(1), b.op(op::FMul, f, {y(a), y(bb)}), z(a), w(bb));
             case vsh::Mac::Min: return b.ext(glsl::FMin, v4, {a, bb});
             case vsh::Mac::Max: return b.ext(glsl::FMax, v4, {a, bb});
@@ -95,10 +114,10 @@ struct Vs {
         const Id s = x(c);
         switch (in.ilu) {
             case vsh::Ilu::Mov: return c;
-            case vsh::Ilu::Rcp: return b.splat(b.op(op::FDiv, f, {b.c_float(1), s}));
+            case vsh::Ilu::Rcp: return b.splat(reciprocal(s));
             case vsh::Ilu::Rcc: {
                 // The reciprocal, its magnitude clamped to [5.42101e-20, 1.884467e+19].
-                const Id r = b.op(op::FDiv, f, {b.c_float(1), s});
+                const Id r = reciprocal(s);
                 const Id pos = b.ext(glsl::FClamp, f, {r, b.c_float(5.42101e-20f), b.c_float(1.884467e+19f)});
                 const Id neg = b.ext(glsl::FClamp, f, {r, b.c_float(-1.884467e+19f), b.c_float(-5.42101e-20f)});
                 return b.splat(b.op(op::Select, f, {b.op(op::FOrdGreaterThan, boolean, {r, b.c_float(0)}), pos, neg}));
