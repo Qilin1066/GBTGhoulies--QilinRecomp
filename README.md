@@ -110,7 +110,7 @@ This runs the unit tests and the CFG pass, then cross-checks Zydis against LLVM'
 
 ## Licence
 
-This project's own code and documentation are under the [MIT licence](LICENSE), as in the other QilinRecomp projects. The vendored code in `third_party/` keeps its own licences, listed in `third_party/README.md`: Zydis and Zycore, Dear ImGui, FSR 1, SMAA, volk and XbSymbolDatabase (MIT), the Vulkan headers (Apache-2.0 or MIT) and nxdk's kernel export list (CC0-1.0). SDL3, fetched by CMake at build time, keeps its zlib licence.
+This project's own code and documentation are under the [GNU General Public License, version 3](LICENSE) (GPL-3.0), as in the other QilinRecomp projects: you may use, share, change and sell it, but anything you distribute that is built from it must come with its full source under the same licence. (Versions before 2026-11-21 were released under MIT, and those copies stay under MIT.) The vendored code in `third_party/` keeps its own licences, listed in `third_party/README.md`: Zydis and Zycore, Dear ImGui, FSR 1, SMAA, volk and XbSymbolDatabase (MIT), the Vulkan headers (Apache-2.0 or MIT) and nxdk's kernel export list (CC0-1.0). SDL3, fetched by CMake at build time, keeps its zlib licence.
 
 The game itself is Microsoft's and Rare's and is not covered by anything here: you need your own copy, and nothing built from it may be shared.
 

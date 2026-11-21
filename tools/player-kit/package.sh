@@ -41,6 +41,8 @@ lic="$pkg/LICENSES"
 mkdir -p "$lic/llvm-mingw" "$lic/ninja" "$lic/SDL3" "$lic/Vulkan-Headers" "$lic/volk" "$lic/Zydis" "$lic/Dear ImGui" "$lic/FidelityFX FSR" "$lic/SMAA"
 mv "$pkg/kit/toolchain/licenses/"* "$lic/llvm-mingw/"
 rmdir "$pkg/kit/toolchain/licenses"
+mkdir -p "$lic/GBTGhoulies-QilinRecomp"
+sed 's/$/\r/' "$root/LICENSE" > "$lic/GBTGhoulies-QilinRecomp/LICENSE.txt"  # GPL-3.0
 cp "$NINJA_WINDOWS/COPYING" "$lic/ninja/"
 sdl=$(sed -n 's/^FETCHCONTENT_SOURCE_DIR_SDL3:PATH=//p' "$build/CMakeCache.txt")
 [ -n "$sdl" ] || sdl="$build/_deps/sdl3-src"
