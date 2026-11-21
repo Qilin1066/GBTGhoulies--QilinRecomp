@@ -126,6 +126,27 @@ struct Device {
     // render target's memory is compared again only after one of these,
     // or once a frame (as textures are).
     uint32_t memory_epoch = 0;
+    // Vertex buffer locks: a count of them, and for each buffer locked (by
+    // its data's address) the count at its last lock. A settled vertex run
+    // is compared again after a lock of the buffer it lies in, not after
+    // any lock: a fight locks its particle and HUD buffers dozens of times
+    // a frame, and each lock had every run compared again (12% of the game
+    // thread, with the textures hashed again for the same reason).
+    uint32_t vertex_epoch = 0;
+    std::map<uint32_t, uint32_t> vertex_locked;
+    void vertex_buffer_locked(uint32_t data) { vertex_locked[data & 0x0FFFFFFFu] = ++vertex_epoch; }
+    // The count at the last lock of the buffer `at` lies in: the locked buffer with the nearest address at or below it.
+    uint32_t vertex_lock_of(uint32_t at) const {
+        auto it = vertex_locked.upper_bound(at & 0x0FFFFFFFu);
+        return it == vertex_locked.begin() ? 0 : std::prev(it)->second;
+    }
+    // The count at the last lock of anything whose data starts in [at, at + bytes): a texture's levels.
+    uint32_t locked_within(uint32_t at, uint64_t bytes) const {
+        const uint32_t lo = at & 0x0FFFFFFFu;
+        uint32_t latest = 0;
+        for (auto it = vertex_locked.lower_bound(lo); it != vertex_locked.end() && it->first < lo + bytes; ++it) latest = std::max(latest, it->second);
+        return latest;
+    }
     std::chrono::steady_clock::time_point frame_began{};  // for the long-frame log
     std::chrono::steady_clock::time_point epoch;  // vblank 0
     uint8_t gamma[3][256];
@@ -163,6 +184,9 @@ struct Device {
         uint32_t id = 0;
         std::vector<uint8_t> texels;  // the guest's texels when uploaded, compared byte for byte
         uint32_t checked = ~0u;  // the frame the texels were last compared
+        uint64_t sample = 0;     // sample_bytes of them
+        uint32_t changed = 0;    // the frame they last changed in
+        uint32_t checked_lock = 0;  // the lock count when they were last compared
         uint32_t dims = 2;
         bool linear = false;
         uint32_t width = 0, height = 0, depth = 1;
@@ -182,6 +206,7 @@ struct Device {
         uint32_t unstable_until = 0;     // a stream that keeps changing goes the old way until this swap
         uint32_t changed = 0;            // the swap its bytes last changed in
         uint32_t checked_swap = UINT32_MAX, checked_epoch = 0;  // when they were last found the same
+        uint64_t sample = 0;             // sample_bytes of src
     };
     std::unordered_map<uint64_t, VertexRun> vertex_runs;
     // Textures the game renders into: the renderer's image for each, by the
@@ -622,6 +647,7 @@ Device::TargetTexture& texture_target(rt::Context& c, Device& d, uint32_t data, 
 
 void block_on_resource(rt::Context& c) {
     if (g_device) ++g_device->memory_epoch;
+    if (g_device) g_device->vertex_buffer_locked(ld(c, arg(c, 0) + 4));  // should it be a vertex buffer
     // A texture the GPU drew or copied into: its texels come back to guest
     // memory before the CPU touches them (a lock or a destroy reaches here).
     if (g_device) hand_back_target(c, *g_device, ld(c, arg(c, 0) + 4));
@@ -635,7 +661,7 @@ void block_on_resource(rt::Context& c) {
 // address in the contiguous-memory window, as the original returns it. (The
 // original also puts a wait for the GPU in the command buffer; see BlockOnResource.)
 void vertex_buffer_lock2(rt::Context& c) {
-    if (g_device) ++g_device->memory_epoch;  // its vertices may change: compared again at their next draw
+    if (g_device) g_device->vertex_buffer_locked(ld(c, arg(c, 0) + 4));  // its vertices may change: compared again at their next draw
     ret(c, ld(c, arg(c, 0) + 4) | rt::kRamCachedAlias, 8);
 }
 
@@ -936,7 +962,7 @@ void long_frames(Device& d, std::chrono::steady_clock::time_point present_from) 
         if ((total > 50 && total > usual * 1.5) || dropped) {
             ++logged, ++this_second;
             std::fprintf(stderr,
-                         "qilin: frame %u took %.1f ms (usually %.1f): the game %.1f ms (reading files %.1f ms; %u pipelines made for draws, %.1f "
+                         "qilin: frame %u took %.1f ms (usually %.1f): the game %.1f ms (reading and writing files %.1f ms; %u pipelines made for draws, %.1f "
                          "ms; %u textures made or written, %.1f ms), presenting %.1f ms; ended at %.3f s on the steady clock\n",
                          d.swaps, total, usual, ms(present_from - d.frame_began), read_ms, costs.pipelines, costs.pipeline_ms, costs.textures,
                          costs.texture_ms, ms(now - present_from), std::chrono::duration<double>(now.time_since_epoch()).count());
@@ -1555,6 +1581,40 @@ void sweep_vertex_runs(Device& d, uint32_t idle) {
 // into it now. False to convert them for this draw only (a small draw, a
 // stream that keeps changing, or no room).
 constexpr uint32_t kSettledSwaps = 60;
+
+// Guest memory that hasn't changed for kSettledSwaps frames (a vertex run,
+// a texture's texels) isn't compared whole with its copy every frame:
+//   - after a lock of the resource it lies in, it is (the count of locks);
+//   - one frame in sixteen it is, each on its own frame (quick_look);
+//   - otherwise eight words spread over it are (sample_bytes), which a
+//     scene loaded over the same memory fails at once.
+// So a write the game makes without a lock, to memory still for a second,
+// that misses all eight words, shows up to fifteen frames late; everything
+// else is seen in the frame it happens, as before. A fight compared 12 MB
+// of vertices and its textures whole every frame, an eighth of the game
+// thread. QILIN_CHECK_SETTLED=1 compares whole as well, and reports what
+// the quick look missed (none, in the story and the first fight).
+uint64_t sample_bytes(const uint8_t* p, uint64_t bytes) {
+    uint64_t h = bytes * 0x9E3779B97F4A7C15ull;
+    if (bytes < 64) {
+        for (uint64_t k = 0; k < bytes; ++k) h = (h ^ p[k]) * 0xFF51AFD7ED558CCDull;
+        return h;
+    }
+    const uint64_t step = (bytes - 8) / 7;
+    for (uint64_t k = 0; k < 8; ++k) {
+        uint64_t word;
+        std::memcpy(&word, p + k * step, 8);
+        h = (h ^ word) * 0xFF51AFD7ED558CCDull;
+        h ^= h >> 29;
+    }
+    return h;
+}
+bool quick_look(const Device& d, uint64_t key) { return ((d.swaps + uint32_t(key >> 24)) & 15) != 0; }
+bool check_settled() {
+    static const bool on = std::getenv("QILIN_CHECK_SETTLED") != nullptr;
+    return on;
+}
+
 bool stream_from_arena(rt::Context& c, Device& d, const std::array<Slot, 16>& sl, uint32_t stream, uint32_t stream_at,
                        uint32_t stride, uint32_t count, Vertices& v) {
     static const bool off = [] { const char* e = std::getenv("QILIN_NO_VERTEX_CACHE"); return e && *e == '1'; }();
@@ -1583,19 +1643,36 @@ bool stream_from_arena(rt::Context& c, Device& d, const std::array<Slot, 16>& sl
     }
     r.used = d.swaps;
     if (r.unstable_until > d.swaps) return false;
-    // A run that hasn't changed for kSettledSwaps is compared once a frame,
-    // at its first draw, and again only after a lock (memory_epoch): the
-    // game draws the same floor once more for each character's shadow, and
-    // comparing every draw was 30 MB a frame in a fight.
-    const bool settled = r.bytes && d.swaps - r.changed >= kSettledSwaps && r.checked_swap == d.swaps && r.checked_epoch == d.memory_epoch;
-    // QILIN_CHECK_SETTLED=1: a settled run compared all the same, and a
-    // difference reported (the game wrote vertices without a lock).
-    static const bool check_settled = std::getenv("QILIN_CHECK_SETTLED") != nullptr;
-    if (check_settled && settled && (r.src.size() != span || std::memcmp(r.src.data(), src, size_t(span)) != 0))
-        std::fprintf(stderr, "qilin: a settled vertex run changed without a lock: %08X stride %u count %u, swap %u\n", stream_at, stride, count, d.swaps);
-    if (settled || (r.bytes && r.src.size() == span && std::memcmp(r.src.data(), src, size_t(span)) == 0)) {
+    // A run that hasn't changed for kSettledSwaps is looked at once a frame,
+    // at its first draw (the game draws the same floor once more for each
+    // character's shadow: comparing every draw was 30 MB a frame in a
+    // fight), and that look is the quick one above unless its buffer was
+    // locked since or it's the run's frame for a whole comparison.
+    const uint32_t locked = d.vertex_lock_of(stream_at);
+    const bool kept = r.bytes && r.src.size() == span;
+    const bool still = kept && d.swaps - r.changed >= kSettledSwaps && r.checked_epoch >= locked;
+    const bool seen = still && r.checked_swap == d.swaps;
+    const bool quick = still && !seen && quick_look(d, key);
+    const bool same = seen || (quick ? sample_bytes(src, span) == r.sample : kept && std::memcmp(r.src.data(), src, size_t(span)) == 0);
+    if (check_settled() && same && (seen || quick) && std::memcmp(r.src.data(), src, size_t(span)) != 0)
+        std::fprintf(stderr, "qilin: a settled vertex run changed without a lock (%s): %08X stride %u count %u, swap %u\n",
+                     seen ? "between draws of one frame" : "the quick look missed it", stream_at, stride, count, d.swaps);
+    if (static const bool stats = std::getenv("QILIN_VERTEX_STATS") != nullptr; stats) {
+        static uint64_t n[4], bytes[4];
+        static uint32_t at_swap = 0;
+        const int why = seen ? 0 : quick ? 1 : kept ? 2 : 3;
+        ++n[why], bytes[why] += span;
+        if (d.swaps >= at_swap + 600) {
+            std::fprintf(stderr, "qilin: vertex runs over 600 frames: seen this frame %llu, a quick look %llu (%llu MB), compared whole %llu (%llu MB), new %llu (%llu MB); %zu runs\n",
+                         (unsigned long long)n[0], (unsigned long long)n[1], (unsigned long long)(bytes[1] >> 20), (unsigned long long)n[2],
+                         (unsigned long long)(bytes[2] >> 20), (unsigned long long)n[3], (unsigned long long)(bytes[3] >> 20), d.vertex_runs.size());
+            for (int k = 0; k < 4; ++k) n[k] = bytes[k] = 0;
+            at_swap = d.swaps;
+        }
+    }
+    if (same) {
         r.changes = 0;
-        r.checked_swap = d.swaps, r.checked_epoch = d.memory_epoch;
+        r.checked_swap = d.swaps, r.checked_epoch = d.vertex_epoch;
     } else {
         r.changed = d.swaps;
         if (r.bytes && ++r.changes >= kUnstableChanges) {  // changes every time: not worth keeping
@@ -1624,6 +1701,7 @@ bool stream_from_arena(rt::Context& c, Device& d, const std::array<Slot, 16>& sl
             ++k;
         }
         r.src.assign(src, src + span);
+        r.sample = sample_bytes(src, span);
     }
     for (uint32_t n = 0; n < 16; ++n) {
         if (!sl[n].bytes || sl[n].stream != stream) continue;
@@ -1852,8 +1930,15 @@ const Device::CachedTexture* stage_texture(rt::Context& c, Device& d, const char
     Device::CachedTexture& e = d.textures[key];
     if (e.id && e.checked == d.swaps) return &e;
     const uint8_t* texels = c.mem + data;
-    const bool same = e.id && e.texels.size() == shape.bytes && std::memcmp(e.texels.data(), texels, shape.bytes) == 0;
+    // Texels still for kSettledSwaps frames get the quick look (above), unless one of the texture's levels was locked since.
+    const bool kept = e.id && e.texels.size() == shape.bytes;
+    const bool quick = kept && d.swaps - e.changed >= kSettledSwaps && e.checked_lock >= d.locked_within(data, shape.bytes) && quick_look(d, key);
+    const bool same = quick ? sample_bytes(texels, shape.bytes) == e.sample : kept && std::memcmp(e.texels.data(), texels, shape.bytes) == 0;
+    if (check_settled() && quick && same && std::memcmp(e.texels.data(), texels, shape.bytes) != 0)
+        std::fprintf(stderr, "qilin: a settled texture changed without a lock (the quick look missed it): %08X, %zu bytes, swap %u\n", data, size_t(shape.bytes), d.swaps);
+    e.checked_lock = d.vertex_epoch;
     if (!same) {
+        e.changed = d.swaps;
         // DXT blocks go to the GPU as they are where it samples BC1-3 (a
         // quarter or an eighth of the memory, and no decoding here).
         const gfx::TextureData t = shape.compressed && shape.depth == 1 && d.renderer->takes_blocks()
@@ -1865,6 +1950,7 @@ const Device::CachedTexture* stage_texture(rt::Context& c, Device& d, const char
             e.id = d.renderer->create_texture(t);
         }
         e.texels.assign(texels, texels + shape.bytes);
+        e.sample = sample_bytes(texels, shape.bytes);
         e.dims = t.dims(), e.linear = t.linear, e.width = t.width, e.height = t.height, e.depth = t.depth;
     }
     e.checked = d.swaps;
@@ -2651,7 +2737,11 @@ void issue_draw(rt::Context& c, Device& d, const char* fn, uint32_t prim, Vertic
                 formats += strf(" t%u format %#x size %08X data %08X;", stage, ld(c, tex + 12), ld(c, tex + 16), ld(c, tex + 4));
         unmodelled(fn, std::string(why) + formats);
     }
-    const uint64_t fs_key = cs.hash() ^ 2;
+    // The setup's key: the one before's when it's the same setup (most draws; the hash is a byte at a time).
+    thread_local gfx::nv2a::CombinerSetup last_setup;
+    thread_local uint64_t last_key = 0;
+    if (!last_key || !(cs == last_setup)) last_setup = cs, last_key = cs.hash() ^ 2;
+    const uint64_t fs_key = last_key;
     auto& fs_code = d.shaders[fs_key];
     if (fs_code.empty()) fs_code = gfx::nv2a::combiners(cs), d.fs_setups[fs_key] = cs;
     if (!fixed_pixels) {

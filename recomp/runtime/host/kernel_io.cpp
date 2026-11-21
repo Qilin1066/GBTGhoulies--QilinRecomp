@@ -38,7 +38,9 @@
 namespace qilin::host {
 namespace fs = std::filesystem;
 namespace {
-std::atomic<uint64_t> g_io_ns{0};  // time spent reading files, for the long-frame log
+std::atomic<uint64_t> g_io_ns{0};  // time spent reading and writing files, for the long-frame log
+std::atomic<int> g_game_reads{0};                       // reads of the game's in progress
+std::atomic<std::chrono::steady_clock::rep> g_last_game_read{0};  // when its last one ended
 
 // ---------------------------------------------------------------- statuses
 constexpr uint32_t kSuccess = 0, kNoMoreFiles = 0x80000006, kBufferOverflow = 0x80000005,
@@ -491,10 +493,12 @@ void transfer(rt::Context& c, bool write, const char* fn) {
     }
     uint32_t done = 0, status = kSuccess;
     if (write) {
+        const auto io0 = std::chrono::steady_clock::now();
         h->file->clear();
         h->file->seekp(std::streamoff(off));
         h->file->write(reinterpret_cast<const char*>(c.mem + buf), len);
         h->file->flush();
+        g_io_ns += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - io0).count());
         done = *h->file ? len : 0;
         if (!*h->file) status = kAccessDenied;
     } else {
@@ -506,10 +510,14 @@ void transfer(rt::Context& c, bool write, const char* fn) {
             status = kEndOfFile;
         } else {
             const auto io0 = std::chrono::steady_clock::now();
+            g_game_reads.fetch_add(1, std::memory_order_relaxed);  // the warm-up stands aside
             h->file->clear();
             h->file->seekg(std::streamoff(off));
             h->file->read(reinterpret_cast<char*>(c.mem + buf), len);
-            const uint64_t ns = uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - io0).count());
+            const auto io1 = std::chrono::steady_clock::now();
+            g_last_game_read.store(io1.time_since_epoch().count(), std::memory_order_relaxed);
+            g_game_reads.fetch_sub(1, std::memory_order_relaxed);
+            const uint64_t ns = uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(io1 - io0).count());
             g_io_ns += ns;
             // Reads over 3 ms are logged (the first 300): a stutter while a scene loads is often the disk.
             static uint32_t slow = 0;
@@ -955,7 +963,18 @@ constexpr IoFn kIo[] = {
 void warm_disc(fs::path disc) {
     std::thread([disc = std::move(disc)] {
         const auto t0 = std::chrono::steady_clock::now();
-        std::vector<char> block(1 << 20);
+        // A quarter megabyte at a time, and none while the game is reading
+        // or has read in the last 50 ms: on a hard disk the two would
+        // otherwise take turns seeking, and the game's reads (bunched as a
+        // scene loads) waited 60-150 ms behind this one's.
+        std::vector<char> block(1 << 18);
+        auto stand_aside = [] {
+            using Clock = std::chrono::steady_clock;
+            while (g_game_reads.load(std::memory_order_relaxed) > 0 ||
+                   Clock::now().time_since_epoch().count() - g_last_game_read.load(std::memory_order_relaxed) <
+                       std::chrono::duration_cast<Clock::duration>(std::chrono::milliseconds(50)).count())
+                std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        };
         uint64_t total = 0;
         std::error_code ec;
         std::vector<fs::path> files;
@@ -965,7 +984,11 @@ void warm_disc(fs::path disc) {
         std::ranges::sort(files);
         for (const fs::path& f : files) {
             std::ifstream in(f, std::ios::binary);
-            while (in.read(block.data(), std::streamsize(block.size())) || in.gcount() > 0) total += uint64_t(in.gcount());
+            for (;;) {
+                stand_aside();
+                if (!in.read(block.data(), std::streamsize(block.size())) && in.gcount() <= 0) break;
+                total += uint64_t(in.gcount());
+            }
         }
         std::fprintf(stderr, "qilin: the disc's %zu files (%.0f MB) read into the system's memory in %.1f s\n", files.size(), double(total) / 1e6,
                      std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());

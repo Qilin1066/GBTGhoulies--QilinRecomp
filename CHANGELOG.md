@@ -11,6 +11,18 @@ Each release is a git tag (`vX.Y.Z`) with a matching GitHub release. The version
 
 ## [Unreleased]
 
+## [0.43.1] - 2026-11-21
+
+### Changed
+- **A fight costs the game thread a seventh less**: measured on a GTX 1080 Ti PC, the first fight ran at 70-80 frames a second where the story's pages hold 144, the time going to the processor, not the graphics card. An eighth of it was comparing memory: every vertex run and texture a frame draws was compared whole with its copy once a frame (12 MB of vertices a frame in the fight), and again after any vertex buffer lock anywhere. Now:
+  - a vertex buffer lock has only the runs in that buffer compared again (locks are counted per buffer), and a texture or surface lock only that texture;
+  - memory that hasn't changed for 60 frames is compared whole after a lock of its resource and one frame in sixteen, and otherwise by eight words spread over it, which a scene loaded over the same memory fails at once. A change the game makes without a lock, to memory still for that long, that misses all eight words, would show up to fifteen frames late; `QILIN_CHECK_SETTLED=1` compares whole as well and reports any such, and finds none through the story and the first fight;
+  - the pixel shader's key is the one before's when the combiner setup is the same as the draw before's (it was hashed a byte at a time for every draw).
+
+  On that PC the same scripted fight then averaged 7 to 7.5 ms a frame where it had averaged 12 to 15, with stretches at 10 to 14 ms still (the busiest moments: the game's own code is 44% of the thread there).
+- **The disc's read into memory stands aside for the game**: on the hard disk it was measured on (2.7 GB of disc files in 60 s), the game's own reads in that first minute waited behind it, 57 and 156 ms in two frames. It now reads a quarter megabyte at a time and none while the game is reading or has read in the last 50 ms.
+- The long-frame log's file time includes writes (a save being made, the sound bank copied to the hard disk's cache).
+
 ## [0.43.0] - 2026-11-21
 
 ### Added
