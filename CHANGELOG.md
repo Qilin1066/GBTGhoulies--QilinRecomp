@@ -14,6 +14,7 @@ Each release is a git tag (`vX.Y.Z`) with a matching GitHub release. The version
 ### Fixed
 - **A refused sound or language setting was kept**: `channels = 4` (or `language = 2`) in the settings file was reported as unreadable, but the value had already been stored, so the game ran with it. A refused value now leaves the setting as it was. (Found in the BarbieWildHorseRescue port, which shares the settings code.)
 - **The coverage test checked nothing**: it counted unknown bytes only in lifted regions, and the synthetic test image's code section lies outside the game's regions, so it was never counted. It now counts every byte there and expects exactly the one known gap (two hand-described functions nothing calls).
+- **Every controller works the F1 menu**, not only the first one SDL lists (which can be a virtual pad or a wheel's base): Dear ImGui's SDL3 backend is set to read them all, as APB's menu now does.
 
 ## [0.41.3] - 2026-11-21
 
