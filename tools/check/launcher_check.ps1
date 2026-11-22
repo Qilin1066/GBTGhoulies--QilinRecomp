@@ -18,6 +18,10 @@ foreach ($part in @('xwavebank', 'bundles', 'demand')) { New-Item -ItemType Dire
 Set-Content -LiteralPath (Join-Path $disc 'default.xbe') -Value 'not game data'
 Copy-Item -LiteralPath $Launcher -Destination (Join-Path $fixture 'kit/play.ps1')
 Copy-Item -LiteralPath $Stub -Destination (Join-Path $fixture 'kit/qilin.exe')
+# A Chocolatey ninja.exe is a shim that finds the real one by a relative
+# path, so a copy of it doesn't run: copy what it points to.
+$chocolateyNinja = Join-Path (Split-Path -Parent (Split-Path -Parent $Ninja)) 'lib/ninja/tools/ninja.exe'
+if (Test-Path -LiteralPath $chocolateyNinja) { $Ninja = $chocolateyNinja }
 Copy-Item -LiteralPath $Ninja -Destination (Join-Path $fixture 'kit/ninja.exe')
 Copy-Item -LiteralPath $Stub -Destination (Join-Path $fixture 'kit/toolchain/bin/x86_64-w64-mingw32-clang++.exe')
 Set-Content -LiteralPath (Join-Path $fixture 'kit/include/stub.hpp') -Value 'header1'
