@@ -61,6 +61,7 @@ constexpr uint32_t kPacketSuccess = 0, kPacketPending = 0x8000000Au, kPacketFlus
 
 // ---------------------------------------------------------------- objects
 struct Buffer {
+    uint32_t own = 0, own_bytes = 0;  // the memory DirectSound gave a buffer created with dwBufferBytes (0: the game's own)
     uint32_t refs = 1;
     uint32_t flags = 0;
     uint32_t output = 0;  // the submix buffer it feeds (SetOutputBuffer), or 0 for the mix bins
@@ -107,6 +108,7 @@ struct DirectSound {
     uint32_t object = 0, refs = 0;
     std::map<uint32_t, std::unique_ptr<Buffer>> buffers;  // by guest address
     std::vector<uint32_t> spare_objects;                  // guest slots for object headers, free
+    std::multimap<uint32_t, uint32_t> spare_memory;       // buffers' own memory, free: bytes -> address
     std::chrono::steady_clock::time_point epoch;
     platform::AudioOut* out = nullptr;  // the speakers, if there's a sound device
     uint64_t mixed = 0;  // output frames mixed so far
@@ -403,7 +405,6 @@ void create_sound_buffer(rt::Context& c) {
     const uint32_t desc = arg(c, 1), out = arg(c, 2);
     const uint32_t flags = ld(c, desc + 4), bytes = ld(c, desc + 8), wfx = ld(c, desc + 12), bins = ld(c, desc + 16);
     if (flags & 0x80000) unmodelled("IDirectSound_CreateSoundBuffer", "an effects input buffer (DSBCAPS_FXIN)");
-    if (bytes) unmodelled("IDirectSound_CreateSoundBuffer", "a buffer with its own memory (dwBufferBytes != 0)");
     auto b = std::make_unique<Buffer>();
     b->flags = flags;
     if (flags & 0x2000) {  // DSBCAPS_MIXIN: a submix destination, with the format's channels
@@ -413,6 +414,20 @@ void create_sound_buffer(rt::Context& c) {
     }
     b->voice.mix_bins = read_mix_bins(c, bins);
     b->voice.headroom = default_headroom(flags);
+    if (bytes) {
+        // A buffer with its own memory: DirectSound allocates it (silence,
+        // as the library's zeroed pool), and Lock hands out pointers into it.
+        if (flags & 0x2000) unmodelled("IDirectSound_CreateSoundBuffer", "a submix buffer with its own memory");
+        if (!wfx) unmodelled("IDirectSound_CreateSoundBuffer", "a buffer with its own memory and no format");
+        auto& spare = ds().spare_memory;
+        uint32_t mem = 0;
+        if (const auto it = spare.find(bytes); it != spare.end()) mem = it->second, spare.erase(it);
+        else mem = contiguous(bytes, 0, 0xFFFFFFFFu, 0, 4);  // as MmAllocateContiguousMemory: PAGE_READWRITE
+        if (!mem) unmodelled("IDirectSound_CreateSoundBuffer", strf("%u bytes of buffer memory (none left)", bytes));
+        for (uint32_t k = 0; k + 4 <= bytes; k += 4) st(c, mem + k, 0);
+        b->own = mem, b->own_bytes = bytes;
+        b->voice.set_data(mem, bytes);
+    }
     const uint32_t obj = guest_object(c);
     ds().buffers[obj] = std::move(b);
     st(c, out, obj);
@@ -428,6 +443,7 @@ void buffer_release(rt::Context& c) {
         catch_up(c);
         for (auto& [addr, other] : ds().buffers)
             if (other->output == a) unmodelled("IDirectSoundBuffer_Release", "releasing a submix buffer other buffers still feed");
+        if (b.own) ds().spare_memory.emplace(b.own_bytes, b.own);
         ds().buffers.erase(a);
         free_guest_object(a);
     }

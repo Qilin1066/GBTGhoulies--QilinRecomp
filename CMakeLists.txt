@@ -247,10 +247,16 @@ target_link_libraries(qilin_d3d_lifetime_tests PRIVATE qilin_host qilin_warnings
 add_test(NAME qilin_d3d_lifetime_tests COMMAND qilin_d3d_lifetime_tests)
 set_tests_properties(qilin_d3d_lifetime_tests PROPERTIES SKIP_RETURN_CODE 77)
 
+# Bounds-check every guest memory access in lifted code (bring-up): off, an
+# access outside guest memory faults instead, and guest_ram.cpp's fault
+# handler stops the runtime naming the guest address, at no cost per access.
+option(QILIN_CHECKED_MEMORY "Bounds-check every guest memory access in lifted code" OFF)
+set(qilin_checked_memory $<$<BOOL:${QILIN_CHECKED_MEMORY}>:QILIN_CHECKED_MEMORY>)
+
 # Compile the complete entry point and dispatch in ordinary CI without a disc.
 add_executable(qilin_player_link_check recomp/runtime/host/run.cpp
     recomp/runtime/dispatch.cpp tools/player-kit/link_check.cpp)
-target_compile_definitions(qilin_player_link_check PRIVATE QILIN_CHECKED_MEMORY)
+target_compile_definitions(qilin_player_link_check PRIVATE ${qilin_checked_memory})
 target_link_libraries(qilin_player_link_check PRIVATE qilin_host qilin_xbe qilin_warnings)
 
 add_executable(qilin_platform_tests recomp/runtime/platform/platform_tests.cpp)
@@ -264,7 +270,7 @@ if(QILIN_GEN_DIR)
     file(GLOB QILIN_GEN_SOURCES CONFIGURE_DEPENDS "${QILIN_GEN_DIR}/*.cpp")
     add_executable(qilin_run recomp/runtime/host/run.cpp recomp/runtime/dispatch.cpp ${QILIN_GEN_SOURCES})
     target_include_directories(qilin_run PRIVATE "${QILIN_GEN_DIR}")
-    target_compile_definitions(qilin_run PRIVATE QILIN_CHECKED_MEMORY)  # bring-up: bad guest accesses stop with an address
+    target_compile_definitions(qilin_run PRIVATE ${qilin_checked_memory})
     target_link_libraries(qilin_run PRIVATE qilin_host qilin_xbe)
     if(MSVC)
         # The generated files are large (up to 2.5 MB, hundreds of functions
@@ -295,7 +301,11 @@ if(QILIN_PLAYER_KIT)
         message(FATAL_ERROR "the player kit needs SDL3 built statically (-DQILIN_SYSTEM_SDL=OFF)")
     endif()
     add_library(ghoulies_kit_main OBJECT recomp/runtime/host/run.cpp recomp/runtime/dispatch.cpp)
-    target_compile_definitions(ghoulies_kit_main PRIVATE QILIN_CHECKED_MEMORY)
+    target_compile_definitions(ghoulies_kit_main PRIVATE ${qilin_checked_memory})
+    set(kit_checked "")
+    if(QILIN_CHECKED_MEMORY)
+        set(kit_checked " -DQILIN_CHECKED_MEMORY")
+    endif()
     target_link_libraries(ghoulies_kit_main PRIVATE qilin_host qilin_xbe qilin_warnings)
     set(kit_libraries qilin_file_store qilin_host qilin_ui qilin_imgui qilin_gfx qilin_audio qilin_platform qilin_xbe qilin_volk SDL3-static)
     set(kit_archive "${CMAKE_BINARY_DIR}/libghoulies_kit.a")
@@ -317,12 +327,12 @@ if(QILIN_PLAYER_KIT)
     string(JOIN " " kit_system_text ${kit_system_libraries})
     # What the lifted code is compiled and linked with: kit.ninja, included by
     # the build.ninja the player's script writes ($kit is the kit's folder).
-    # The same floating-point rules as qilin_runtime (bit-exact SSE), and the
-    # same checked guest memory as qilin_run. Lifted calls nest as deeply as
+    # The same floating-point rules as qilin_runtime (bit-exact SSE), and
+    # guest memory accessed as qilin_run accesses it (QILIN_CHECKED_MEMORY). Lifted calls nest as deeply as
     # the guest's: a 16 MB main stack.
     file(WRITE "${CMAKE_BINARY_DIR}/kit.ninja"
         "# Written by CMake for the player kit (QILIN_PLAYER_KIT).\n"
-        "cxxflags = -O2 -DNDEBUG -DQILIN_CHECKED_MEMORY -std=c++23 -ffp-contract=off -fno-fast-math -w -I$kit/include\n"
+        "cxxflags = -O2 -DNDEBUG${kit_checked} -std=c++23 -ffp-contract=off -fno-fast-math -w -I$kit/include\n"
         "ldflags = -static -O2 -Wl,--stack,16777216\n"
         "libs = $kit/lib/libghoulies_kit.a ${kit_system_text}\n")
     # Linked with stand-ins for the lifted code: the kit is complete.

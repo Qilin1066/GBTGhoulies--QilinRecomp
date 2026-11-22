@@ -350,9 +350,12 @@ int main(int argc, char** argv) {
     // StackBase, and starts the stack under it.
     const uint32_t tls = tls_size(m);
     host::init_main_thread(c, mm.kpcr(), mm.kthread(), mm.stack_top(), host::MemoryMap::kStackSize, tls);
+    // Before init_main, which copies these registers as the starting state of
+    // every thread created later and of DPCs: the kernel starts each thread
+    // with this control word (all exceptions masked, 53-bit precision).
+    c.fpcw = 0x027F;
     host::sched::init_main(c, mm.kthread(), host::call_guest);  // the scheduler, with this as the main thread
     if (tls) init_tls(c, mm.stack_top() - tls);
-    c.fpcw = 0x027F;
     c.esp = (mm.stack_top() - tls) & ~15u;
     for (int k = 0; k < 3; ++k) push(c, 0);  // main(argc, argv, envp)
     push(c, host::kReturnSentinel);

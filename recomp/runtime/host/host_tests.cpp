@@ -14,6 +14,11 @@
 #include <cstdio>
 #include <string>
 
+#if !defined(_WIN32)
+#include <sys/wait.h>
+#include <unistd.h>
+#endif
+
 #include "crypto.hpp"
 #include "strf.hpp"
 #include "host.hpp"
@@ -551,6 +556,35 @@ int main() {
         wave.close();
         std::filesystem::remove(wav_path);
     }
+
+#if !defined(_WIN32)
+    // An access to guest memory that isn't mapped stops the runtime, naming
+    // the guest address (guest_ram.cpp's fault handler), in a child process.
+    {
+        int out[2];
+        CHECK(pipe(out) == 0);
+        const pid_t child = fork();
+        if (child == 0) {
+            dup2(out[1], 2);
+            std::string why;
+            uint8_t* base = host::map_guest_ram(0x100000, &why);
+            if (!base) std::_Exit(10);
+            base[0x1234] = 1;                                  // RAM: fine
+            volatile uint8_t* past = base + 0x7FFE1230u;       // the virtual memory, not committed
+            *past = 1;
+            std::_Exit(11);                                    // not reached
+        }
+        close(out[1]);
+        std::string text;
+        char buf[256];
+        for (ssize_t n; (n = read(out[0], buf, sizeof buf)) > 0;) text.append(buf, size_t(n));
+        close(out[0]);
+        int status = 0;
+        waitpid(child, &status, 0);
+        CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 3);
+        CHECK(text.find("guest memory access at 7FFE1230") != std::string::npos);
+    }
+#endif
 
     if (failures) std::fprintf(stderr, "%d check(s) failed\n", failures);
     else std::printf("all host tests passed\n");

@@ -9,6 +9,12 @@
 // title's virtual memory: host pages there are inaccessible until the
 // title commits them (commit_guest_pages), and RAM is charged for what's
 // committed, not for the address space (host.cpp's physical budget).
+//
+// Lifted code doesn't check its accesses (unless built with
+// QILIN_CHECKED_MEMORY): every guest address is inside the reservation, and
+// what isn't mapped there faults. The fault handler here turns such a fault
+// into the runtime's stop, naming the guest address, as a checked access
+// would; a fault anywhere else goes on to whatever handled it before.
 #include <algorithm>
 #include <cerrno>
 #include <cstdio>
@@ -24,6 +30,7 @@
 #define NOMINMAX
 #include <windows.h>
 #else
+#include <csignal>
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <unistd.h>
@@ -162,6 +169,57 @@ void host_take_back(uint8_t* p, size_t n) { host_commit(p, n); }
 
 uint8_t* g_base = nullptr;
 
+// The stop for an access to guest memory that isn't mapped: written with
+// nothing but write(2)-like calls, as it runs in a fault handler.
+void stop_at(uintptr_t host_address) {
+    const uint32_t guest = uint32_t(host_address - uintptr_t(g_base));
+    char line[] = "qilin: stopped: guest memory access at 00000000, which isn't mapped (or is read-only)\n";
+    char* digits = std::strchr(line, '0');  // the eight digits
+    for (int k = 7; k >= 0; --k) digits[7 - k] = "0123456789ABCDEF"[(guest >> (4 * k)) & 0xF];
+    const int n = int(sizeof line - 1);
+#if defined(_WIN32)
+    DWORD written = 0;
+    WriteFile(GetStdHandle(STD_ERROR_HANDLE), line, DWORD(n), &written, nullptr);
+#else
+    [[maybe_unused]] const ssize_t written = write(2, line, size_t(n));
+#endif
+    std::_Exit(3);
+}
+
+bool in_reservation(uintptr_t a) { return g_base && a >= uintptr_t(g_base) && a - uintptr_t(g_base) < kReservation; }
+
+#if defined(_WIN32)
+LONG CALLBACK on_fault(EXCEPTION_POINTERS* e) {
+    const EXCEPTION_RECORD* r = e->ExceptionRecord;
+    if (r->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && r->NumberParameters >= 2 && in_reservation(uintptr_t(r->ExceptionInformation[1])))
+        stop_at(uintptr_t(r->ExceptionInformation[1]));
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+void install_fault_handler() { AddVectoredExceptionHandler(1, on_fault); }
+#else
+struct sigaction g_previous_segv{}, g_previous_bus{};
+void on_fault(int sig, siginfo_t* info, void* context) {
+    if (in_reservation(uintptr_t(info->si_addr))) stop_at(uintptr_t(info->si_addr));
+    // Not guest memory: as before this handler was installed.
+    const struct sigaction& previous = sig == SIGBUS ? g_previous_bus : g_previous_segv;
+    if (previous.sa_flags & SA_SIGINFO) {
+        if (previous.sa_sigaction) return previous.sa_sigaction(sig, info, context);
+    } else if (previous.sa_handler != SIG_DFL && previous.sa_handler != SIG_IGN && previous.sa_handler) {
+        return previous.sa_handler(sig);
+    }
+    signal(sig, SIG_DFL);  // the fault happens again on return, and ends the process as it would have
+}
+void install_fault_handler() {
+    struct sigaction a{};
+    a.sa_sigaction = on_fault;
+    a.sa_flags = SA_SIGINFO | SA_ONSTACK;
+    sigemptyset(&a.sa_mask);
+    sigaction(SIGSEGV, &a, &g_previous_segv);
+    sigaction(SIGBUS, &a, &g_previous_bus);  // macOS reports some protection faults as SIGBUS
+}
+#endif
+
+
 }  // namespace
 
 uint8_t* map_guest_ram(uint32_t ram_size, std::string* error) {
@@ -172,6 +230,7 @@ uint8_t* map_guest_ram(uint32_t ram_size, std::string* error) {
     uint8_t* base = map(ram_size, error);
     if (!base) return nullptr;
     rt::g_ram_aliases = true, rt::g_ram_size = ram_size, g_base = base;
+    install_fault_handler();
     // Every page of RAM made now, not when the game first touches it: the
     // host's first touch of each (a fault, and a page zeroed) otherwise
     // lands in the frames where a new scene's data comes in, a stutter.

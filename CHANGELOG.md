@@ -11,6 +11,13 @@ Each release is a git tag (`vX.Y.Z`) with a matching GitHub release. The version
 
 ## [Unreleased]
 
+### Changed
+- Lifted code no longer bounds-checks each guest memory access. Every guest address lies inside the 4 GB reservation, so an access to memory that isn't mapped faults; a fault handler (signals on Linux and macOS, a vectored exception handler on Windows) turns it into the same stop a checked access gave, naming the guest address. Faults outside guest memory go to whatever handled them before. `-DQILIN_CHECKED_MEMORY=ON` restores the per-access checks for bring-up; it also governs `qilin_run`, the player kit and the link check.
+
+### Fixed
+- The main thread's x87 control word (0x027F) is set before the scheduler copies the main thread's registers, so threads and DPCs created later start with it too, as on the console.
+- DirectSound buffers created with `dwBufferBytes` get their own zeroed memory, reused when such a buffer is released, rather than stopping as unmodelled. Ported from the Wild Horse Rescue recompilation; not yet exercised by this game.
+
 ## [0.47.0] - 2026-11-22
 
 ### Fixed
