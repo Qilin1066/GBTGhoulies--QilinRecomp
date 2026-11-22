@@ -19,11 +19,14 @@ namespace qilin::platform {
 
 class AudioOut {
 public:
+    AudioOut() = default;
+    AudioOut(const AudioOut&) = delete;
+    AudioOut& operator=(const AudioOut&) = delete;
     // Opens the default playback device for `channels` channels at `rate`:
     // 2 (stereo) or 6 (5.1: front left, right, centre, LFE, back left,
     // right), or 0 for the device's own (6 where it has that many). False
     // (with a message printed) where there's no sound device; the game then
-    // runs silent.
+    // runs silent and retries during mixing.
     // `device` names a playback device (as playback_devices lists them) to
     // use whatever the system's default is; empty, or a name not found (a
     // message says so), is the default device, which SDL follows when the
@@ -47,6 +50,10 @@ public:
     uint64_t dropped() const { return dropped_; }
 
 private:
+    void stop();
+    void failed();
+    uint64_t retry_at_ = 0, full_since_ = 0;
+    std::string device_;
     ::SDL_AudioStream* stream_ = nullptr;
     uint32_t rate_ = 0, channels_ = 0;
     uint32_t target_frames_ = 0;  // the cushion held queued

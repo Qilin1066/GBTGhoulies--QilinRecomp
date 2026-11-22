@@ -1,3 +1,4 @@
+#include "command_line.hpp"
 // Direct3D 8 (the XDK's D3D8 library), replaced natively over the Vulkan
 // renderer (recomp/runtime/gfx). docs/graphics.md describes the design.
 //
@@ -479,7 +480,7 @@ void deliver_frame(Device& d) {
             for (int k = 0; k < 3; ++k) im.rgba[i + k] = d.gamma[k][im.rgba[i + k]];
             im.rgba[i + 3] = 255;
         }
-        const std::string path = (g_capture.log ? g_capture.dir.string() : d.config.dump_dir.empty() ? std::string(trace_dir) : d.config.dump_dir) +
+        const std::string path = (g_capture.log ? qilin::utf8_path(g_capture.dir) : d.config.dump_dir.empty() ? std::string(trace_dir) : d.config.dump_dir) +
                                  strf("/frame_%05llu.png", (unsigned long long)n);
         if (!gfx::write_png(path, im)) std::fprintf(stderr, "qilin: can't write %s\n", path.c_str());
         // A capture's first four frames at the render resolution too (full_NNNNN.png): what the
@@ -490,7 +491,7 @@ void deliver_frame(Device& d) {
                 for (int k = 0; k < 3; ++k) full.rgba[i + k] = d.gamma[k][full.rgba[i + k]];
                 full.rgba[i + 3] = 255;
             }
-            gfx::write_png(g_capture.dir.string() + strf("/full_%05llu.png", (unsigned long long)n), full);
+            gfx::write_png(qilin::utf8_path(g_capture.dir) + strf("/full_%05llu.png", (unsigned long long)n), full);
         }
     }
     if (d.config.max_frames && n >= d.config.max_frames) {
@@ -1001,7 +1002,7 @@ void test_run(Device& d) {
     static size_t next = 0;
     static const auto began = std::chrono::steady_clock::now();
     static const bool loaded = [&] {
-        const std::filesystem::path file = std::filesystem::path(d.config.settings_folder) / "selftest.txt";
+        const std::filesystem::path file = qilin::native_path(d.config.settings_folder) / "selftest.txt";
         std::ifstream in(file);
         if (!in) return false;
         for (std::string line; std::getline(in, line);) {
@@ -1030,7 +1031,7 @@ void test_run(Device& d) {
         std::ranges::stable_sort(steps, {}, &TestStep::at);
         std::error_code ec;
         std::filesystem::rename(file, std::filesystem::path(file).replace_extension(".ran"), ec);
-        std::printf("qilin_run: a test run from %s: %zu steps\n", file.string().c_str(), steps.size());
+        std::printf("qilin_run: a test run from %s: %zu steps\n", qilin::utf8_path(file).c_str(), steps.size());
         std::fflush(stdout);
         return true;
     }();
@@ -1062,7 +1063,7 @@ void capture_step(rt::Context& c, Device& d) {
         std::fclose(g_capture.log);
         g_capture.log = nullptr;
         pack_capture(g_capture.dir);
-        const std::string where = std::filesystem::path(g_capture.dir).concat(".tar").string();
+        const std::string where = qilin::utf8_path(std::filesystem::path(g_capture.dir).concat(".tar"));
         std::printf("qilin_run: captured %u frames to %s\n", kCaptureFrames, where.c_str());
         std::fflush(stdout);
         if (d.menu) d.menu->banner("Captured " + std::to_string(kCaptureFrames) + " frames to " + where);
@@ -1075,11 +1076,15 @@ void capture_step(rt::Context& c, Device& d) {
         const auto now = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
         char stamp[32] = "capture";
         if (const std::tm* tm = std::localtime(&now)) std::strftime(stamp, sizeof stamp, "%Y%m%d-%H%M%S", tm);
-        g_capture.dir = std::filesystem::path(d.config.settings_folder) / "captures" / stamp;
+        g_capture.dir = qilin::native_path(d.config.settings_folder) / "captures" / stamp;
         std::filesystem::create_directories(g_capture.dir, ec);
-        g_capture.log = std::fopen((g_capture.dir / "trace.txt").string().c_str(), "w");
+#ifdef _WIN32
+        g_capture.log = _wfopen((g_capture.dir / "trace.txt").c_str(), L"w");
+#else
+        g_capture.log = std::fopen((g_capture.dir / "trace.txt").c_str(), "w");
+#endif
         if (!g_capture.log) {
-            std::printf("qilin_run: can't write a capture to %s\n", g_capture.dir.string().c_str());
+            std::printf("qilin_run: can't write a capture to %s\n", qilin::utf8_path(g_capture.dir).c_str());
             return;
         }
         g_capture.until = d.swaps + kCaptureFrames;
@@ -1140,6 +1145,7 @@ void swap(rt::Context& c) {
     // with the menu over it until it closes; the time it was open is taken off
     // the game's clock (its vblanks) and the sound's, so nothing jumps.
     if (d.menu && d.menu->open()) {
+        if (d.config.input) d.config.input->stop_rumble();
         const auto paused = std::chrono::steady_clock::now();
         pause_audio(true);
         while (d.menu->open()) {
@@ -2999,7 +3005,7 @@ void issue_draw(rt::Context& c, Device& d, const char* fn, uint32_t prim, Vertic
             }
             std::fputs(x.c_str(), g_capture.log ? g_capture.log : stderr);
         }
-        const std::string capture_dir = g_capture.log ? g_capture.dir.string() : std::string();
+        const std::string capture_dir = g_capture.log ? qilin::utf8_path(g_capture.dir) : std::string();
         if (const char* dir = g_capture.log ? capture_dir.c_str() : std::getenv("QILIN_TRACE_DUMP"); dir && *dir && (g_capture.log || trace_wanted(line))) {
             static uint32_t n = 0;
             for (uint32_t stage = 0; stage < 4; ++stage)

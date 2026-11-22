@@ -1,3 +1,4 @@
+#include "command_line.hpp"
 // qilin_run: loads default.xbe into guest memory and runs the game's lifted
 // main() until it returns or reaches something the runtime doesn't provide
 // yet, which it names. Built with the generated code (-DQILIN_GEN_DIR=...).
@@ -45,7 +46,12 @@ void push(rt::Context& c, uint32_t v) {
 // directory, under qilin/ghoulies.
 std::filesystem::path default_data_dir() {
     auto env = [](const char* n) -> std::filesystem::path {
+#ifdef _WIN32
+        const std::wstring key(n, n + std::strlen(n));
+        const wchar_t* v = _wgetenv(key.c_str());
+#else
         const char* v = std::getenv(n);
+#endif
         return v && *v ? std::filesystem::path(v) : std::filesystem::path();
     };
 #if defined(_WIN32)
@@ -133,6 +139,8 @@ void crt_startup(rt::Context& c) {
 }  // namespace
 
 int main(int argc, char** argv) {
+    const qilin::CommandLine command_line(argc, argv);
+    argc = command_line.count(); argv = command_line.values();
     const char* path = nullptr;
     const char* game_dir = nullptr;
     const char* data_dir = nullptr;
@@ -194,7 +202,7 @@ int main(int argc, char** argv) {
                      "  --fullscreen     start fullscreen (F11 or Alt+Enter switches)\n"
                      "  --mute           no sound output (--headless implies it; --dump-audio still writes)\n"
                      "  --audio-channels 2 or 6 (5.1); by default 5.1 where the sound device has six or more speakers\n",
-                     host::kRetailRamMb, default_data_dir().string().c_str());
+                     host::kRetailRamMb, qilin::utf8_path(default_data_dir()).c_str());
         return 2;
     }
     host::set_memory_map(host::MemoryMap{ram_mb << 20});
@@ -279,7 +287,7 @@ int main(int argc, char** argv) {
     host::register_xapi();
     host::register_game_fixes();
     // The settings (ghoulies.ini in the data folder): written with the defaults the first time.
-    const std::filesystem::path data_folder = data_dir ? std::filesystem::path(data_dir) : default_data_dir();
+    const std::filesystem::path data_folder = data_dir ? qilin::native_path(data_dir) : default_data_dir();
     static platform::Settings settings = platform::load_settings(data_folder);
     fullscreen = fullscreen || settings.fullscreen;
     if (!audio_channels) audio_channels = settings.channels;
@@ -289,7 +297,7 @@ int main(int argc, char** argv) {
     const float aspect = host::game_aspect_ratio(platform::aspect_ratio(settings, headless ? 0.0f : platform::Window::main_screen_aspect()));
     host::set_game_aspect(m, aspect, false);
     d3d.settings = &settings;
-    d3d.settings_folder = data_folder.string();
+    d3d.settings_folder = qilin::utf8_path(data_folder);
     // The window: where there's no display, the game still runs and draws.
     std::unique_ptr<platform::Window> window;
     if (!headless) {
@@ -309,19 +317,19 @@ int main(int argc, char** argv) {
     d3d.input = input.get();
     host::register_xinput(input.get());
     // Outside the partitions, so the game's disk never sees it.
-    d3d.pipeline_cache = ((data_dir ? std::filesystem::path(data_dir) : default_data_dir()) / "vulkan_pipelines.cache").string();
+    d3d.pipeline_cache = qilin::utf8_path((data_dir ? qilin::native_path(data_dir) : default_data_dir()) / "vulkan_pipelines.cache");
     host::register_d3d(d3d);
     // Sound: the mixer's output to the default playback device, unless asked not to.
     std::unique_ptr<platform::AudioOut> sound;
     if (!headless && !mute) {
         sound = std::make_unique<platform::AudioOut>();
-        if (!sound->start(audio::kOutputRate, audio_channels, settings.sound_device)) sound.reset();
+        sound->start(audio::kOutputRate, audio_channels, settings.sound_device); // keep retrying during an outage
     }
     host::set_audio_surround(sound && sound->channels() == 6);
     host::register_dsound(dump_audio, sound.get());
     host::register_kernel();
-    const std::filesystem::path disc = game_dir ? std::filesystem::path(game_dir) : std::filesystem::path(path).parent_path();
-    std::filesystem::path data = data_dir ? std::filesystem::path(data_dir) : default_data_dir();
+    const std::filesystem::path disc = game_dir ? qilin::native_path(game_dir) : qilin::native_path(path).parent_path();
+    std::filesystem::path data = data_dir ? qilin::native_path(data_dir) : default_data_dir();
     // A test run (selftest.txt, which the Direct3D side plays) gets a hard
     // disk of its own, empty each time: the player's saves aren't touched,
     // and the run starts the same way every time.
@@ -331,7 +339,7 @@ int main(int argc, char** argv) {
         std::filesystem::create_directories(data, ec);
     }
     host::register_kernel_io({disc.empty() ? std::filesystem::path(".") : disc, data, !headless});
-    std::printf("qilin_run: disc %s, hard disk %s\n", disc.string().c_str(), data.string().c_str());
+    std::printf("qilin_run: disc %s, hard disk %s\n", qilin::utf8_path(disc).c_str(), qilin::utf8_path(data).c_str());
 
     // The main thread: its information block (fs:[0] = end of the exception
     // chain), the C runtime's default x87 control word, and main's arguments.

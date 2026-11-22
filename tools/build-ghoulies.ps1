@@ -41,8 +41,9 @@ function Find-Built([string]$name) {
 function Start-Game([string]$game, [string]$disc) {
     $xbe = Join-Path $disc "default.xbe"
     if ($onWindows) {
-        $command = "`"`"$game`" --game-dir `"$disc`" `"$xbe`" > `"$log`" 2>&1`""
-        Start-Process -FilePath "cmd.exe" -ArgumentList @("/s", "/c", $command) -WorkingDirectory (Split-Path -Parent $game) -WindowStyle Hidden
+        Start-Process -FilePath $game -ArgumentList @("--game-dir", "`"$disc`"", "`"$xbe`"") `
+            -WorkingDirectory (Split-Path -Parent $game) -WindowStyle Hidden `
+            -RedirectStandardOutput $log -RedirectStandardError (Join-Path $build "run-errors.log")
     } else {
         Start-Process -FilePath $game -ArgumentList @("--game-dir", $disc, $xbe) -RedirectStandardOutput $log
     }
@@ -117,7 +118,6 @@ if ($onWindows -and -not (Test-Path (Join-Path $build "CMakeCache.txt"))) { $con
 if (-not $onWindows) { $configure += "-DCMAKE_BUILD_TYPE=Release" }
 New-Item -ItemType Directory -Force -Path $gen | Out-Null
 Invoke-Step "Configuring" "cmake" $configure
-Set-Content -Path $discFile -Value $Disc -Encoding UTF8
 Invoke-Step "Building the recompiler" "cmake" @("--build", $build, "--config", "Release", "--target", "qilin", "--parallel")
 $qilin = Find-Built "qilin"
 if (-not $qilin) { throw "built, but qilin$exe isn't where it should be" }
@@ -127,6 +127,7 @@ Invoke-Step "Building Grabbed by the Ghoulies (the first time compiles the whole
 $game = Find-Built "qilin_run"
 if (-not $game) { throw "built, but qilin_run$exe isn't where it should be" }
 
+Set-Content -Path $discFile -Value $Disc -Encoding UTF8
 Write-Host "Built: $game" -ForegroundColor Green
 if ($Run) {
     Write-Host "Starting Grabbed by the Ghoulies..."

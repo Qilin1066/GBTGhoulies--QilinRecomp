@@ -36,6 +36,17 @@ int main() {
         return o;
     };
 
+    // Empty submix blocks do not form references into empty sample storage.
+    {
+        audio::Voice source, target;
+        source.set_format(audio::Format{});
+        const int16_t sample = 123;
+        std::memcpy(mem.data() + 0x100, &sample, sizeof sample);
+        source.set_data(0x100, sizeof sample);
+        source.play(true);
+        target.make_submix(2);
+        source.mix_into(mem.data(), mem.size(), target, 0);
+    }
     // A 16-bit mono PCM voice at 48 kHz: plays sample for sample to both
     // sides (default mix bins), then stops at the end of its data.
     const int16_t pcm[4] = {16384, -16384, 8192, 0};

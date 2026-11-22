@@ -1,3 +1,5 @@
+#include "command_line.hpp"
+#include "file_store.hpp"
 // The Vulkan 1.3 renderer (gfx.hpp). The Vulkan library is loaded at run time
 // through volk, so there's nothing to link against and a machine without
 // Vulkan gets a message.
@@ -1084,7 +1086,7 @@ void VulkanRenderer::submit(VkSemaphore wait, VkSemaphore signal) {
 void VulkanRenderer::load_pipeline_cache() {
     std::vector<char> data;
     if (!config_.pipeline_cache.empty()) {
-        std::ifstream in(config_.pipeline_cache, std::ios::binary);
+        std::ifstream in(qilin::native_path(config_.pipeline_cache), std::ios::binary);
         if (in) data.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
         VkPhysicalDeviceProperties props{};
         vkGetPhysicalDeviceProperties(gpu_, &props);
@@ -1110,15 +1112,10 @@ void VulkanRenderer::save_pipeline_cache() {
     if (vkGetPipelineCacheData(device_, pipeline_cache_, &size, nullptr) != VK_SUCCESS || !size) return;
     std::vector<char> data(size);
     if (vkGetPipelineCacheData(device_, pipeline_cache_, &size, data.data()) != VK_SUCCESS) return;
-    const std::filesystem::path to(config_.pipeline_cache), tmp = to.string() + ".new";
+    const auto to = qilin::native_path(config_.pipeline_cache);
     std::error_code ec;
     std::filesystem::create_directories(to.parent_path(), ec);
-    {
-        std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
-        if (!out.write(data.data(), std::streamsize(size))) return;
-    }
-    std::filesystem::rename(tmp, to, ec);
-    if (!ec) unsaved_pipelines_ = 0;
+    if (!ec && platform::atomic_write(to, {data.data(), size})) unsaved_pipelines_ = 0;
 }
 
 void VulkanRenderer::present_again() {
@@ -2494,7 +2491,7 @@ void VulkanRenderer::write_library_entry(std::ostream& out, const PipelineKey& k
 
 void VulkanRenderer::start_library() {
     if (config_.pipeline_cache.empty()) return;
-    library_.path = std::filesystem::path(config_.pipeline_cache).replace_filename("pipeline_library.bin");
+    library_.path = qilin::native_path(config_.pipeline_cache).replace_filename("pipeline_library.bin");
     const uint32_t layout[2] = {34, uint32_t(sizeof(nv2a::CombinerSetup))};
     std::string data;
     if (std::ifstream in(library_.path, std::ios::binary); in) data.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());

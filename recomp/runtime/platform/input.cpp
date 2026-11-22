@@ -162,6 +162,7 @@ bool Input::start() {
 }
 
 Input::~Input() {
+    stop_rumble();
     for (Port& p : ports_)
         if (p.pad) SDL_CloseGamepad(p.pad);
     if (started_) SDL_QuitSubSystem(SDL_INIT_GAMEPAD);
@@ -192,6 +193,7 @@ void Input::detach(uint32_t id) {
     for (uint32_t n = 0; n < kPorts; ++n) {
         Port& p = ports_[n];
         if (p.id != id) continue;
+        SDL_RumbleGamepad(p.pad, 0, 0, 0);
         SDL_CloseGamepad(p.pad);
         p = Port{};
         std::printf("qilin_run: controller %u removed\n", n + 1);
@@ -298,6 +300,22 @@ void Input::set_keys(const std::vector<std::string> (&names)[kControlCount]) {
     }
 }
 
+void Input::stop_rumble() {
+#ifdef _WIN32
+    // Also stop a fallback slot after SDL starts seeing a controller.
+    if (xinput().set_state) {
+        XiVibration zero{};
+        for (uint32_t port = 0; port < kPorts; ++port)
+            if (xinput().present[port]) xinput().set_state(port, &zero);
+    }
+#endif
+    for (uint32_t port = 0; port < kPorts; ++port) rumble(port, 0, 0);
+}
+void Input::set_rumble(bool on) {
+    rumble_on_ = on;
+    if (!on) stop_rumble();
+}
+
 void Input::rumble(uint32_t port, uint16_t left, uint16_t right) {
     if (!rumble_on_) left = right = 0;
 #ifdef _WIN32
@@ -311,10 +329,10 @@ void Input::rumble(uint32_t port, uint16_t left, uint16_t right) {
     Port& p = ports_[port];
     p.left = left;
     p.right = right;
-    // SDL's rumble runs for a set time, up to about a minute; asked again
+    // A short lease prevents lingering vibration if the game stalls. Asked again
     // with each change and each call (the game sends its rumble every
     // frame), so it lasts until changed, as the Xbox's.
-    SDL_RumbleGamepad(p.pad, left, right, 0xFFFF);
+    SDL_RumbleGamepad(p.pad, left, right, 250);
 }
 
 bool hold_key(const std::string& name, bool down) {

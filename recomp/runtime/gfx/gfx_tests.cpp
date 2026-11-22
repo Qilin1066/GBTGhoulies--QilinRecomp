@@ -190,7 +190,8 @@ mad oPos.xyz, oPos.xyzz, r1.x, c-37.xyzz
             return 1;
         }
         std::printf("renderer tests skipped: %s\n", error.c_str());
-        return 77;
+        const char* required = std::getenv("QILIN_REQUIRE_VULKAN");
+        return required && std::string(required) == "1" ? 1 : 77;
     }
     std::printf("device: %s\n", r->device_name().c_str());
 

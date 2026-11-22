@@ -32,6 +32,10 @@ $stamp = Join-Path $work "built-with.txt"
 $discFile = Join-Path $work "disc-folder.txt"
 $kitVersion = (Get-Content (Join-Path $kit "VERSION") -Raw).Trim()
 $onWindows = ($PSVersionTable.PSEdition -eq "Desktop") -or $IsWindows   # Windows PowerShell 5.1 has no $IsWindows
+$identityParts = @("lib/libghoulies_kit.a", "qilin.exe", "kit.ninja", "play.ps1") | ForEach-Object {
+    (Get-FileHash -LiteralPath (Join-Path $kit $_) -Algorithm SHA256).Hash
+}
+$builtFor = "$kitVersion | $($identityParts -join ':')"
 # Off Windows (testing the download), QILIN_KIT_RUNNER runs the kit's programs.
 $runner = $env:QILIN_KIT_RUNNER
 
@@ -96,7 +100,6 @@ while ($true) {
 }
 $disc = $disc.TrimEnd('\')
 New-Item -ItemType Directory -Force -Path $work | Out-Null
-Set-Content -Path $discFile -Value $disc -Encoding UTF8
 
 # Starts the game, its messages into run.log (the file to send when something goes wrong).
 function Start-Game {
@@ -105,13 +108,14 @@ function Start-Game {
         Write-Host "(not on Windows: built, not started)"
         return
     }
-    $command = "`"`"$game`" --game-dir `"$disc`" `"$xbe`" > `"$log`" 2>&1`""
-    Start-Process -FilePath "cmd.exe" -ArgumentList @("/s", "/c", $command) -WorkingDirectory $top -WindowStyle Hidden
+    Start-Process -FilePath $game -ArgumentList @("--game-dir", "`"$disc`"", "`"$xbe`"") -WorkingDirectory $top `
+        -WindowStyle Hidden -RedirectStandardOutput $log -RedirectStandardError (Join-Path $top "run-errors.log")
 }
 
 # Up to date: just play.
 $built = if (Test-Path $stamp) { (Get-Content $stamp -Raw).Trim() } else { "" }
-if (-not $Rebuild -and (Test-Path $game) -and $built -eq $kitVersion) {
+if (-not $Rebuild -and (Test-Path $game) -and $built -eq $builtFor) {
+    Set-Content -Path $discFile -Value $disc -Encoding UTF8
     if (-not $BuildOnly) { Start-Game }
     exit 0
 }
@@ -165,8 +169,15 @@ $jobs = [Math]::Max(1, [Environment]::ProcessorCount)
 if ($onWindows) { $code = Invoke-Kit $ninja @("-C", $work, "-j", "$jobs") }
 else { & $ninja -C $work -j $jobs | Out-Host; $code = $LASTEXITCODE }
 if ($code -ne 0) { throw "compiling failed" }
-Copy-Item (Join-Path $work "Ghoulies.exe") $game -Force
-Set-Content -Path $stamp -Value $kitVersion -Encoding ASCII
+$staged = "$game.new"
+Copy-Item -LiteralPath (Join-Path $work "Ghoulies.exe") -Destination $staged -Force
+if (Test-Path -LiteralPath $game) {
+    [System.IO.File]::Replace($staged, $game, "$game.previous", $true)
+} else {
+    [System.IO.File]::Move($staged, $game)
+}
+Set-Content -Path $stamp -Value $builtFor -Encoding ASCII
+Set-Content -Path $discFile -Value $disc -Encoding UTF8
 Write-Host ""
 Write-Host "Built: $game" -ForegroundColor Green
 if (-not $BuildOnly) {

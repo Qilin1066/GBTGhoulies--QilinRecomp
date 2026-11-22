@@ -1,3 +1,4 @@
+#include "command_line.hpp"
 // qilin: Grabbed by the Ghoulies static recompiler (work in progress).
 //
 //   qilin info     <default.xbe> [--json out.json]   XBE headers, sections, libraries, kernel imports
@@ -229,13 +230,17 @@ void write_file(const std::filesystem::path& path, std::string_view s) {
         if (old && std::string(std::istreambuf_iterator<char>(old), {}) == s) return;
     }
     std::ofstream f(path, std::ios::binary);
-    if (!f || !f.write(s.data(), std::streamsize(s.size()))) throw Failure{"cannot write " + path.string()};
+    if (!f || !f.write(s.data(), std::streamsize(s.size()))) throw Failure{"cannot write " + qilin::utf8_path(path)};
 }
 
 using File = std::unique_ptr<FILE, int (*)(FILE*)>;
 File open_out(std::optional<std::string_view> path) {
     if (!path) return File(stdout, [](FILE*) { return 0; });
+#ifdef _WIN32
+    FILE* f = _wfopen(qilin::native_path(*path).c_str(), L"wb");
+#else
     FILE* f = std::fopen(std::string(*path).c_str(), "wb");
+#endif
     if (!f) throw Failure{std::format("cannot write {}", *path)};
     return File(f, &std::fclose);
 }
@@ -347,7 +352,7 @@ int cmd_lift(const Xbe& xbe, Decoder& dec, std::span<const std::string_view> arg
     cfg.run();
     const Conventions conv = crt_conventions();
     Lifter lifter(dec, &conv);
-    const std::filesystem::path dir(*outdir);
+    const std::filesystem::path dir = qilin::native_path(*outdir);
     std::filesystem::create_directories(dir);
 
     std::vector<uint32_t> done;
@@ -483,14 +488,14 @@ int run(std::string_view cmd, const std::string& path, std::span<const std::stri
     const Xbe& xbe = *loaded;
     if (cmd == "info") {
         const std::string js = xbe.to_json();
-        if (auto p = opt(args, "--json")) write_file(std::string(*p), js);
+        if (auto p = opt(args, "--json")) write_file(qilin::native_path(*p), js);
         std::println("{}", js);
         return 0;
     }
     if (cmd == "image") {
         if (args.empty()) return usage();
         auto img = xbe.image();
-        write_file(std::string(args[0]), std::string_view(reinterpret_cast<const char*>(img.data()), img.size()));
+        write_file(qilin::native_path(args[0]), std::string_view(reinterpret_cast<const char*>(img.data()), img.size()));
         std::println("base {:08x} size {}", xbe.base, img.size());
         return 0;
     }
@@ -499,7 +504,7 @@ int run(std::string_view cmd, const std::string& path, std::span<const std::stri
         Cfg cfg(xbe, dec);
         cfg.run();
         std::print("{}", cfg.summary());
-        if (auto p = opt(args, "--json")) write_file(std::string(*p), cfg.to_json());
+        if (auto p = opt(args, "--json")) write_file(qilin::native_path(*p), cfg.to_json());
         return 0;
     }
     if (cmd == "suspects") {
@@ -563,6 +568,8 @@ int run(std::string_view cmd, const std::string& path, std::span<const std::stri
 }  // namespace
 
 int main(int argc, char** argv) {
+    const qilin::CommandLine command_line(argc, argv);
+    argc = command_line.count(); argv = command_line.values();
     if (argc == 2 && (std::string_view(argv[1]) == "--version" || std::string_view(argv[1]) == "version")) {
         std::println("qilin {}", QILIN_VERSION);
         return 0;

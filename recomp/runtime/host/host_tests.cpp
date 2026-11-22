@@ -235,6 +235,58 @@ int main() {
         CHECK(g.call("NtQueryFullAttributesFile", {g.attributes("\\Device\\Harddisk0\\Partition1\\SAVE.DAT"), buf}) == 0);
         CHECK(g.u32(buf + 40) == 3 && g.u32(buf + 48) == 0x80);  // EndOfFile; FILE_ATTRIBUTE_NORMAL
 
+        // Five pre-write generations, one per handle even across multiple writes.
+        const auto save_name = g.attributes("\\Device\\Harddisk0\\Partition1\\save.dat");
+        const auto history = root / "hdd" / "save-history" / "partition1" / "save.dat";
+        for (uint32_t version = 1; version <= 6; ++version) {
+            CHECK(g.call("NtCreateFile", {handle, 0xC0100000, save_name, iosb, 0, 0x80, 0, 5, 0x60}) == 0);
+            const auto out = g.u32(handle);
+            g.ram[text] = uint8_t('0' + version);
+            CHECK(g.call("NtWriteFile", {out, 0, 0, 0, iosb, text, 1, 0}) == 0);
+            CHECK(g.call("NtFlushBuffersFile", {out, iosb}) == 0);
+            CHECK(g.call("NtClose", {out}) == 0);
+        }
+        std::string previous;
+        std::getline(std::ifstream(history / "1.bin"), previous); CHECK(previous == "5");
+        std::getline(std::ifstream(history / "5.bin"), previous); CHECK(previous == "1");
+        CHECK(!fs::exists(history / "6.bin"));
+        // Backup failure must not truncate or modify the existing save.
+        fs::remove_all(root / "hdd" / "save-history");
+        std::ofstream(root / "hdd" / "save-history") << "blocked";
+        CHECK(g.call("NtCreateFile", {handle, 0xC0100000, save_name, iosb, 0, 0x80, 0, 5, 0x60}) == 0xC0000022);
+        CHECK(fs::file_size(root / "hdd" / "partition1" / "save.dat") == 1);
+        CHECK(g.call("NtOpenFile", {handle, 0xC0100000, save_name, iosb, 0, 0x60}) == 0);
+        const auto protected_save = g.u32(handle);
+        CHECK(g.call("NtWriteFile", {protected_save, 0, 0, 0, iosb, text, 3, 0}) == 0xC0000022);
+        CHECK(fs::file_size(root / "hdd" / "partition1" / "save.dat") == 1);
+        CHECK(g.call("NtClose", {protected_save}) == 0);
+        fs::remove(root / "hdd" / "save-history");
+        CHECK(g.call("NtOpenFile", {handle, 0xC0100000, save_name, iosb, 0, 0x60}) == 0);
+        const auto rw = g.u32(handle);
+        // Reject negative offsets and short information structures without changing the file position.
+        g.put32(off, 0); g.put32(off + 4, 0x80000000);
+        CHECK(g.call("NtReadFile", {rw, 0, 0, 0, iosb, buf, 1, off}) == 0xC000000D && g.u32(iosb + 4) == 0);
+        CHECK(g.call("NtSetInformationFile", {rw, iosb, off, 8, 14}) == 0xC000000D);
+        CHECK(g.call("NtSetInformationFile", {rw, iosb, off, 1, 20}) == 0xC0000004);
+        // Append is the NT sentinel, not a negative seek.
+        g.put32(off, 0xffffffff); g.put32(off + 4, 0xffffffff);
+        CHECK(g.call("NtWriteFile", {rw, 0, 0, 0, iosb, text, 1, off}) == 0);
+        CHECK(fs::file_size(root / "hdd" / "partition1" / "save.dat") == 2);
+        g.put32(off, 0); g.put32(off + 4, 0);
+        CHECK(g.call("NtReadFile", {rw, 0, 0, 0, iosb, buf, 8, off}) == 0 && g.u32(iosb + 4) == 2);
+        CHECK(g.call("NtFlushBuffersFile", {rw, iosb}) == 0); // EOF on a read/write handle is benign
+        CHECK(g.call("NtClose", {rw}) == 0);
+        // A read-only handle on a writable partition must see another handle's growth.
+        CHECK(g.call("NtOpenFile", {handle, 0x80100000, save_name, iosb, 0, 0x60}) == 0);
+        const auto reader = g.u32(handle);
+        CHECK(g.call("NtReadFile", {reader, 0, 0, 0, iosb, buf, 8, 0}) == 0 && g.u32(iosb + 4) == 2);
+        { std::ofstream append(root / "hdd" / "partition1" / "save.dat", std::ios::app); append << "more"; }
+        CHECK(g.call("NtReadFile", {reader, 0, 0, 0, iosb, buf, 8, 0}) == 0 && g.u32(iosb + 4) == 4);
+        CHECK(g.call("NtReadFile", {reader, 0, 0, 0, iosb, buf, 8, 0}) == 0xC0000011);
+        CHECK(g.call("NtFlushBuffersFile", {reader, iosb}) == 0);
+        CHECK(g.call("NtClose", {reader}) == 0);
+
+        g.put32(off, 0); g.put32(off + 4, 0);
         // Formatting a cache partition: the FATX header empties it and sets
         // its cluster size, which the volume then reports.
         fs::create_directories(root / "hdd" / "partition3" / "old");
@@ -262,6 +314,19 @@ int main() {
         g.put32(buf, 0);
         CHECK(g.call("NtReadFile", {cfg, 0, 0, 0, iosb, buf, 0x200, off}) == 0 && g.u32(buf) == 0x97315286);
         CHECK(g.call("NtClose", {cfg}) == 0);
+#ifndef _WIN32
+        // Real host write failure: never turn an exhausted device into success,
+        // and retain the failure across flush, another write and close.
+        if (fs::exists("/dev/full")) {
+            fs::create_symlink("/dev/full", root / "hdd" / "partition3" / "full");
+            CHECK(g.call("NtOpenFile", {handle, 0xC0100000, g.attributes("\\Device\\Harddisk0\\Partition3\\full"), iosb, 0, 0x60}) == 0);
+            const auto full = g.u32(handle);
+            CHECK(g.call("NtWriteFile", {full, 0, 0, 0, iosb, text, 1, 0}) == 0xC0000022 && g.u32(iosb + 4) == 0);
+            CHECK(g.call("NtFlushBuffersFile", {full, iosb}) == 0xC0000022);
+            CHECK(g.call("NtWriteFile", {full, 0, 0, 0, iosb, text, 1, 0}) == 0xC0000022);
+            CHECK(g.call("NtClose", {full}) == 0xC0000022);
+        }
+#endif
         fs::remove_all(root, ec);
     }
 

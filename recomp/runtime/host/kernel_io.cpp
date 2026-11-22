@@ -24,6 +24,8 @@
 #include <filesystem>
 #include <fstream>
 #include <map>
+#include <limits>
+#include "file_store.hpp"
 #include <memory>
 #include <optional>
 #include <string>
@@ -191,6 +193,7 @@ struct Handle {
     std::unique_ptr<std::fstream> file;
     uint64_t position = 0;
     bool writable = false, delete_on_close = false;
+    bool write_failed = false, history_saved = false;
     std::optional<uint64_t> fixed_size;  // a file that can't change (the disc's): its size, asked once
     bool formatting = false;  // a raw partition handle that has written a FATX volume header
     std::vector<fs::directory_entry> entries;  // directory enumeration, filled on first query
@@ -211,6 +214,35 @@ uint32_t new_handle(Handle h) {
 Handle* find(uint32_t h) {
     auto it = handles().find(h);
     return it == handles().end() ? nullptr : &it->second;
+}
+
+// Keep five pre-write copies outside the guest's partitions. Cache partitions
+// are deliberately excluded; title saves live on partition 1.
+bool preserve_save(const Device& device, const fs::path& path) {
+    if (device.partition != 1) return true;
+    std::error_code ec;
+    const bool exists = fs::exists(path, ec);
+    if (ec) return false;
+    if (!exists) return true;
+    const fs::path folder = device.root.parent_path() / "save-history" / "partition1" / path.lexically_relative(device.root);
+    fs::create_directories(folder, ec);
+    if (ec) return false;
+    auto copy = [](const fs::path& from, const fs::path& to) {
+        std::string bytes;
+        return platform::read_file(from, bytes) && platform::atomic_write(to, bytes);
+    };
+    for (int n = 4; n >= 1; --n) {
+        const fs::path previous = folder / (std::to_string(n) + ".bin");
+        const bool present = fs::exists(previous, ec);
+        if (ec || (present && !copy(previous, folder / (std::to_string(n + 1) + ".bin")))) return false;
+    }
+    return copy(path, folder / "1.bin");
+}
+bool preserve_save(Handle& h) {
+    if (h.history_saved) return true;
+    if (!preserve_save(*h.device, h.host)) return false;
+    h.history_saved = true;
+    return true;
 }
 
 // OBJECT_ATTRIBUTES: RootDirectory, ObjectName, Attributes.
@@ -349,7 +381,10 @@ uint32_t create_file(const rt::Context& c, uint32_t phandle, uint32_t access, ui
         default: return kInvalidParameter;
     }
     if (truncate) {
+        if (!preserve_save(*r->device, r->host)) return kAccessDenied;
         std::ofstream make(r->host, std::ios::binary | std::ios::trunc);
+        if (!make) return kAccessDenied;
+        make.close();
         if (!make) return kAccessDenied;
     }
     auto f = std::make_unique<std::fstream>(r->host, std::ios::binary | std::ios::in | (r->device->writable ? std::ios::out : std::ios::in));
@@ -360,6 +395,7 @@ uint32_t create_file(const rt::Context& c, uint32_t phandle, uint32_t access, ui
     h.object = r->object;
     h.file = std::move(f);
     h.writable = want_write;
+    h.history_saved = truncate;
     h.delete_on_close = (options & kDeleteOnClose) != 0;
     st(c, phandle, new_handle(std::move(h)));
     io_status(c, iosb, kSuccess, info);
@@ -390,13 +426,23 @@ void nt_close(rt::Context& c) {
         ret(c, kInvalidHandle, 4);
         return;
     }
-    if (it->second.delete_on_close) {
-        it->second.file.reset();
-        std::error_code ec;
-        fs::remove(it->second.host, ec);
+    Handle& h = it->second;
+    uint32_t status = h.write_failed ? kAccessDenied : kSuccess;
+    if (h.file) {
+        if (!h.write_failed && !h.file->bad()) h.file->clear(); // EOF is not a close failure
+        h.file->close();
+        if (h.file->fail()) status = kAccessDenied;
+    }
+    if (h.delete_on_close && status == kSuccess) {
+        if (h.kind == Handle::Kind::File && !preserve_save(h)) status = kAccessDenied;
+        else {
+            std::error_code ec;
+            fs::remove(h.host, ec);
+            if (ec) status = kAccessDenied;
+        }
     }
     handles().erase(it);
-    ret(c, kSuccess, 4);
+    ret(c, status, 4);
 }
 
 // ---------------------------------------------------------------- read and write
@@ -417,6 +463,9 @@ void raw_transfer(rt::Context& c, Handle& h, bool write, const char* fn) {
         ret(c, 0xC0000005, 32);
         return;
     }
+    if (off > uint64_t(std::numeric_limits<std::streamoff>::max()) - len) {
+        io_status(c, iosb, kInvalidParameter, 0); ret(c, kInvalidParameter, 32); return;
+    }
     if ((off | len) & 511) {  // sector-aligned, as the disk driver requires
         io_status(c, iosb, kInvalidParameter, 0);
         ret(c, kInvalidParameter, 32);
@@ -428,37 +477,45 @@ void raw_transfer(rt::Context& c, Handle& h, bool write, const char* fn) {
         return;
     }
     uint8_t* p = c.mem + buf;
+    uint32_t status = kSuccess;
     if (d.partition == 0) {
-        if (off + len > kConfigArea) unmodelled(fn, strf("raw access to the whole disk past its configuration area (offset %#llx)", (unsigned long long)off));
+        if (off > kConfigArea || len > kConfigArea - off) unmodelled(fn, strf("raw access to the whole disk past its configuration area (offset %#llx)", (unsigned long long)off));
         std::error_code ec;
         if (write) {
             if (!fs::exists(d.root, ec)) std::ofstream(d.root, std::ios::binary);
             std::fstream f(d.root, std::ios::binary | std::ios::in | std::ios::out);
             f.seekp(std::streamoff(off));
             f.write(reinterpret_cast<const char*>(p), len);
+            f.flush();
+            if (!f) status = kAccessDenied;
+            f.close();
+            if (f.fail()) status = kAccessDenied;
         } else {
             std::memset(p, 0, len);
             std::ifstream f(d.root, std::ios::binary);
             if (f) {
                 f.seekg(std::streamoff(off));
                 f.read(reinterpret_cast<char*>(p), len);
-            }
+                if (f.bad() || (f.fail() && !f.eof())) status = kAccessDenied;
+            } else if (fs::exists(d.root, ec) || ec) status = kAccessDenied;
         }
     } else if (d.partition > 0 && write) {
         if (off == 0 && len >= 4 && std::memcmp(p, "FATX", 4) == 0) {
             std::error_code ec;
-            for (const auto& e : fs::directory_iterator(d.root, ec)) fs::remove_all(e.path(), ec);
-            // Keep the header: its cluster size is the volume's from now on.
-            std::ofstream(d.header, std::ios::binary | std::ios::trunc).write(reinterpret_cast<const char*>(p), std::min<uint32_t>(len, 4096));
-            h.formatting = true;
+            for (fs::directory_iterator it(d.root, ec), end; !ec && it != end; it.increment(ec))
+                fs::remove_all(it->path(), ec);
+            // Keep the header only after a successful format.
+            if (ec || !platform::atomic_write(d.header, {reinterpret_cast<const char*>(p), std::min<uint32_t>(len, 4096)}))
+                status = kAccessDenied;
+            else h.formatting = true;
         } else if (!h.formatting) {
             unmodelled(fn, strf("a raw write to %s that isn't part of a format", d.name.c_str()));
         }
     } else {
         unmodelled(fn, strf("raw reads from %s", d.name.c_str()));
     }
-    io_status(c, iosb, kSuccess, len);
-    ret(c, kSuccess, 32);
+    io_status(c, iosb, status, status == kSuccess ? len : 0);
+    ret(c, status, 32);
 }
 
 // NtReadFile / NtWriteFile(HANDLE, HANDLE Event, PIO_APC_ROUTINE, PVOID ApcContext,
@@ -473,6 +530,7 @@ void transfer(rt::Context& c, bool write, const char* fn) {
         return;
     }
     if (!h || h->kind != Handle::Kind::File) {
+        io_status(c, iosb, h ? kInvalidDeviceRequest : kInvalidHandle, 0);
         ret(c, h ? kInvalidDeviceRequest : kInvalidHandle, 32);
         return;
     }
@@ -484,7 +542,16 @@ void transfer(rt::Context& c, bool write, const char* fn) {
     uint64_t off = h->position;
     if (poff) {
         const uint64_t o = rt::ld64(mem(c), poff, 0);
-        if (o != 0xFFFFFFFFFFFFFFFEull) off = o;  // FILE_USE_FILE_POINTER_POSITION
+        if (write && o == 0xFFFFFFFFFFFFFFFFull) {
+            std::error_code ec;
+            off = fs::file_size(h->host, ec);
+            if (ec) { io_status(c, iosb, kAccessDenied, 0); ret(c, kAccessDenied, 32); return; }
+        } else if (o != 0xFFFFFFFFFFFFFFFEull) off = o;  // FILE_USE_FILE_POINTER_POSITION
+    }
+    if (off > uint64_t(std::numeric_limits<std::streamoff>::max()) - len) {
+        io_status(c, iosb, kInvalidParameter, 0);
+        ret(c, kInvalidParameter, 32);
+        return;
     }
     if (uint64_t(buf) + len > c.mem_size) {  // the host side is never unchecked
         io_status(c, iosb, 0xC0000005, 0);     // STATUS_ACCESS_VIOLATION
@@ -493,6 +560,9 @@ void transfer(rt::Context& c, bool write, const char* fn) {
     }
     uint32_t done = 0, status = kSuccess;
     if (write) {
+        if (h->write_failed || !preserve_save(*h)) {
+            io_status(c, iosb, kAccessDenied, 0); ret(c, kAccessDenied, 32); return;
+        }
         const auto io0 = std::chrono::steady_clock::now();
         h->file->clear();
         h->file->seekp(std::streamoff(off));
@@ -500,11 +570,11 @@ void transfer(rt::Context& c, bool write, const char* fn) {
         h->file->flush();
         g_io_ns += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - io0).count());
         done = *h->file ? len : 0;
-        if (!*h->file) status = kAccessDenied;
+        if (!*h->file) { status = kAccessDenied; h->write_failed = true; }
     } else {
         // The disc's files don't change: their size is asked of the host once
         // (it was two calls to the file system at every read).
-        if (!h->writable && !h->fixed_size) h->fixed_size = host_size(h->host);
+        if (!h->device->writable && !h->fixed_size) h->fixed_size = host_size(h->host);
         const uint64_t size = h->fixed_size ? *h->fixed_size : host_size(h->host);
         if (off >= size && len) {
             status = kEndOfFile;
@@ -525,9 +595,11 @@ void transfer(rt::Context& c, bool write, const char* fn) {
                 ++slow, std::fprintf(stderr, "qilin: reading %u bytes at %llu of %s took %.1f ms\n", len, (unsigned long long)off,
                                      h->host.filename().string().c_str(), double(ns) / 1e6);
             done = uint32_t(h->file->gcount());
+            if (h->file->bad() || (h->file->fail() && !h->file->eof())) status = kAccessDenied;
+            else if (!done && len) status = kEndOfFile;
         }
     }
-    h->position = off + done;
+    if (status == kSuccess) h->position = off + done;
     io_status(c, iosb, status, done);
     ret(c, status, 32);
 }
@@ -537,9 +609,14 @@ void nt_write_file(rt::Context& c) { transfer(c, true, "NtWriteFile"); }
 // NTSTATUS NtFlushBuffersFile(HANDLE, PIO_STATUS_BLOCK) (198)
 void nt_flush_buffers_file(rt::Context& c) {
     Handle* h = find(arg(c, 0));
-    if (h && h->file) h->file->flush();
-    io_status(c, arg(c, 1), h ? kSuccess : kInvalidHandle, 0);
-    ret(c, h ? kSuccess : kInvalidHandle, 8);
+    uint32_t status = !h ? kInvalidHandle : !h->file ? kInvalidDeviceRequest : kSuccess;
+    if (h && h->file) {
+        if (!h->write_failed && !h->file->bad()) h->file->clear();
+        h->file->flush();
+        if (h->write_failed || !*h->file) status = kAccessDenied;
+    }
+    io_status(c, arg(c, 1), status, 0);
+    ret(c, status, 8);
 }
 
 // ---------------------------------------------------------------- information
@@ -599,6 +676,14 @@ void nt_set_information_file(rt::Context& c) {
         ret(c, h ? kInvalidParameter : kInvalidHandle, 20);
         return;
     }
+    const uint32_t length = arg(c, 3);
+    const uint32_t needed = cls == 4 ? 40 : cls == 13 ? 1 : (cls == 14 || cls == 19 || cls == 20) ? 8 : 0;
+    if (length < needed) {
+        io_status(c, iosb, kInfoLengthMismatch, 0); ret(c, kInfoLengthMismatch, 20); return;
+    }
+    if ((cls == 14 || cls == 19 || cls == 20) && rt::ld64(mem(c), in, 0) > uint64_t(std::numeric_limits<std::streamoff>::max())) {
+        io_status(c, iosb, kInvalidParameter, 0); ret(c, kInvalidParameter, 20); return;
+    }
     uint32_t status = kSuccess;
     std::error_code ec;
     switch (cls) {
@@ -609,7 +694,10 @@ void nt_set_information_file(rt::Context& c) {
             if (!h->writable) { status = kAccessDenied; break; }
             const uint64_t n = rt::ld64(mem(c), in, 0);
             if (cls == 20 || n < host_size(h->host)) {
+                if (h->write_failed || !preserve_save(*h)) { status = kAccessDenied; break; }
+                h->file->clear();
                 h->file->flush();
+                if (!*h->file) { h->write_failed = true; status = kAccessDenied; break; }
                 fs::resize_file(h->host, n, ec);
                 if (ec) status = kAccessDenied;
             }

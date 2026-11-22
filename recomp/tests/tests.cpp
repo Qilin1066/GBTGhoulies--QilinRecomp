@@ -1,3 +1,5 @@
+#include "command_line.hpp"
+#include <fstream>
 // Self-contained tests: build a tiny synthetic XBE in memory and run the
 // loader, decoder, CFG and lifter over it, and exercise the runtime helpers.
 // No game files required (runs in CI).
@@ -270,6 +272,14 @@ void trap(uint32_t, const char* why) { throw std::runtime_error(why); }
 }  // namespace qilin::rt
 
 int main() {
+    {
+        const auto path = std::filesystem::temp_directory_path() / std::filesystem::path(u8"ghoulies-é-保存.xbe");
+        const auto bytes = make_xbe();
+        { std::ofstream output(path, std::ios::binary); output.write(reinterpret_cast<const char*>(bytes.data()), std::streamsize(bytes.size())); }
+        CHECK(Xbe::load(utf8_path(path)).has_value());
+        std::filesystem::remove(path);
+    }
+
     // ---------------------------------------------------------------- loader
     auto loaded = Xbe::parse(make_xbe());
     CHECK(loaded.has_value());

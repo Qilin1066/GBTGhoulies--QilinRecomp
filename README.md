@@ -6,7 +6,11 @@ A static recompilation of **Grabbed by the Ghoulies** (Rare, original Xbox, 2003
 
 ## Status
 
-Roadmap step 2, **recompiler core**, is in progress.
+The recompiler core accounts for all lifted code; the native runtime is playable
+and still being developed. **The current validation record does not establish a complete end-to-end
+playthrough.** Code coverage is not a measure of whole-game compatibility. See
+[the 0.44.0 validation record](docs/validation-0.44.md) for the latest reliability
+checks and the evidence still needed for a complete-game claim.
 
 | Piece | State |
 |---|---|
@@ -23,14 +27,14 @@ Releases are tagged `vX.Y.Z` on GitHub, and every release is recorded in [`CHANG
 
 ## Playing on Windows
 
-**The download (nothing to install).** `.github/workflows/player-kit.yml` builds `GBTGhoulies--QilinRecomp-<version>-windows-x64.zip` (about 80 MB) on every push, as its sister projects ApbArcade--QilinRecomp and PunchOutWii--QilinRecomp do (an artifact of the run; attached to a release when one is tagged). Unpack it and double-click **`Play Ghoulies.bat`**: the first time it asks for your extracted disc folder (the one holding `default.xbe`; the USA release, MS-083) and builds the game from it, with the compiler inside the download (LLVM-MinGW: Clang, free and open source); after that it starts the game at once. The game's messages go to `run.log` beside it. The download has everything but the game's own code, prebuilt: the recompiler, the runtime, the renderer, SDL3. The code made from the disc is made on the player's PC, from their own copy, and never distributed. See `tools/player-kit/` (`package.sh` builds the download on Linux; `play.ps1` is what Play runs).
+**The download (nothing to install).** `.github/workflows/player-kit.yml` builds `GBTGhoulies--QilinRecomp-<version>-windows-x64.zip` (about 80 MB) on every push, as its sister projects ApbArcade--QilinRecomp and PunchOutWii--QilinRecomp do (an artifact of the run; attached to a release when one is tagged). Unpack it and double-click **`Play Ghoulies.bat`**: the first time it asks for your extracted disc folder (the one holding `default.xbe`; the USA release, MS-083) and builds the game from it, with the compiler inside the download (LLVM-MinGW: Clang, free and open source); after that it starts the game at once. The game's messages go to `run.log` and errors to `run-errors.log` beside it. The download has everything but the game's own code, prebuilt: the recompiler, the runtime, the renderer, SDL3. The code made from the disc is made on the player's PC, from their own copy, and never distributed. See `tools/player-kit/` (`package.sh` builds the download on Linux; `play.ps1` is what Play runs).
 
 **From the source, double-click.** With Visual Studio 2022 (17.10 or newer, the free Community edition, with "Desktop development with C++") and Git installed, in the project's folder:
 
 - **`Play Ghoulies.bat`** starts the game. The first time it builds it (10 to 40 minutes), asking for your extracted disc folder with a folder picker.
 - **`Update Ghoulies.bat`** gets the latest code, rebuilds only what changed, and starts the game.
 
-Both run `tools/build-ghoulies.ps1`, which finds Visual Studio's CMake and Git itself; the game's messages go to `build-game\run.log`.
+Both run `tools/build-ghoulies.ps1`, which finds Visual Studio's CMake and Git itself; the game's messages go to `build-game\run.log` and `build-game\run-errors.log`.
 
 ## Building
 

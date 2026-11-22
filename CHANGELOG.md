@@ -11,6 +11,26 @@ Each release is a git tag (`vX.Y.Z`) with a matching GitHub release. The version
 
 ## [Unreleased]
 
+## [0.44.0] - 2026-11-22
+
+### Added
+- Five pre-write generations of title-save files, outside the guest disk at `save-history/partition1/<relative file>/{1..5}.bin` (newest first). Existing files are protected before truncation, first write or resize per handle, and file deletion on close. Cache partitions are excluded. Backup failure refuses the mutation. Recovery instructions are in the Windows download's README; these are per-file copies, not whole-save transactions.
+- ROM-free platform tests for repeated settings replacement, UTF-8 BOMs, Unicode file paths, initial audio outage/recovery, virtual-controller rumble disable/pause/shutdown and balanced audio subsystem ownership.
+- Windows launcher regression using native child-process fixtures: same-version kit rebuilds, a locked executable, recovery after a failed installation, and disc paths with spaces, Unicode and shell metacharacters.
+- Ordinary CI compiles and links the complete player entry point and dispatch with an empty function table. No game data is needed. Linux CI requires the Vulkan test to run rather than silently accepting a skipped renderer.
+
+### Fixed
+- Settings and Vulkan pipeline cache replacement now use a shared, flushed, unique temporary file and atomic replacement, including replacing an existing file on Windows. Failed writes remove temporary files and preserve the existing destination. Unreadable settings are no longer replaced with defaults during loading; UTF-8 BOMs are accepted.
+- Kernel file I/O checks read, write, flush, close and resize errors; failed writes remain failures for that handle. Negative/overflowing offsets and undersized information structures are rejected; append uses the NT end-of-file sentinel. Read-only handles on writable partitions no longer cache stale sizes. Raw configuration writes and format-header writes also check failures.
+- Zero-length voice mixes and submix feeds no longer form references into empty sample buffers (found with UndefinedBehaviorSanitizer). Zero-frame gain priming is preserved.
+- Audio output checks SDL submission/rate/start errors and retries after initial or subsequent outages. A stalled queue triggers reopening; outage samples are counted as dropped instead of counted as submitted. Recovery retains the established channel count, using stereo if no device opened initially.
+- Disabling rumble, opening the settings menu or destroying input stops the motors immediately. SDL rumble uses a short renewable lease to limit vibration after a stall; fallback Windows XInput motors are stopped too.
+- Windows command lines are decoded from UTF-16; the XBE loader, lift output, runtime disc/data paths and cache/audio/PNG file boundaries use native paths. Source and kit launchers start the executable directly rather than passing disc paths through `cmd.exe`, keeping `%...%` and `&` literal. Error output is in `run-errors.log`, beside `run.log`.
+- Player-kit identity checks the archive, lifter, build flags and launcher contents, not only VERSION. Executables are staged and the previous one retained; a failed replacement leaves the working executable and build stamp intact. Source and kit launchers remember a new disc only after a successful build.
+
+### Documentation
+- [Validation record and remaining completion checks](docs/validation-0.44.md). README status distinguishes full lifted-code coverage from an unverified complete playthrough; this version does not claim 100% whole-game compatibility.
+
 ## [0.43.4] - 2026-11-21
 
 ### Added

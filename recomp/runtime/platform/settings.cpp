@@ -1,4 +1,6 @@
+#include "../command_line.hpp"
 #include "settings.hpp"
+#include "file_store.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -184,7 +186,7 @@ std::string settings_text(const Settings& s) {
 
 Settings parse_settings(const std::string& text, std::vector<std::string>& warnings) {
     Settings s = default_settings();
-    std::istringstream in(text);
+    std::istringstream in(text.starts_with("\xef\xbb\xbf") ? text.substr(3) : text);
     std::string line, section;
     bool aspect_given = false, widescreen = true;  // 0.36's [console] widescreen = off, without an aspect: 4:3
     for (int n = 1; std::getline(in, line); ++n) {
@@ -284,29 +286,29 @@ std::filesystem::path settings_file(const std::filesystem::path& folder) { retur
 
 Settings load_settings(const std::filesystem::path& folder) {
     const std::filesystem::path path = settings_file(folder);
-    std::ifstream f(path, std::ios::binary);
-    if (!f) {
+    std::string text;
+    if (!read_file(path, text)) {
         Settings s = default_settings();
-        if (!save_settings(folder, s)) std::printf("qilin_run: can't write the settings to %s\n", path.string().c_str());
+        std::error_code ec;
+        const bool exists = std::filesystem::exists(path, ec);
+        if (!exists && !ec) {
+            if (!save_settings(folder, s)) std::printf("qilin_run: can't create the settings file\n");
+        } else {
+            std::printf("qilin_run: settings unreadable; using defaults and preserving the file\n");
+        }
         return s;
     }
-    const std::string text((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
     std::vector<std::string> warnings;
     Settings s = parse_settings(text, warnings);
-    for (const std::string& w : warnings) std::printf("qilin_run: %s, %s\n", path.string().c_str(), w.c_str());
+    for (const std::string& w : warnings) std::printf("qilin_run: %s, %s\n", qilin::utf8_path(path).c_str(), w.c_str());
     return s;
 }
 
 bool save_settings(const std::filesystem::path& folder, const Settings& s) {
     std::error_code ec;
     std::filesystem::create_directories(folder, ec);
-    const std::filesystem::path path = settings_file(folder), temp = path.string() + ".new";
-    {
-        std::ofstream f(temp, std::ios::binary | std::ios::trunc);
-        if (!(f << settings_text(s))) return false;
-    }
-    std::filesystem::rename(temp, path, ec);
-    return !ec;
+    if (ec) return false;
+    return atomic_write(settings_file(folder), settings_text(s));
 }
 
 }  // namespace qilin::platform

@@ -7,7 +7,7 @@ if(APPLE AND NOT CMAKE_OSX_DEPLOYMENT_TARGET)
     set(CMAKE_OSX_DEPLOYMENT_TARGET 10.15 CACHE STRING "oldest macOS the runtime runs on")
 endif()
 # The single source of the version number (see CHANGELOG.md for the scheme).
-project(GBTGhoulies--QilinRecomp VERSION 0.43.4 LANGUAGES C CXX)
+project(GBTGhoulies--QilinRecomp VERSION 0.44.0 LANGUAGES C CXX)
 
 # ---- Language: C++23 everywhere (recompiler, runtime, generated code) ----
 set(CMAKE_CXX_STANDARD 23)
@@ -88,6 +88,10 @@ else()
     target_compile_options(qilin_runtime INTERFACE -ffp-contract=off -fno-fast-math)
 endif()
 
+if(WIN32)
+    target_link_libraries(qilin_runtime INTERFACE shell32)
+endif()
+
 # Developer tools on macOS: macOS 13.3 or later (std::format).
 function(qilin_tool target)
     if(APPLE)
@@ -124,11 +128,29 @@ add_executable(qilin_tests recomp/tests/tests.cpp)
 target_link_libraries(qilin_tests PRIVATE qilin_core qilin_warnings)
 qilin_tool(qilin_tests)
 add_test(NAME qilin_tests COMMAND qilin_tests)
+if(WIN32 AND NOT CMAKE_CROSSCOMPILING)
+    find_program(QILIN_POWERSHELL NAMES pwsh powershell)
+    if(QILIN_POWERSHELL)
+        add_executable(qilin_launcher_stub tools/check/launcher_stub.cpp)
+        target_link_libraries(qilin_launcher_stub PRIVATE qilin_runtime qilin_warnings)
+        add_test(NAME qilin_launcher_check COMMAND "${QILIN_POWERSHELL}" -NoProfile -File
+            "${CMAKE_CURRENT_SOURCE_DIR}/tools/check/launcher_check.ps1"
+            -Stub "$<TARGET_FILE:qilin_launcher_stub>"
+            -Launcher "${CMAKE_CURRENT_SOURCE_DIR}/tools/player-kit/play.ps1"
+            -Out "${CMAKE_CURRENT_BINARY_DIR}/launcher-check/$<CONFIG>")
+        set_tests_properties(qilin_launcher_check PROPERTIES TIMEOUT 120)
+    endif()
+endif()
+
 
 # x87 transcendentals: fast paths against slow paths on each CI platform's compiler and CPU.
 add_executable(qilin_x87_consistency tools/check/x87/consistency.cpp)
 target_link_libraries(qilin_x87_consistency PRIVATE qilin_runtime qilin_warnings)
 add_test(NAME qilin_x87_consistency COMMAND qilin_x87_consistency 200000)
+
+add_library(qilin_file_store STATIC recomp/runtime/platform/file_store.cpp)
+target_include_directories(qilin_file_store PUBLIC recomp/runtime/platform)
+target_link_libraries(qilin_file_store PRIVATE qilin_warnings)
 
 # ---- Renderer: Vulkan 1.3, loaded at run time through volk (no SDK or link-time Vulkan needed) ----
 add_library(qilin_volk STATIC third_party/volk/volk.c)
@@ -137,7 +159,7 @@ target_link_libraries(qilin_volk PUBLIC ${CMAKE_DL_LIBS})
 add_library(qilin_gfx STATIC recomp/runtime/gfx/renderer.cpp recomp/runtime/gfx/fsr/fsr_constants.cpp recomp/runtime/gfx/png.cpp recomp/runtime/gfx/vsh.cpp
     recomp/runtime/gfx/spirv.cpp recomp/runtime/gfx/nv2a_vs.cpp recomp/runtime/gfx/nv2a_ps.cpp recomp/runtime/gfx/texture.cpp)
 target_include_directories(qilin_gfx PUBLIC recomp/runtime/gfx PRIVATE recomp/runtime)
-target_link_libraries(qilin_gfx PUBLIC qilin_volk PRIVATE qilin_warnings)
+target_link_libraries(qilin_gfx PUBLIC qilin_volk qilin_file_store PRIVATE qilin_warnings)
 add_executable(qilin_gfx_tests recomp/runtime/gfx/gfx_tests.cpp)
 target_link_libraries(qilin_gfx_tests PRIVATE qilin_gfx qilin_warnings)
 add_test(NAME qilin_gfx_tests COMMAND qilin_gfx_tests)
@@ -180,7 +202,7 @@ endif()
 add_library(qilin_platform STATIC recomp/runtime/platform/window.cpp recomp/runtime/platform/input.cpp recomp/runtime/platform/settings.cpp
     recomp/runtime/platform/audio_out.cpp)
 target_include_directories(qilin_platform PUBLIC recomp/runtime/platform)
-target_link_libraries(qilin_platform PUBLIC SDL3::SDL3 PRIVATE qilin_warnings)
+target_link_libraries(qilin_platform PUBLIC SDL3::SDL3 qilin_file_store PRIVATE qilin_warnings)
 
 # ---- The settings menu: Dear ImGui (MIT, vendored as ApbArcade--QilinRecomp has it) over the window ----
 add_library(qilin_imgui STATIC
@@ -211,6 +233,16 @@ target_link_libraries(qilin_host PUBLIC qilin_runtime qilin_gfx qilin_audio qili
 add_executable(qilin_host_tests recomp/runtime/host/host_tests.cpp)
 target_link_libraries(qilin_host_tests PRIVATE qilin_host qilin_warnings)
 add_test(NAME qilin_host_tests COMMAND qilin_host_tests)
+
+# Compile the complete entry point and dispatch in ordinary CI without a disc.
+add_executable(qilin_player_link_check recomp/runtime/host/run.cpp
+    recomp/runtime/dispatch.cpp tools/player-kit/link_check.cpp)
+target_compile_definitions(qilin_player_link_check PRIVATE QILIN_CHECKED_MEMORY)
+target_link_libraries(qilin_player_link_check PRIVATE qilin_host qilin_xbe qilin_warnings)
+
+add_executable(qilin_platform_tests recomp/runtime/platform/platform_tests.cpp)
+target_link_libraries(qilin_platform_tests PRIVATE qilin_platform qilin_warnings)
+add_test(NAME qilin_platform_tests COMMAND qilin_platform_tests)
 
 # qilin_run: the game, from `qilin lift` output (needs your own default.xbe):
 #   qilin lift default.xbe --out gen && cmake -B build -DQILIN_GEN_DIR=$PWD/gen
@@ -252,7 +284,7 @@ if(QILIN_PLAYER_KIT)
     add_library(ghoulies_kit_main OBJECT recomp/runtime/host/run.cpp recomp/runtime/dispatch.cpp)
     target_compile_definitions(ghoulies_kit_main PRIVATE QILIN_CHECKED_MEMORY)
     target_link_libraries(ghoulies_kit_main PRIVATE qilin_host qilin_xbe qilin_warnings)
-    set(kit_libraries qilin_host qilin_ui qilin_imgui qilin_gfx qilin_audio qilin_platform qilin_xbe qilin_volk SDL3-static)
+    set(kit_libraries qilin_file_store qilin_host qilin_ui qilin_imgui qilin_gfx qilin_audio qilin_platform qilin_xbe qilin_volk SDL3-static)
     set(kit_archive "${CMAKE_BINARY_DIR}/libghoulies_kit.a")
     set(mri "CREATE ${kit_archive}\n")
     foreach(library IN LISTS kit_libraries)

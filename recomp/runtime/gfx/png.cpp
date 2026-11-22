@@ -1,3 +1,4 @@
+#include "command_line.hpp"
 // A minimal PNG writer: 8-bit RGBA, zlib "stored" blocks (no compression),
 // for saving frames in tests and from qilin_run. No dependencies.
 #include <algorithm>
@@ -77,7 +78,11 @@ bool write_png(const std::string& path, const Image& image) {
     chunk(out, "IHDR", ihdr);
     chunk(out, "IDAT", z);
     chunk(out, "IEND", {});
+#ifdef _WIN32
+    std::FILE* f = _wfopen(qilin::native_path(path).c_str(), L"wb");
+#else
     std::FILE* f = std::fopen(path.c_str(), "wb");
+#endif
     if (!f) return false;
     const bool ok = std::fwrite(out.data(), 1, out.size(), f) == out.size();
     return std::fclose(f) == 0 && ok;

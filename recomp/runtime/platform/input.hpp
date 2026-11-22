@@ -48,6 +48,9 @@ public:
 
     // Starts SDL's gamepad support. False (with a message printed) if it
     // can't; the ports then have the keyboard only.
+    Input() = default;
+    Input(const Input&) = delete;
+    Input& operator=(const Input&) = delete;
     bool start();
     ~Input();
 
@@ -59,7 +62,8 @@ public:
     // Rumble, the two motors' speeds from 0 to 65535 (the Xbox's left motor
     // is the low-frequency one). Lasts until changed.
     void rumble(uint32_t port, uint16_t left, uint16_t right);
-    void set_rumble(bool on) { rumble_on_ = on; }
+    void set_rumble(bool on);
+    void stop_rumble();
     // The keyboard's keys for each control (SDL's key names).
     void set_keys(const std::vector<std::string> (&names)[kControlCount]);
 

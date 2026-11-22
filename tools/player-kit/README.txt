@@ -25,8 +25,8 @@ Playing
    - To use a different disc folder: Play Ghoulies.bat -ChooseDisc
    - Ghoulies.exe in this folder can be started directly too:
        Ghoulies.exe --game-dir "<disc folder>" "<disc folder>\default.xbe"
-3. What the game prints goes into run.log in this folder: send that file
-   when you report a problem.
+3. What the game prints goes into run.log and run-errors.log in this
+   folder: send both files when you report a problem.
 4. If the picture is wrong (something flickers, a shadow or an effect looks
    off), press F9 while it shows: the next 12 frames and what the game drew
    in them are saved to a file in the settings folder's captures folder
@@ -87,3 +87,19 @@ work\               made when building: the recompiled code (from your disc)
 LICENSES\           the licences of everything included
 
 Source, changes and issues: https://github.com/Qilin1066/GBTGhoulies--QilinRecomp
+
+Updates and save recovery
+-------------------------
+Updates stage the new executable before replacing the old one, retained as
+Ghoulies.exe.previous. Close the game before updating. A changed kit rebuilds
+it even if VERSION has not changed, and a failed build keeps the remembered
+disc folder and working executable.
+
+Before changing an existing title-save file, the runtime retains five copies
+under the game's data folder: save-history/partition1/<relative file>/1.bin
+through 5.bin (1 is the newest). Cache partitions are excluded. The game does
+not see these backups. If a backup cannot be made, the write is refused.
+To restore: quit the game, keep a separate copy of its current partition1,
+and copy the chosen snapshot back to partition1/<relative file>. Restore
+related files together if the game saved them as a group. This is file-level
+history, not a whole-disk transaction or a verified completed-game save.
