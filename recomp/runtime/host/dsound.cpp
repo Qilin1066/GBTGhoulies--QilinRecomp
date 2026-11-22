@@ -424,7 +424,9 @@ void create_sound_buffer(rt::Context& c) {
         if (const auto it = spare.find(bytes); it != spare.end()) mem = it->second, spare.erase(it);
         else mem = contiguous(bytes, 0, 0xFFFFFFFFu, 0, 4);  // as MmAllocateContiguousMemory: PAGE_READWRITE
         if (!mem) unmodelled("IDirectSound_CreateSoundBuffer", strf("%u bytes of buffer memory (none left)", bytes));
-        for (uint32_t k = 0; k + 4 <= bytes; k += 4) st(c, mem + k, 0);
+        rt::check({c.mem, c.mem_size}, mem, bytes, 0);
+        rt::traced(mem, bytes);
+        std::memset(c.mem + mem, 0, bytes);  // include a trailing 1-3 bytes on reuse
         b->own = mem, b->own_bytes = bytes;
         b->voice.set_data(mem, bytes);
     }

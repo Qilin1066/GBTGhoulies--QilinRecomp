@@ -15,6 +15,7 @@
 #include <string>
 
 #if !defined(_WIN32)
+#include <csignal>
 #include <sys/wait.h>
 #include <unistd.h>
 #endif
@@ -76,6 +77,18 @@ struct Guest {
         put32(oa + 4, object_string(name));
         put32(oa + 8, 0x40);  // OBJ_CASE_INSENSITIVE
         return oa;
+    }
+    uint32_t call_xdk(const char* fn, std::initializer_list<uint32_t> args) {
+        const auto* symbol = host::xdk_symbol(fn);
+        CHECK(symbol != nullptr);
+        if (!symbol) return UINT32_MAX;
+        c.esp = 0xF0000 - 4 * uint32_t(args.size() + 1);
+        put32(c.esp, 0x5555);
+        uint32_t k = 4;
+        for (uint32_t a : args) put32(c.esp + (k += 4) - 4, a);
+        rt::call_unlifted(c, symbol->address);
+        CHECK(c.ret_to == 0x5555 && c.esp == 0xF0000);
+        return c.eax;
     }
     uint32_t call(const char* fn, std::initializer_list<uint32_t> args) {
         const host::KernelExport* e = host::kernel_export(std::string_view(fn));
@@ -208,6 +221,32 @@ int main() {
         CHECK(dense.reserve(0, 0x1000, 4, false, 0x1000) == 0x10000);
         CHECK(dense.reserve(0, 0x1000, 4, false, 0x1000) == 0x11000);
     }
+
+#if !defined(_WIN32)
+    // Run before the parent's first mapping: retain a pre-existing handler
+    // across two maps. A self-chained handler recurses instead of reaching it.
+    for (const int sig : {SIGSEGV, SIGBUS}) {
+        const pid_t child = fork();
+        CHECK(child >= 0);
+        if (child == 0) {
+            alarm(5);  // a broken signal chain must not hang the suite
+            struct sigaction previous{};
+            previous.sa_flags = SA_SIGINFO;
+            previous.sa_sigaction = [](int, siginfo_t*, void*) { std::_Exit(42); };
+            sigemptyset(&previous.sa_mask);
+            if (sigaction(sig, &previous, nullptr) != 0) std::_Exit(10);
+            std::string error;
+            if (!host::map_guest_ram(0x100000, &error) || !host::map_guest_ram(0x100000, &error)) std::_Exit(11);
+            raise(sig);  // outside the guest reservation: forwarded exactly once
+            std::_Exit(12);
+        }
+        if (child > 0) {
+            int status = 0;
+            CHECK(waitpid(child, &status, 0) == child);
+            CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 42);
+        }
+    }
+#endif
 
     // Guest RAM: the same pages at 0, 0x80000000 and 0xF0000000, zero to start.
     {
@@ -538,13 +577,40 @@ int main() {
         const auto* create = host::xdk_symbol("DirectSoundCreate");
         CHECK(create != nullptr);
         if (create) {
-            guest.c.esp = 0xf0000 - 16;
-            guest.put32(guest.c.esp, 0x5555);
-            guest.put32(guest.c.esp + 4, 0);
-            guest.put32(guest.c.esp + 8, guest.alloc(4));
-            guest.put32(guest.c.esp + 12, 0);
-            rt::call_unlifted(guest.c, create->address);
-            CHECK(guest.c.eax == 0 && guest.c.ret_to == 0x5555);
+            const uint32_t device_out = guest.alloc(4);
+            CHECK(guest.call_xdk("DirectSoundCreate", {0, device_out, 0}) == 0);
+            const uint32_t device = guest.u32(device_out);
+            const uint32_t desc = guest.alloc(24), format = guest.alloc(18), result = guest.alloc(4);
+            const uint32_t ptr1 = guest.alloc(4), len1 = guest.alloc(4), ptr2 = guest.alloc(4), len2 = guest.alloc(4);
+            guest.put32(format, 1 | (1u << 16));  // PCM, mono
+            guest.put32(format + 4, 22050); guest.put32(format + 8, 22050);
+            guest.put32(format + 12, 1 | (8u << 16));  // 8-bit, one byte per frame
+            guest.put32(desc, 24); guest.put32(desc + 12, format);
+            for (const uint32_t bytes : {1u, 2u, 3u, 5u, 6u, 7u, 4099u}) {
+                guest.put32(desc + 8, bytes);
+                uint32_t owned = 0;
+                const auto reserved = host::vm().reserved_bytes();
+                uint64_t after_first = 0;
+                for (int reuse = 0; reuse < 2; ++reuse) {
+                    CHECK(guest.call_xdk("IDirectSound_CreateSoundBuffer", {device, desc, result, 0}) == 0);
+                    const uint32_t handle = guest.u32(result);
+                    CHECK(guest.call_xdk("IDirectSoundBuffer_Lock", {handle, 0, 0, ptr1, len1, ptr2, len2, 2}) == 0);
+                    const uint32_t data = guest.u32(ptr1);
+                    CHECK(guest.u32(len1) == bytes && guest.u32(ptr2) == 0 && guest.u32(len2) == 0);
+                    CHECK(data >= 0x10000 && uint64_t(data) + bytes <= 0x80000);
+                    if (!reuse) { owned = data; after_first = host::vm().reserved_bytes(); }
+                    else { CHECK(data == owned); CHECK(host::vm().reserved_bytes() == after_first); }
+                    CHECK(after_first >= reserved);
+                    CHECK(std::all_of(guest.ram.get() + data, guest.ram.get() + data + bytes, [](uint8_t b) { return b == 0; }));
+                    // Wrapping a lock must describe the tail then the head.
+                    const uint32_t count = std::min(bytes, 3u);
+                    CHECK(guest.call_xdk("IDirectSoundBuffer_Lock", {handle, bytes - 1, count, ptr1, len1, ptr2, len2, 0}) == 0);
+                    CHECK(guest.u32(ptr1) == data + bytes - 1 && guest.u32(len1) == 1);
+                    CHECK(guest.u32(ptr2) == (count > 1 ? data : 0) && guest.u32(len2) == count - 1);
+                    std::memset(guest.ram.get() + data, 0xA5, bytes);
+                    CHECK(guest.call_xdk("IDirectSoundBuffer_Release", {handle}) == 0);
+                }
+            }
             std::this_thread::sleep_for(std::chrono::milliseconds(15));
             host::pump_audio(guest.c);
         }

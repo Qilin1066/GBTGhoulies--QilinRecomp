@@ -23,6 +23,15 @@ Intel/Apple Silicon and MSVC, plus the Windows download toolchain. Linux CI
 requires both Vulkan tests to run. Windows CI requires PowerShell and Ninja
 so the launcher check cannot disappear because a tool is absent.
 
+## Windows PowerShell follow-up
+
+The first 0.47.0 CI run passed all five Linux/macOS jobs and Windows download
+packaging. The MSVC build passed, but the launcher regression failed in Windows
+PowerShell 5.1 because `Get-FileHash` could not be discovered under the inherited
+CI module environment. Subsequent main commits removed this dependency in the launcher
+and its fixture: the launcher streams files through framework SHA-256 directly.
+The default Windows shell remains the regression target.
+
 ## Launcher regression
 
 The test runs the real launcher with real Ninja, a synthetic compiler and a

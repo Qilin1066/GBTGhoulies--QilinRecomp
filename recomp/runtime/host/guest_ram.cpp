@@ -195,7 +195,11 @@ LONG CALLBACK on_fault(EXCEPTION_POINTERS* e) {
         stop_at(uintptr_t(r->ExceptionInformation[1]));
     return EXCEPTION_CONTINUE_SEARCH;
 }
-void install_fault_handler() { AddVectoredExceptionHandler(1, on_fault); }
+void install_fault_handler() {
+    // Mapping again must not accumulate vectored handlers.
+    static void* const installed = AddVectoredExceptionHandler(1, on_fault);
+    (void)installed;
+}
 #else
 struct sigaction g_previous_segv{}, g_previous_bus{};
 void on_fault(int sig, siginfo_t* info, void* context) {
@@ -210,12 +214,18 @@ void on_fault(int sig, siginfo_t* info, void* context) {
     signal(sig, SIG_DFL);  // the fault happens again on return, and ends the process as it would have
 }
 void install_fault_handler() {
-    struct sigaction a{};
-    a.sa_sigaction = on_fault;
-    a.sa_flags = SA_SIGINFO | SA_ONSTACK;
-    sigemptyset(&a.sa_mask);
-    sigaction(SIGSEGV, &a, &g_previous_segv);
-    sigaction(SIGBUS, &a, &g_previous_bus);  // macOS reports some protection faults as SIGBUS
+    // Capturing our own handler as "previous" on a second mapping would
+    // recurse forever when a fault outside guest memory needs forwarding.
+    static const bool installed = [] {
+        struct sigaction a{};
+        a.sa_sigaction = on_fault;
+        a.sa_flags = SA_SIGINFO | SA_ONSTACK;
+        sigemptyset(&a.sa_mask);
+        sigaction(SIGSEGV, &a, &g_previous_segv);
+        sigaction(SIGBUS, &a, &g_previous_bus);  // macOS protection faults
+        return true;
+    }();
+    (void)installed;
 }
 #endif
 

@@ -11,6 +11,8 @@ Each release is a git tag (`vX.Y.Z`) with a matching GitHub release. The version
 
 ## [Unreleased]
 
+## [0.48.0] - 2026-11-22
+
 ### Changed
 - Lifted code no longer bounds-checks each guest memory access. Every guest address lies inside the 4 GB reservation, so an access to memory that isn't mapped faults; a fault handler (signals on Linux and macOS, a vectored exception handler on Windows) turns it into the same stop a checked access gave, naming the guest address. Faults outside guest memory go to whatever handled them before. `-DQILIN_CHECKED_MEMORY=ON` restores the per-access checks for bring-up; it also governs `qilin_run`, the player kit and the link check.
 
@@ -18,6 +20,14 @@ Each release is a git tag (`vX.Y.Z`) with a matching GitHub release. The version
 - The main thread's x87 control word (0x027F) is set before the scheduler copies the main thread's registers, so threads and DPCs created later start with it too, as on the console.
 - The player kit's launcher hashes files with .NET rather than `Get-FileHash`, which is missing when Windows PowerShell inherits a PowerShell 7 module path (started from pwsh, for example). The launcher stopped there; the hashes are the same, so existing builds aren't redone.
 - DirectSound buffers created with `dwBufferBytes` get their own zeroed memory, reused when such a buffer is released, rather than stopping as unmodelled. Ported from the Wild Horse Rescue recompilation; not yet exercised by this game.
+- DirectSound-owned buffer reuse clears every byte, including trailing 1-3 bytes when the requested size is not divisible by four. Dirty data at the tail could survive release and be handed to the next buffer.
+- Guest RAM mapping installs the process fault handler once. Repeated mapping previously captured its own Linux/macOS handler as the previous handler; a subsequent non-guest fault recursively called itself instead of reaching the original handler. Windows no longer accumulates duplicate vectored handlers.
+- The Windows launcher regression resolves Chocolatey's Ninja shim to the underlying executable before copying it into the fixture.
+
+### Tests
+- Native DirectSound calls create, lock, dirty, release and reuse buffers of 1, 2, 3, 5, 6, 7 and 4,099 bytes. Tests check complete zeroing, allocation reuse and wraparound lock regions.
+- Isolated Linux/macOS child processes map guest RAM twice and verify that non-guest SIGSEGV and SIGBUS reach pre-existing handlers. An alarm bounds failure time.
+- [Validation record](docs/validation-0.48.md). Real-disc gameplay and complete-game compatibility remain unverified here.
 
 ## [0.47.0] - 2026-11-22
 
