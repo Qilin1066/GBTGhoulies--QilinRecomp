@@ -1,4 +1,4 @@
-#include "command_line.hpp"
+#include "path.hpp"
 // A minimal PNG writer: 8-bit RGBA, zlib "stored" blocks (no compression),
 // for saving frames in tests and from qilin_run. No dependencies.
 #include <algorithm>

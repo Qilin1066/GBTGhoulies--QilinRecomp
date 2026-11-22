@@ -1,4 +1,4 @@
-#include "command_line.hpp"
+#include "path.hpp"
 // Direct3D 8 (the XDK's D3D8 library), replaced natively over the Vulkan
 // renderer (recomp/runtime/gfx). docs/graphics.md describes the design.
 //
@@ -498,6 +498,8 @@ void deliver_frame(Device& d) {
         std::fflush(stderr);
         std::printf("qilin_run: %llu frames presented; stopping as asked (--frames)\n", (unsigned long long)n);
         std::fflush(stdout);
+        if (d.config.input) d.config.input->stop_rumble();
+        host::shutdown_dsound();
         std::exit(0);
     }
 }
@@ -584,6 +586,8 @@ void create_device(rt::Context& c) {
     if (!d->renderer) {
         std::fflush(stdout);
         std::fprintf(stderr, "qilin: can't start the renderer: %s\n", error.c_str());
+        if (d->config.input) d->config.input->stop_rumble();
+        host::shutdown_dsound();
         std::exit(3);
     }
     for (int k = 0; k < 3; ++k)
@@ -947,6 +951,8 @@ void pump_window(const Device& d) {
         std::fflush(stderr);
         std::printf("qilin_run: the window was closed after %u frames\n", d.swaps);
         std::fflush(stdout);
+        if (d.config.input) d.config.input->stop_rumble();
+        host::shutdown_dsound();
         std::exit(0);
     }
 }
@@ -1049,6 +1055,8 @@ void test_run(Device& d) {
                 std::fflush(stderr);
                 std::printf("qilin_run: the test run ended after %u frames\n", d.swaps);
                 std::fflush(stdout);
+                if (d.config.input) d.config.input->stop_rumble();
+                host::shutdown_dsound();
                 std::exit(0);
         }
     }

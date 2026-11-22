@@ -127,13 +127,17 @@ struct DirectSound {
     bool paused = false;                                 // the settings menu is up: nothing mixed, the clock stopped
     std::chrono::steady_clock::time_point paused_at;
     std::condition_variable wake;
-    ~DirectSound() {
+    void stop() {
         if (mixer.joinable()) {
             quit = true;
             wake.notify_all();
             mixer.join();
         }
+        if (wav && !wav->close()) std::fprintf(stderr, "qilin: %s: %s\n", dump_path.c_str(), wav->error().c_str());
+        wav.reset();
+        out = nullptr;
     }
+    ~DirectSound() { stop(); }
 };
 DirectSound& ds() {
     static DirectSound d;
@@ -221,7 +225,10 @@ void mix_block(DirectSound& d, uint32_t n) {
         d.stereo[2 * i + 1] = fr[i] + fc[i] * 0.70710678f + br[i];
     }
     d.limiter.process(d.stereo.data(), n);
-    if (d.wav) d.wav->write(d.stereo.data(), n);
+    if (d.wav && !d.wav->write(d.stereo.data(), n)) {
+        std::fprintf(stderr, "qilin: %s: %s; capture stopped, playback continues\n", d.dump_path.c_str(), d.wav->error().c_str());
+        d.wav.reset();
+    }
     for (float x : d.stereo) d.peak = std::max(d.peak, std::fabs(x));
     const float v = d.volume;
     if (d.out && d.out->channels() == 6) {
@@ -360,7 +367,10 @@ void direct_sound_create(rt::Context& c) {
         d.mixer = std::thread(mixer_thread);
         if (!d.dump_path.empty()) {
             d.wav = std::make_unique<audio::WavWriter>(d.dump_path);
-            if (!d.wav->ok()) std::fprintf(stderr, "qilin: can't write %s\n", d.dump_path.c_str());
+            if (!d.wav->ok()) {
+                std::fprintf(stderr, "qilin: %s: %s\n", d.dump_path.c_str(), d.wav->error().c_str());
+                d.wav.reset();
+            }
         }
         std::printf("qilin_run: DirectSound: %u Hz software mix on its own thread, to %s%s%s\n", audio::kOutputRate,
                     d.out && d.out->channels() == 6 ? "5.1" : "stereo", d.wav ? ", written to " : "", d.wav ? d.dump_path.c_str() : "");
@@ -1163,6 +1173,8 @@ void pump_audio(rt::Context& c) {
     }
     deliver(c);
 }
+
+void shutdown_dsound() { ds().stop(); }
 
 void register_dsound(const std::string& dump_wav, platform::AudioOut* out) {
     ds().dump_path = dump_wav;

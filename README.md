@@ -9,7 +9,7 @@ A static recompilation of **Grabbed by the Ghoulies** (Rare, original Xbox, 2003
 The recompiler core accounts for all lifted code; the native runtime is playable
 and still being developed. **The current validation record does not establish a complete end-to-end
 playthrough.** Code coverage is not a measure of whole-game compatibility. See
-[the 0.44.0 validation record](docs/validation-0.44.md) for the latest reliability
+[the 0.45.0 validation record](docs/validation-0.45.md) for the latest reliability
 checks and the evidence still needed for a complete-game claim.
 
 | Piece | State |

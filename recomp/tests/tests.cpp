@@ -1,4 +1,4 @@
-#include "command_line.hpp"
+#include "path.hpp"
 #include <fstream>
 // Self-contained tests: build a tiny synthetic XBE in memory and run the
 // loader, decoder, CFG and lifter over it, and exercise the runtime helpers.

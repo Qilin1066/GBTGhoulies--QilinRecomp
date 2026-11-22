@@ -11,6 +11,20 @@ Each release is a git tag (`vX.Y.Z`) with a matching GitHub release. The version
 
 ## [Unreleased]
 
+## [0.45.0] - 2026-11-22
+
+### Fixed
+- **Windows builds after 0.44.0**: filesystem conversion helpers now live in a platform-header-free `path.hpp`. Including the command-line decoder from the audio code had brought in Windows' `far` macro, breaking the HRTF filter's local variable in both MSVC CI and the LLVM-MinGW download. That variable is also named `far_ear` now. The UTF-16 command-line decoder remains in the player and recompiler.
+- **Absolute kernel timers** now interpret positive due times as system timestamps since 1601 and convert them onto the scheduler clock, as kernel waits already intended. They were incorrectly treated as elapsed runtime ticks. Relative waits/timers handle `INT64_MIN` and saturate overlong deadlines without signed overflow or nanosecond wraparound. Periodic timers retain their phase and coalesce missed expirations after a stall instead of firing a catch-up burst every millisecond.
+- **WAV captures** check header writes, seeks, data writes, flush and close, retaining the first failure. They use 64-bit seek offsets on Windows and stop at the RIFF size limit rather than wrapping the header. Encoding uses bounded scratch space; NaN becomes silence and infinities saturate. Capture errors stop/report the dump while playback continues.
+- **Audio shutdown** explicitly joins the mixer before the platform stream is destroyed when guest main returns. Window/menu quit, scripted quit and `--frames` exits also stop controller motors and finalise audio captures before exiting; `std::exit` bypasses the automatic input/output destructors.
+
+### Tests
+- Timer arithmetic and real guest timer structures cover absolute/relative due times, cancellation, extreme deadlines and periodic catch-up.
+- WAV tests check live and final headers, Unicode paths, sample conversion, invalid destinations, RIFF-limit refusal and real `/dev/full` failures.
+- A host regression starts the actual DirectSound mixer through its native replacement, mixes into a capture, then joins/finalises it and checks idempotent shutdown before guest RAM is released. Host tests link the empty dispatch fixture, without game files.
+- [Validation record](docs/validation-0.45.md). Complete-game compatibility remains unverified.
+
 ## [0.44.0] - 2026-11-22
 
 ### Added

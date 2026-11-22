@@ -1,4 +1,4 @@
-#include "../command_line.hpp"
+#include "../path.hpp"
 // Voices: decoding PCM and Xbox ADPCM, resampling, gain and mix bins.
 #include <algorithm>
 #include <array>
@@ -383,10 +383,10 @@ bool Voice::process(const uint8_t* mem, size_t mem_size, uint32_t frames) {
         // negated): positive delays the left ear. (Checked against the
         // filters over five minutes of play: in 7.96 million blocks with a
         // delay, the delayed ear's filter was the quieter one every time.)
-        const int far = three_d.itd > 0 ? 0 : 1;
+        const int far_ear = three_d.itd > 0 ? 0 : 1;
         hrtf_out_.assign(size_t(frames) * 2, 0.0f);
         for (int e = 0; e < 2; ++e) {
-            const uint32_t delay = e == far ? itd : 0;
+            const uint32_t delay = e == far_ear ? itd : 0;
             float* o = &hrtf_out_[size_t(e) * frames];
             for (uint32_t i = 0; i < frames; ++i) {
                 float acc = 0.0f;
@@ -676,15 +676,15 @@ void Limiter::process(float* io, uint32_t frames) {
 
 // ---------------------------------------------------------------- WAV output
 namespace {
-void le16(std::FILE* f, uint32_t v) {
-    const uint8_t b[2] = {uint8_t(v), uint8_t(v >> 8)};
-    std::fwrite(b, 1, 2, f);
+constexpr uint64_t kWavFrames = (uint64_t(UINT32_MAX) - 36) / 4;
+bool wav_seek(std::FILE* file, uint64_t offset) {
+#ifdef _WIN32
+    return _fseeki64(file, static_cast<int64_t>(offset), SEEK_SET) == 0;
+#else
+    return fseeko(file, static_cast<off_t>(offset), SEEK_SET) == 0;
+#endif
 }
-void le32(std::FILE* f, uint32_t v) {
-    const uint8_t b[4] = {uint8_t(v), uint8_t(v >> 8), uint8_t(v >> 16), uint8_t(v >> 24)};
-    std::fwrite(b, 1, 4, f);
-}
-}  // namespace
+} // namespace
 
 WavWriter::WavWriter(const std::string& path) {
 #ifdef _WIN32
@@ -692,50 +692,71 @@ WavWriter::WavWriter(const std::string& path) {
 #else
     file_ = std::fopen(path.c_str(), "wb");
 #endif
-    if (file_) finish();
+    if (!file_) fail("cannot open WAV capture");
+    else finish();
+}
+WavWriter::~WavWriter() { close(); }
+
+bool WavWriter::fail(const char* message) {
+    if (healthy_) error_ = message;
+    healthy_ = false;
+    return false;
 }
 
-WavWriter::~WavWriter() {
+// Rebuild the header, then restore the exact 64-bit append offset. A Windows
+// long/ftell only reaches 2 GB, though a RIFF capture can be almost 4 GB.
+bool WavWriter::finish() {
+    if (!file_) return false;
+    std::array<uint8_t, 44> header{};
+    auto word = [&](size_t at, uint32_t value, size_t bytes) {
+        for (size_t i = 0; i < bytes; ++i) header[at + i] = uint8_t(value >> (8 * i));
+    };
+    std::memcpy(header.data(), "RIFF", 4);
+    word(4, uint32_t(36 + frames_ * 4), 4);
+    std::memcpy(header.data() + 8, "WAVEfmt ", 8);
+    word(16, 16, 4); word(20, 1, 2); word(22, 2, 2);
+    word(24, kOutputRate, 4); word(28, kOutputRate * 4, 4);
+    word(32, 4, 2); word(34, 16, 2);
+    std::memcpy(header.data() + 36, "data", 4);
+    word(40, uint32_t(frames_ * 4), 4);
+    if (!wav_seek(file_, 0) || std::fwrite(header.data(), 1, header.size(), file_) != header.size() ||
+        !wav_seek(file_, 44 + frames_ * 4) || std::fflush(file_) != 0)
+        return fail("cannot finalise WAV capture");
+    return true;
+}
+
+bool WavWriter::close() {
     if (file_) {
+        // Even on a size-limit failure, leave a header for the frames accepted.
+        std::clearerr(file_);
         finish();
-        std::fclose(file_);
+        if (std::fclose(file_) != 0) fail("cannot close WAV capture");
+        file_ = nullptr;
     }
+    return healthy_;
 }
 
-// The header, with the sizes so far; the file stays a valid WAV at every point.
-void WavWriter::finish() {
-    const long here = std::ftell(file_);
-    std::fseek(file_, 0, SEEK_SET);
-    const uint32_t data = uint32_t(frames_ * 4);
-    std::fwrite("RIFF", 1, 4, file_);
-    le32(file_, 36 + data);
-    std::fwrite("WAVEfmt ", 1, 8, file_);
-    le32(file_, 16);
-    le16(file_, 1);
-    le16(file_, 2);
-    le32(file_, kOutputRate);
-    le32(file_, kOutputRate * 4);
-    le16(file_, 4);
-    le16(file_, 16);
-    std::fwrite("data", 1, 4, file_);
-    le32(file_, data);
-    if (here > 44) std::fseek(file_, here, SEEK_SET);
+bool WavWriter::write(const float* stereo, uint32_t frames) {
+    if (!ok()) return false;
+    if (frames > kWavFrames - frames_) return fail("WAV capture reached RIFF's 4 GB size limit");
+    if (frames && !stereo) return fail("WAV capture received no samples");
+    const uint64_t before = frames_;
+    std::array<uint8_t, 4096 * 4> buffer;
+    for (uint32_t offset = 0; offset < frames;) {
+        const uint32_t count = std::min<uint32_t>(4096, frames - offset);
+        for (size_t i = 0; i < size_t(count) * 2; ++i) {
+            const float sample = stereo[size_t(offset) * 2 + i];
+            const int32_t value = std::isnan(sample) ? 0 : int32_t(std::lround(std::clamp(sample, -1.0f, 1.0f) * 32767.0f));
+            buffer[2 * i] = uint8_t(value);
+            buffer[2 * i + 1] = uint8_t(uint32_t(value) >> 8);
+        }
+        const size_t written = std::fwrite(buffer.data(), 4, count, file_);
+        frames_ += written;
+        if (written != count) return fail("cannot write WAV capture samples");
+        offset += count;
+    }
+    if (frames_ / (kOutputRate / 2) != before / (kOutputRate / 2)) return finish();
+    return true;
 }
 
-void WavWriter::write(const float* stereo, uint32_t frames) {
-    if (!file_) return;
-    std::vector<uint8_t> buf(size_t(frames) * 4);
-    for (uint32_t i = 0; i < frames * 2; ++i) {
-        const int32_t v = int32_t(std::lround(std::clamp(stereo[i], -1.0f, 1.0f) * 32767.0f));
-        buf[2 * i] = uint8_t(v);
-        buf[2 * i + 1] = uint8_t(uint32_t(v) >> 8);
-    }
-    std::fwrite(buf.data(), 1, buf.size(), file_);
-    frames_ += frames;
-    if (frames_ % (kOutputRate / 2) < frames) {  // every half second, keep the header current
-        finish();
-        std::fflush(file_);
-    }
-}
-
-}  // namespace qilin::audio
+} // namespace qilin::audio

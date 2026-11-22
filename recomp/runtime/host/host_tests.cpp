@@ -1,3 +1,8 @@
+#include "sched.hpp"
+#include "path.hpp"
+#include <thread>
+#include "time.hpp"
+#include <limits>
 // Tests for the runtime's host side; no game files needed.
 #include <algorithm>
 #include <array>
@@ -87,6 +92,42 @@ void fake_create_file(rt::Context& c) {  // stdcall, two arguments: returns thei
 }  // namespace
 
 int main() {
+    // NT timeout conversion: absolute system times and extreme relative waits.
+    {
+        namespace t = host::time;
+        CHECK(t::interval_ticks(-7, 100) == 7);
+        CHECK(t::interval_ticks(INT64_MIN, 100) == (uint64_t{1} << 63));
+        CHECK(t::interval_ticks(99, 100) == 0);
+        CHECK(t::interval_ticks(107, 100) == 7);
+        CHECK(t::add(UINT64_MAX - 1, 10) == UINT64_MAX);
+        const auto now = t::Clock::time_point{} + std::chrono::seconds(1);
+        CHECK(t::deadline(now, 0) == now);
+        CHECK(t::deadline(now, 10) == now + std::chrono::nanoseconds(1000));
+        CHECK(t::deadline(now, uint64_t{1} << 63) == t::Clock::time_point::max());
+        CHECK(t::deadline(t::Clock::time_point::max() - std::chrono::nanoseconds(50), 1) == t::Clock::time_point::max());
+        CHECK(t::next_period(100, 100, 1550) == 1600);
+        CHECK(t::next_period(100, 100, 100) == 200);
+        CHECK(t::next_period(100, 100, 50) == 100);
+        CHECK(t::next_period(UINT64_MAX - 10, 100, UINT64_MAX - 5) == UINT64_MAX);
+    }
+
+    // Exercise the timer API with real guest structures, without starting a
+    // scheduler clock thread. Absolute system due times become elapsed times.
+    {
+        Guest guest;
+        const auto timer = guest.alloc(0x28);
+        const auto before = host::sched::interrupt_time();
+        const auto due = host::time::system_ticks() + 10000000;
+        CHECK(host::sched::set_timer(guest.c, timer, int64_t(due), 0, 0) == 0);
+        const uint64_t stored = uint64_t(guest.u32(timer + 0x10)) | (uint64_t(guest.u32(timer + 0x14)) << 32);
+        CHECK(stored >= before && stored <= host::sched::interrupt_time() + 10000000);
+        CHECK(guest.ram[timer + 3] == 1);
+        CHECK(host::sched::cancel_timer(guest.c, timer));
+        CHECK(guest.ram[timer + 3] == 0 && !host::sched::cancel_timer(guest.c, timer));
+        CHECK(host::sched::set_timer(guest.c, timer, INT64_MIN, 0, 0) == 0);
+        CHECK(host::sched::cancel_timer(guest.c, timer));
+    }
+
     // The kernel export table: names, argument sizes, data exports, fastcall.
     const host::KernelExport* e = host::kernel_export(190);
     CHECK(e && std::string(e->name) == "NtCreateFile" && e->arg_bytes == 36 && !e->data);
@@ -415,6 +456,35 @@ int main() {
             CHECK(pairs);
             CHECK(counts);
         }
+    }
+
+    // A real DirectSound mixer starts on another thread and must be joined
+    // before its guest RAM goes away. Shutdown finalises the capture, twice safely.
+    {
+        const auto wav_path = std::filesystem::temp_directory_path() / std::filesystem::path(u8"ghoulies-mixer-é.wav");
+        Guest guest;
+        host::vm().init(guest.ram.get(), 0x10000, 0x80000);
+        host::register_dsound(utf8_path(wav_path), nullptr);
+        const auto* create = host::xdk_symbol("DirectSoundCreate");
+        CHECK(create != nullptr);
+        if (create) {
+            guest.c.esp = 0xf0000 - 16;
+            guest.put32(guest.c.esp, 0x5555);
+            guest.put32(guest.c.esp + 4, 0);
+            guest.put32(guest.c.esp + 8, guest.alloc(4));
+            guest.put32(guest.c.esp + 12, 0);
+            rt::call_unlifted(guest.c, create->address);
+            CHECK(guest.c.eax == 0 && guest.c.ret_to == 0x5555);
+            std::this_thread::sleep_for(std::chrono::milliseconds(15));
+            host::pump_audio(guest.c);
+        }
+        host::shutdown_dsound(); host::shutdown_dsound();
+        CHECK(std::filesystem::file_size(wav_path) > 44);
+        std::ifstream wave(wav_path, std::ios::binary);
+        char riff[4]{}; wave.read(riff, 4);
+        CHECK(std::memcmp(riff, "RIFF", 4) == 0);
+        wave.close();
+        std::filesystem::remove(wav_path);
     }
 
     if (failures) std::fprintf(stderr, "%d check(s) failed\n", failures);

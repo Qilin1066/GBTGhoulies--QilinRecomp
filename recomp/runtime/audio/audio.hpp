@@ -335,11 +335,19 @@ class WavWriter {
 public:
     explicit WavWriter(const std::string& path);
     ~WavWriter();
-    bool ok() const { return file_ != nullptr; }
-    void write(const float* stereo, uint32_t frames);
+    WavWriter(const WavWriter&) = delete;
+    WavWriter& operator=(const WavWriter&) = delete;
+    bool ok() const { return file_ && healthy_; }
+    const std::string& error() const { return error_; }
+    bool write(const float* stereo, uint32_t frames);
+    bool close(); // finalise, flush and check fclose; idempotent
+
 
 private:
-    void finish();
+    bool finish();
+    bool fail(const char* message);
+    bool healthy_ = true;
+    std::string error_;
     std::FILE* file_ = nullptr;
     uint64_t frames_ = 0;
 };

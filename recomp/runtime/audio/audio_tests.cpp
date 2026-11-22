@@ -1,3 +1,7 @@
+#include "../path.hpp"
+#include <filesystem>
+#include <fstream>
+#include <limits>
 // Audio engine tests: voices over a fake guest memory, no device needed.
 #include <algorithm>
 #include <cmath>
@@ -401,6 +405,47 @@ int main() {
         b.bin(0)[0] = std::nanf(""), b.bin(0)[1] = INFINITY;
         audio::saturate(b, 0, 1);
         CHECK(b.bin(0)[0] == 0.0f && b.bin(0)[1] < 1.0f);
+    }
+
+    // WAV captures: sizes stay valid while open; failures latch; conversion
+    // handles non-finite samples without passing NaN to lround().
+    {
+        namespace fs = std::filesystem;
+        const auto dir = fs::temp_directory_path() / fs::path(u8"qilin-wav-é-保存");
+        fs::remove_all(dir); fs::create_directories(dir);
+        auto u32 = [](const fs::path& path, size_t at) {
+            std::ifstream file(path, std::ios::binary);
+            file.seekg(std::streamoff(at));
+            uint8_t bytes[4]{}; file.read(reinterpret_cast<char*>(bytes), 4);
+            return uint32_t(bytes[0]) | (uint32_t(bytes[1]) << 8) | (uint32_t(bytes[2]) << 16) | (uint32_t(bytes[3]) << 24);
+        };
+        const auto path = dir / "capture.wav";
+        audio::WavWriter wav(utf8_path(path));
+        CHECK(wav.ok() && fs::file_size(path) == 44 && u32(path, 4) == 36 && u32(path, 40) == 0);
+        const float special[] = {1, -1, std::nanf(""), INFINITY, -INFINITY, 0.5f, 0, 0};
+        CHECK(wav.write(special, 4));
+        std::vector<float> silence(audio::kOutputRate, 0.0f);
+        CHECK(wav.write(silence.data(), audio::kOutputRate / 2));
+        CHECK(u32(path, 40) == (4 + audio::kOutputRate / 2) * 4);
+        CHECK(wav.close() && wav.close() && !wav.ok());
+        CHECK(fs::file_size(path) == 44 + (4 + audio::kOutputRate / 2) * 4);
+        CHECK(u32(path, 44) == 0x80017fffu); // +1, -1
+        CHECK(u32(path, 48) == 0x7fff0000u); // NaN -> silence, +infinity -> maximum
+        CHECK(u32(path, 52) == 0x40008001u); // -infinity -> minimum, +0.5
+        CHECK(!wav.write(special, 1));
+        audio::WavWriter limit(utf8_path(dir / "limit.wav"));
+        CHECK(!limit.write(nullptr, UINT32_MAX)); // reject before reading/allocating samples
+        CHECK(!limit.close() && !limit.error().empty());
+        CHECK(fs::file_size(dir / "limit.wav") == 44 && u32(dir / "limit.wav", 40) == 0);
+        audio::WavWriter missing(utf8_path(dir / "missing" / "file.wav"));
+        CHECK(!missing.ok() && !missing.close());
+#ifndef _WIN32
+        if (fs::exists("/dev/full")) {
+            audio::WavWriter full("/dev/full");
+            CHECK(!full.ok() && !full.write(special, 4) && !full.close());
+        }
+#endif
+        fs::remove_all(dir);
     }
 
     if (failures) std::fprintf(stderr, "%d check(s) failed\n", failures);

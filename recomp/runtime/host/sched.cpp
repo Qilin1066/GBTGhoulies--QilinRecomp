@@ -1,3 +1,4 @@
+#include "time.hpp"
 // The kernel's threads, waits, timers and DPCs (see sched.hpp).
 //
 // One mutex guards the scheduler. The guest thread holding the processor
@@ -249,11 +250,7 @@ uint32_t wait(std::vector<uint32_t> objects, bool all, std::optional<Clock::time
 std::optional<Clock::time_point> timeout_at(const rt::Context& c, uint32_t p) {
     if (!p) return std::nullopt;
     const int64_t v = int64_t(uint64_t(ld(c, p + 4)) << 32 | ld(c, p));
-    if (v < 0) return Clock::now() + std::chrono::nanoseconds(uint64_t(-v) * 100);
-    // Absolute: system time (100 ns since 1601), against the host's clock.
-    const int64_t now_sys = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::system_clock::now().time_since_epoch()).count() / 100 +
-                            116444736000000000LL;
-    return Clock::now() + std::chrono::nanoseconds(std::max<int64_t>(0, v - now_sys) * 100);
+    return time::deadline(Clock::now(), time::interval_ticks(v, time::system_ticks()));
 }
 
 // ------------------------------------------------------------ DPCs
@@ -329,7 +326,7 @@ void clock_thread() {
             const uint32_t t = it->first;
             State::Timer tm = it->second;
             if (tm.period) {
-                it->second.due += uint64_t(tm.period) * 10000;
+                it->second.due = time::next_period(tm.due, uint64_t(tm.period) * 10000, it_now);
                 ++it;
             } else {
                 rt::st8(mem(mc()), t + 3, 0, 0);  // no longer inserted
@@ -901,12 +898,12 @@ void set_data_export(uint32_t ordinal, uint32_t addr) {
 
 uint32_t set_timer(rt::Context& c, uint32_t t, int64_t due, uint32_t period, uint32_t dpc) {
     const uint64_t now = interrupt_time();
-    const uint64_t at = due < 0 ? now + uint64_t(-due) : uint64_t(due);  // absolute: as the interrupt clock's
+    const uint64_t at = time::add(now, time::interval_ticks(due, time::system_ticks()));
     std::lock_guard lk(s().mu);
     const bool was = s().timers.erase(t) != 0;
     s().timers[t] = State::Timer{at, period, dpc};
     rt::st8(mem(c), t + 3, 1, 0);  // Header.Inserted
-    set_state(t, 0);
+    st(c, t + 4, 0);
     st(c, t + 0x10, uint32_t(at));
     st(c, t + 0x14, uint32_t(at >> 32));
     st(c, t + 0x20, dpc);
