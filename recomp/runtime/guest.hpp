@@ -132,7 +132,7 @@ namespace scalar {
 template <typename L, typename F>
 inline uint64_t lanes(uint64_t a, uint64_t b, F f) {
     constexpr int bits = int(sizeof(L) * 8);
-    constexpr uint64_t mask = bits == 64 ? ~0ull : (1ull << bits) - 1;
+    constexpr uint64_t mask = UINT64_MAX >> (64 - bits);
     uint64_t r = 0;
     for (int k = 0; k < 64; k += bits) r |= (uint64_t(f(L((a >> k) & mask), L((b >> k) & mask))) & mask) << k;
     return r;
@@ -211,7 +211,7 @@ inline uint64_t sar(uint64_t a, uint64_t n) {
 template <typename L>
 inline uint64_t unpack(uint64_t a, uint64_t b, bool high) {
     constexpr int bits = int(sizeof(L) * 8);
-    constexpr uint64_t mask = bits == 64 ? ~0ull : (1ull << bits) - 1;
+    constexpr uint64_t mask = UINT64_MAX >> (64 - bits);
     if (high) a >>= 32, b >>= 32;
     uint64_t r = 0;
     for (int k = 0; k < 32 / bits; ++k) {

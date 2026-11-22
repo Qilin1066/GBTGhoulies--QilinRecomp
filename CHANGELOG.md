@@ -11,6 +11,13 @@ Each release is a git tag (`vX.Y.Z`) with a matching GitHub release. The version
 
 ## [Unreleased]
 
+## [0.45.1] - 2026-11-22
+
+### Fixed
+- **The scheduler's first clock read** initialises its state before sampling `now`. The subtraction's operands could previously be evaluated in the other order, making the first sample earlier than the clock's start and wrapping the unsigned elapsed time. The new timer integration regression caught it on Clang/Linux ARM64/macOS; the exact bounds check is retained.
+- **MSVC warnings-as-errors**: MMX scalar lane masks use a right shift from `UINT64_MAX`, which works for 64-bit lanes without a syntactically out-of-range left shift in a conditional's unused branch. MSVC rejected that branch while instantiating the existing MMX regression checks. Lane-mask values are unchanged.
+
+
 ## [0.45.0] - 2026-11-22
 
 ### Fixed

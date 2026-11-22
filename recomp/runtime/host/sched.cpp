@@ -880,7 +880,10 @@ void set_event(uint32_t event) {
 void wait_object(uint32_t object) { wait({object}, false, std::nullopt); }
 
 uint64_t interrupt_time() {
-    return uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - s().start).count() / 100);
+    // Initialise State before sampling now: operand evaluation order otherwise
+    // permits now to precede State::start on the very first call.
+    const auto start = s().start;
+    return uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - start).count() / 100);
 }
 
 void set_data_export(uint32_t ordinal, uint32_t addr) {

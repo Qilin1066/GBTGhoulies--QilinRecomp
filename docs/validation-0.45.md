@@ -41,3 +41,14 @@ claimed. The remaining completion evidence is listed in the
 Reproduction commands are unchanged from that record. The release build uses
 `QILIN_WERROR=ON`; instrumented checks use `QILIN_SANITIZE=address,undefined`
 and `ASAN_OPTIONS=detect_leaks=0 UBSAN_OPTIONS=halt_on_error=1`.
+
+## CI follow-up: 0.45.1
+
+0.45.0's Windows download packaged successfully. Cross-platform CI then
+caught a scheduler clock bootstrap bug in the new integration test: the first
+`Clock::now()` could be evaluated before constructing `State::start`. The
+elapsed-time subtraction now initialises the state first. The exact timer
+check remains unchanged. MSVC also flagged an out-of-range shift expression
+in the MMX scalar mask's unused branch; a right-shift mask avoids the
+expression while preserving all lane values. Both corrections are versioned
+as 0.45.1 and checked by the existing tests.
