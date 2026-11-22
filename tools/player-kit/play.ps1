@@ -32,9 +32,18 @@ $stamp = Join-Path $work "built-with.txt"
 $discFile = Join-Path $work "disc-folder.txt"
 $kitVersion = (Get-Content (Join-Path $kit "VERSION") -Raw).Trim()
 $onWindows = ($PSVersionTable.PSEdition -eq "Desktop") -or $IsWindows   # Windows PowerShell 5.1 has no $IsWindows
+# SHA-256 of a file, upper-case hex. Not Get-FileHash: that cmdlet is missing
+# when Windows PowerShell inherits a PowerShell 7 module path, as it does
+# when started from pwsh (or from CI's shell).
+function Get-Sha256([string]$path) {
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    $stream = [System.IO.File]::OpenRead($path)
+    try { return ([BitConverter]::ToString($sha.ComputeHash($stream))).Replace('-', '') }
+    finally { $stream.Dispose(); $sha.Dispose() }
+}
 function Get-Identity([string[]]$parts) {
     $lines = foreach ($part in $parts) {
-        $part.Replace('\', '/') + ':' + (Get-FileHash -LiteralPath (Join-Path $kit $part) -Algorithm SHA256).Hash
+        $part.Replace('\', '/') + ':' + (Get-Sha256 (Join-Path $kit $part))
     }
     $hash = [System.Security.Cryptography.SHA256]::Create()
     try { return ([BitConverter]::ToString($hash.ComputeHash([Text.Encoding]::UTF8.GetBytes(($lines -join "`n"))))).Replace('-', '').ToLowerInvariant() }
@@ -112,7 +121,7 @@ while ($true) {
 $disc = $disc.TrimEnd('\')
 New-Item -ItemType Directory -Force -Path $work | Out-Null
 
-$discIdentity = (Get-FileHash -LiteralPath (Join-Path $disc 'default.xbe') -Algorithm SHA256).Hash
+$discIdentity = (Get-Sha256 (Join-Path $disc 'default.xbe'))
 $builtFor = "$kitVersion | $kitIdentity | $compileKit | $discIdentity"
 # Part of Ninja's compile command, so preserved/older timestamps cannot hide
 # changed headers, compiler or disc code. Runtime-only archive changes relink.

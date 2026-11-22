@@ -16,6 +16,7 @@ Each release is a git tag (`vX.Y.Z`) with a matching GitHub release. The version
 
 ### Fixed
 - The main thread's x87 control word (0x027F) is set before the scheduler copies the main thread's registers, so threads and DPCs created later start with it too, as on the console.
+- The player kit's launcher hashes files with .NET rather than `Get-FileHash`, which is missing when Windows PowerShell inherits a PowerShell 7 module path (started from pwsh, for example). The launcher stopped there; the hashes are the same, so existing builds aren't redone.
 - DirectSound buffers created with `dwBufferBytes` get their own zeroed memory, reused when such a buffer is released, rather than stopping as unmodelled. Ported from the Wild Horse Rescue recompilation; not yet exercised by this game.
 
 ## [0.47.0] - 2026-11-22

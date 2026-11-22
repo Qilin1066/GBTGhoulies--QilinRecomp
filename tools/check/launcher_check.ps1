@@ -1,5 +1,14 @@
 param([string]$Stub, [string]$Ninja, [string]$Launcher, [string]$Out)
 $ErrorActionPreference = 'Stop'
+# SHA-256 of a file, upper-case hex. Not Get-FileHash: that cmdlet is missing
+# when Windows PowerShell inherits a PowerShell 7 module path, as it does
+# when started from pwsh (or from CI's shell).
+function Get-Sha256([string]$path) {
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    $stream = [System.IO.File]::OpenRead($path)
+    try { return ([BitConverter]::ToString($sha.ComputeHash($stream))).Replace('-', '') }
+    finally { $stream.Dispose(); $sha.Dispose() }
+}
 # Test metacharacters and names outside the Windows active code page, too.
 $fixture = Join-Path $Out ('Kit with spaces ' + [char]0x00e9)
 if (Test-Path -LiteralPath $fixture) { Remove-Item -LiteralPath $fixture -Recurse -Force }
@@ -23,7 +32,7 @@ if ($LASTEXITCODE -ne 0) { throw 'Initial build failed' }
 $stamp = Join-Path $fixture 'work/built-with.txt'
 $before = Get-Content -LiteralPath $stamp -Raw
 $game = Join-Path $fixture 'Ghoulies.exe'
-$initialHash = (Get-FileHash -LiteralPath $game).Hash
+$initialHash = (Get-Sha256 $game)
 $calls = Join-Path $fixture 'work/tool-calls.txt'
 function Compile-Count { return @(Get-Content -LiteralPath $calls | Where-Object { $_ -eq 'compile' }).Count }
 $compiles = Compile-Count
@@ -33,7 +42,7 @@ Add-Content -LiteralPath $archive -Value 'same version, new contents'
 (Get-Item -LiteralPath $archive).LastWriteTimeUtc = [DateTime]'2000-01-01'
 & $shellExe -NoProfile -File $launcherPath -BuildOnly
 if ($LASTEXITCODE -ne 0 -or (Get-Content -LiteralPath $stamp -Raw) -eq $before) { throw 'Same-version change did not rebuild' }
-if ((Get-FileHash -LiteralPath $game).Hash -eq $initialHash) { throw 'Old archive timestamp hid a changed runtime: stale link' }
+if ((Get-Sha256 $game) -eq $initialHash) { throw 'Old archive timestamp hid a changed runtime: stale link' }
 if ((Compile-Count) -ne $compiles) { throw 'Runtime-only update unnecessarily recompiled guest code' }
 # Header and compiler changes must rebuild objects even with old timestamps.
 $header = Join-Path $fixture 'kit/include/stub.hpp'
@@ -61,14 +70,14 @@ if ($LASTEXITCODE -ne 0 -or (Compile-Count) -ne ($compiles + 1)) { throw 'Explic
 if (-not (Test-Path -LiteralPath (Join-Path $fixture 'Ghoulies.exe.previous'))) { throw 'Previous executable missing' }
 $before = Get-Content -LiteralPath $stamp -Raw
 $game = Join-Path $fixture 'Ghoulies.exe'
-$hash = (Get-FileHash -LiteralPath $game).Hash
+$hash = (Get-Sha256 $game)
 Add-Content -LiteralPath (Join-Path $fixture 'kit/lib/libghoulies_kit.a') -Value 'another update'
 $locked = [System.IO.File]::Open($game, 'Open', 'Read', 'Read')
 try {
     & $shellExe -NoProfile -File $launcherPath -BuildOnly
     if ($LASTEXITCODE -eq 0) { throw 'Locked executable unexpectedly replaced' }
 } finally { $locked.Dispose() }
-if ((Get-FileHash -LiteralPath $game).Hash -ne $hash -or (Get-Content -LiteralPath $stamp -Raw) -ne $before) { throw 'Failed update changed executable or stamp' }
+if ((Get-Sha256 $game) -ne $hash -or (Get-Content -LiteralPath $stamp -Raw) -ne $before) { throw 'Failed update changed executable or stamp' }
 # Recover and launch a real child with Unicode, spaces and shell metacharacters.
 & $shellExe -NoProfile -File $launcherPath
 if ($LASTEXITCODE -ne 0) { throw 'Launch failed' }
