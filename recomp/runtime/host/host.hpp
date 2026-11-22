@@ -153,6 +153,7 @@ struct D3dConfig {
     std::string settings_folder;             // where it's kept
 };
 void register_d3d(const D3dConfig& config);
+void shutdown_d3d(); // destroy menu/renderer and join cache workers before the window goes away
 const D3dConfig& d3d_config();
 
 // The console's audio setting the game reads (ExQueryNonVolatileSetting):

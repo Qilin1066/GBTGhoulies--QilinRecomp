@@ -11,6 +11,18 @@ Each release is a git tag (`vX.Y.Z`) with a matching GitHub release. The version
 
 ## [Unreleased]
 
+## [0.47.0] - 2026-11-22
+
+### Fixed
+- Player-kit updates always relink a changed runtime archive, even if an extracted update preserves older file timestamps. The previous content check could request a rebuild while Ninja still considered the old executable up to date.
+- Runtime headers, the bundled compiler executable, build flags and the disc executable participate in compilation identity. Changes invalidate guest objects independently of modification times; runtime-only archive changes reuse those objects. `-Rebuild` now cleans generated build outputs before compiling, while retaining the installed executable until its replacement succeeds.
+- Player shutdown destroys the Direct3D device before its window and controllers. This runs menu/renderer teardown, joins the pipeline-library worker, waits for GPU work and finalises caches. An unfinished F9 trace is closed and its remaining folder reported. Normal guest return, window/menu quit, scripted quit and frame-limited exits use the cleanup path; repeated shutdown is safe.
+
+### Tests
+- The Windows launcher regression now uses real Ninja with a synthetic compiler and disc. It checks old-timestamp archive/header/compiler changes, changed disc contents with unchanged certificate metadata, unchanged-build reuse, explicit clean rebuild, locked installation recovery and literal Unicode child arguments. Windows CI requires its test tools rather than silently omitting the test.
+- Added a Vulkan-backed host Direct3D lifetime test using synthetic guest RAM and three no-op startup helpers. It creates and destroys two devices, closes the pipeline-library file and checks repeated shutdown. Linux CI requires it to run.
+- [Validation record](docs/validation-0.47.md). Complete-game compatibility remains unverified.
+
 ## [0.46.0] - 2026-11-22
 
 ### Fixed

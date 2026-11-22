@@ -32,10 +32,21 @@ $stamp = Join-Path $work "built-with.txt"
 $discFile = Join-Path $work "disc-folder.txt"
 $kitVersion = (Get-Content (Join-Path $kit "VERSION") -Raw).Trim()
 $onWindows = ($PSVersionTable.PSEdition -eq "Desktop") -or $IsWindows   # Windows PowerShell 5.1 has no $IsWindows
-$identityParts = @("lib/libghoulies_kit.a", "qilin.exe", "kit.ninja", "play.ps1") | ForEach-Object {
-    (Get-FileHash -LiteralPath (Join-Path $kit $_) -Algorithm SHA256).Hash
+function Get-Identity([string[]]$parts) {
+    $lines = foreach ($part in $parts) {
+        $part.Replace('\', '/') + ':' + (Get-FileHash -LiteralPath (Join-Path $kit $part) -Algorithm SHA256).Hash
+    }
+    $hash = [System.Security.Cryptography.SHA256]::Create()
+    try { return ([BitConverter]::ToString($hash.ComputeHash([Text.Encoding]::UTF8.GetBytes(($lines -join "`n"))))).Replace('-', '').ToLowerInvariant() }
+    finally { $hash.Dispose() }
 }
-$builtFor = "$kitVersion | $($identityParts -join ':')"
+# Names as well as bytes matter: removing or adding a header changes this key.
+$headers = @(Get-ChildItem -LiteralPath (Join-Path $kit 'include') -Recurse -File | Sort-Object FullName | ForEach-Object {
+    $_.FullName.Substring($kit.Length + 1)
+})
+$compiler = 'toolchain/bin/x86_64-w64-mingw32-clang++.exe'
+$compileKit = Get-Identity (@('kit.ninja', $compiler) + $headers)
+$kitIdentity = Get-Identity @('lib/libghoulies_kit.a', 'qilin.exe', 'kit.ninja', 'play.ps1')
 # Off Windows (testing the download), QILIN_KIT_RUNNER runs the kit's programs.
 $runner = $env:QILIN_KIT_RUNNER
 
@@ -101,6 +112,12 @@ while ($true) {
 $disc = $disc.TrimEnd('\')
 New-Item -ItemType Directory -Force -Path $work | Out-Null
 
+$discIdentity = (Get-FileHash -LiteralPath (Join-Path $disc 'default.xbe') -Algorithm SHA256).Hash
+$builtFor = "$kitVersion | $kitIdentity | $compileKit | $discIdentity"
+# Part of Ninja's compile command, so preserved/older timestamps cannot hide
+# changed headers, compiler or disc code. Runtime-only archive changes relink.
+$compileRevision = "rev$compileKit$discIdentity"
+
 # Starts the game, its messages into run.log (the file to send when something goes wrong).
 function Start-Game {
     $xbe = Join-Path $disc "default.xbe"
@@ -144,7 +161,7 @@ $lines = @(
     "include ../kit/kit.ninja",
     "cxx = ..\kit\toolchain\bin\x86_64-w64-mingw32-clang++.exe",
     "rule cxx",
-    "  command = `$cxx `$cxxflags -Igen -MD -MF `$out.d -c `$in -o `$out",
+    "  command = `$cxx `$cxxflags -DQILIN_KIT_COMPILE_ID=$compileRevision -Igen -MD -MF `$out.d -c `$in -o `$out",
     "  depfile = `$out.d",
     "  deps = gcc",
     "  description = Compiling `$in",
@@ -159,12 +176,20 @@ foreach ($s in $sources) {
     $objects += $object
     $lines += "build ${object}: cxx gen/$($s.Name)"
 }
-$lines += "build Ghoulies.exe: link $($objects -join ' ') | ../kit/lib/libghoulies_kit.a"
+# This phony input is always dirty. Ninja is only invoked for a requested
+# rebuild or an invalid stamp; even an archive with old timestamps must link.
+$lines += "build force_link: phony"
+$lines += "build Ghoulies.exe: link $($objects -join ' ') | ../kit/lib/libghoulies_kit.a force_link"
 $lines += "default Ghoulies.exe"
 Set-Content -Path (Join-Path $work "build.ninja") -Value $lines -Encoding ASCII
 
 Write-Host "== Compiling ($($sources.Count) files; the biggest take a few minutes each)" -ForegroundColor Cyan
 $ninja = if ($onWindows) { Join-Path $kit "ninja.exe" } else { "ninja" }
+if ($Rebuild) {
+    if ($onWindows) { $clean = Invoke-Kit $ninja @('-C', $work, '-t', 'clean') }
+    else { & $ninja -C $work -t clean | Out-Host; $clean = $LASTEXITCODE }
+    if ($clean -ne 0) { throw "cleaning the rebuild outputs failed" }
+}
 $jobs = [Math]::Max(1, [Environment]::ProcessorCount)
 if ($onWindows) { $code = Invoke-Kit $ninja @("-C", $work, "-j", "$jobs") }
 else { & $ninja -C $work -j $jobs | Out-Host; $code = $LASTEXITCODE }

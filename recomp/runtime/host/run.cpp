@@ -327,9 +327,9 @@ int main(int argc, char** argv) {
     }
     host::set_audio_surround(sound && sound->channels() == 6);
     host::register_dsound(dump_audio, sound.get());
-    struct SoundLifetime {
-        ~SoundLifetime() { host::shutdown_dsound(); }
-    } sound_lifetime; // destroyed before the output stream, including normal main() return
+    struct RuntimeLifetime {
+        ~RuntimeLifetime() { host::shutdown_dsound(); host::shutdown_d3d(); }
+    } runtime_lifetime; // before output, controllers and window, including normal main() return
     host::register_kernel();
     const std::filesystem::path disc = game_dir ? qilin::native_path(game_dir) : qilin::native_path(path).parent_path();
     std::filesystem::path data = data_dir ? qilin::native_path(data_dir) : default_data_dir();

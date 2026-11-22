@@ -92,8 +92,10 @@ Updates and save recovery
 -------------------------
 Updates stage the new executable before replacing the old one, retained as
 Ghoulies.exe.previous. Close the game before updating. A changed kit rebuilds
-it even if VERSION has not changed, and a failed build keeps the remembered
-disc folder and working executable.
+it even if VERSION has not changed or the update has older file timestamps.
+Runtime-only changes reuse the compiled game code; changed headers, compiler
+or disc executable recompile it. Play Ghoulies.bat -Rebuild forces a clean
+build. A failed build keeps the remembered disc folder and working executable.
 
 Before changing an existing title-save file, the runtime retains five copies
 under the game's data folder: save-history/partition1/<relative file>/1.bin

@@ -7,7 +7,7 @@ if(APPLE AND NOT CMAKE_OSX_DEPLOYMENT_TARGET)
     set(CMAKE_OSX_DEPLOYMENT_TARGET 10.15 CACHE STRING "oldest macOS the runtime runs on")
 endif()
 # The single source of the version number (see CHANGELOG.md for the scheme).
-project(GBTGhoulies--QilinRecomp VERSION 0.46.0 LANGUAGES C CXX)
+project(GBTGhoulies--QilinRecomp VERSION 0.47.0 LANGUAGES C CXX)
 
 # ---- Language: C++23 everywhere (recompiler, runtime, generated code) ----
 set(CMAKE_CXX_STANDARD 23)
@@ -32,6 +32,7 @@ elseif(MSVC AND MSVC_VERSION LESS 1940)
 endif()
 
 option(QILIN_WERROR "Treat warnings in our own code as errors" OFF)
+option(QILIN_REQUIRE_LAUNCHER_TESTS "Require Windows launcher test tools (CI)" OFF)
 
 # ---- Zydis (vendored, MIT) ----
 set(ZYDIS_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
@@ -129,13 +130,18 @@ target_link_libraries(qilin_tests PRIVATE qilin_core qilin_warnings)
 qilin_tool(qilin_tests)
 add_test(NAME qilin_tests COMMAND qilin_tests)
 if(WIN32 AND NOT CMAKE_CROSSCOMPILING)
-    find_program(QILIN_POWERSHELL NAMES pwsh powershell)
-    if(QILIN_POWERSHELL)
+    find_program(QILIN_POWERSHELL NAMES powershell pwsh)
+    find_program(QILIN_NINJA NAMES ninja ninja-build)
+    if(QILIN_REQUIRE_LAUNCHER_TESTS AND (NOT QILIN_POWERSHELL OR NOT QILIN_NINJA))
+        message(FATAL_ERROR "Launcher tests need PowerShell and Ninja")
+    endif()
+    if(QILIN_POWERSHELL AND QILIN_NINJA)
         add_executable(qilin_launcher_stub tools/check/launcher_stub.cpp)
         target_link_libraries(qilin_launcher_stub PRIVATE qilin_runtime qilin_warnings)
         add_test(NAME qilin_launcher_check COMMAND "${QILIN_POWERSHELL}" -NoProfile -File
             "${CMAKE_CURRENT_SOURCE_DIR}/tools/check/launcher_check.ps1"
             -Stub "$<TARGET_FILE:qilin_launcher_stub>"
+            -Ninja "${QILIN_NINJA}"
             -Launcher "${CMAKE_CURRENT_SOURCE_DIR}/tools/player-kit/play.ps1"
             -Out "${CMAKE_CURRENT_BINARY_DIR}/launcher-check/$<CONFIG>")
         set_tests_properties(qilin_launcher_check PROPERTIES TIMEOUT 120)
@@ -234,6 +240,12 @@ add_executable(qilin_host_tests recomp/runtime/host/host_tests.cpp
     recomp/runtime/dispatch.cpp tools/player-kit/link_check.cpp)
 target_link_libraries(qilin_host_tests PRIVATE qilin_host qilin_warnings)
 add_test(NAME qilin_host_tests COMMAND qilin_host_tests)
+
+add_executable(qilin_d3d_lifetime_tests recomp/runtime/host/d3d_lifetime_tests.cpp
+    recomp/runtime/dispatch.cpp tools/player-kit/link_check.cpp)
+target_link_libraries(qilin_d3d_lifetime_tests PRIVATE qilin_host qilin_warnings)
+add_test(NAME qilin_d3d_lifetime_tests COMMAND qilin_d3d_lifetime_tests)
+set_tests_properties(qilin_d3d_lifetime_tests PROPERTIES SKIP_RETURN_CODE 77)
 
 # Compile the complete entry point and dispatch in ordinary CI without a disc.
 add_executable(qilin_player_link_check recomp/runtime/host/run.cpp

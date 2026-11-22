@@ -500,6 +500,7 @@ void deliver_frame(Device& d) {
         std::fflush(stdout);
         if (d.config.input) d.config.input->stop_rumble();
         host::shutdown_dsound();
+        host::shutdown_d3d();
         std::exit(0);
     }
 }
@@ -588,6 +589,7 @@ void create_device(rt::Context& c) {
         std::fprintf(stderr, "qilin: can't start the renderer: %s\n", error.c_str());
         if (d->config.input) d->config.input->stop_rumble();
         host::shutdown_dsound();
+        host::shutdown_d3d();
         std::exit(3);
     }
     for (int k = 0; k < 3; ++k)
@@ -953,6 +955,7 @@ void pump_window(const Device& d) {
         std::fflush(stdout);
         if (d.config.input) d.config.input->stop_rumble();
         host::shutdown_dsound();
+        host::shutdown_d3d();
         std::exit(0);
     }
 }
@@ -1057,6 +1060,7 @@ void test_run(Device& d) {
                 std::fflush(stdout);
                 if (d.config.input) d.config.input->stop_rumble();
                 host::shutdown_dsound();
+                host::shutdown_d3d();
                 std::exit(0);
         }
     }
@@ -4009,6 +4013,20 @@ D3dConfig& config_storage() {
 }  // namespace
 
 const D3dConfig& d3d_config() { return config_storage(); }
+
+void shutdown_d3d() {
+    // Device was process-owned via a raw pointer. Explicit destruction is
+    // needed: std::exit bypasses the player's automatic platform objects.
+    std::unique_ptr<Device> owned(std::exchange(g_device, nullptr));
+    if (owned && owned->config.input) owned->config.input->stop_rumble();
+    if (g_capture.log) {
+        std::fclose(g_capture.log);
+        g_capture.log = nullptr;
+        std::fprintf(stderr, "qilin: unfinished capture files remain in %s\n", qilin::utf8_path(g_capture.dir).c_str());
+    }
+    // Menu is destroyed before its renderer; the renderer joins its worker,
+    // waits for the GPU, then finalises caches and releases GPU resources.
+}
 
 void register_d3d(const D3dConfig& config) {
     config_storage() = config;
