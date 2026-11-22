@@ -11,6 +11,20 @@ Each release is a git tag (`vX.Y.Z`) with a matching GitHub release. The version
 
 ## [Unreleased]
 
+## [0.46.0] - 2026-11-22
+
+### Fixed
+- Fixed-address reservations cover the full original address/size range after rounding the base down. For example, `0x51001 + 0x1000` reserves `0x50000..0x53000`, rather than ending before the requested bytes. Zero sizes, overflowing ranges and impossible limits are rejected without altering reservation state; smaller explicit alignments no longer inherit artificial 64 KiB gaps.
+- Zero-length commits are rejected. Zero-length decommit requires the reservation's actual base; successful native decommits return the rounded address/extent to the guest. Native allocation checks commit success and rolls back a failed reservation rather than returning success with unusable memory.
+- A controller ignored while all four ports are full is picked up automatically when another controller disconnects. Controllers already assigned keep their ports; no unplug/replug of the waiting controller is needed.
+
+### Changed
+- Save-history rotation uses a checked streaming copy with a fixed 64 KiB scratch buffer instead of loading each snapshot completely into RAM. Copies use the same flushed temporary-file and atomic-replacement path as settings; failed copies preserve the destination. History I/O now contributes to long-frame file-I/O timings.
+
+### Tests
+- Added allocation/decommit boundary and native-kernel tests, failure rollback under simulated memory pressure, snapshot copy tests across multiple chunks (including Unicode, binary data, empty files and copy-to-self), and a five-controller hotplug test.
+- [Validation record](docs/validation-0.46.md). No complete-game compatibility claim is made.
+
 ## [0.45.1] - 2026-11-22
 
 ### Fixed

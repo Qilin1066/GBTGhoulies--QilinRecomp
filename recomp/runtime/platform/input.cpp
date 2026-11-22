@@ -197,6 +197,13 @@ void Input::detach(uint32_t id) {
         SDL_CloseGamepad(p.pad);
         p = Port{};
         std::printf("qilin_run: controller %u removed\n", n + 1);
+        // A pad ignored while all four ports were occupied can now take the
+        // vacancy. Existing pads keep their ports; no replug is required.
+        int count = 0;
+        SDL_JoystickID* ids = SDL_GetGamepads(&count);
+        for (int i = 0; ids && i < count; ++i) attach(uint32_t(ids[i]));
+        SDL_free(ids);
+        return;
     }
 }
 

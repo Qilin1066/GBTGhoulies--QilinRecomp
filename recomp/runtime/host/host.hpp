@@ -94,7 +94,8 @@ public:
     // back on decommit and release (commit_guest_pages, free_guest_pages).
     void init(uint8_t* ram, uint32_t lo, uint32_t hi, bool host_backed = false);
     // Reserves `size` bytes (rounded up to pages) at `base` (rounded down to
-    // 64 KB), or anywhere free if base is 0, lowest first or highest first.
+    // 64 KB), covering every page of the original base/size range. If base
+    // is 0, choose anywhere free, lowest first or highest first.
     // Returns the base, or 0 if that range isn't free.
     // lowest/highest bound the whole reservation (contiguous allocations' limits).
     uint32_t reserve(uint32_t base, uint32_t size, uint32_t protect, bool top_down, uint32_t align = kGranularity,

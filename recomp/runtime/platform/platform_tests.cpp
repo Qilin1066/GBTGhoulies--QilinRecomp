@@ -39,6 +39,26 @@ int main() {
     std::string unchanged = "untouched";
     CHECK(!read_file(blocked, unchanged) && unchanged == "untouched");
     for (const auto& entry : fs::directory_iterator(root)) CHECK(entry.path().filename().string().find(".tmp.") == std::string::npos);
+    // Save-history copies stream beyond a chunk, preserve bytes and replace
+    // existing destinations. Failures leave the previous destination intact.
+    const auto source = root / fs::path(u8"source-é.bin"), destination = root / "snapshot.bin";
+    std::string contents(200003, '\0');
+    for (size_t i = 0; i < contents.size(); ++i) contents[i] = char((i * 37 + i / 251) & 255);
+    CHECK(atomic_write(source, contents));
+    CHECK(atomic_copy(source, destination));
+    std::string copied;
+    CHECK(read_file(destination, copied) && copied == contents);
+    CHECK(atomic_write(source, "new version") && atomic_copy(source, destination));
+    CHECK(read_file(destination, copied) && copied == "new version");
+    CHECK(!atomic_copy(root / "missing", destination));
+    CHECK(read_file(destination, copied) && copied == "new version");
+    CHECK(!atomic_copy(blocked, destination) && !atomic_copy(source, blocked));
+    CHECK(read_file(destination, copied) && copied == "new version");
+    CHECK(atomic_copy(destination, destination));
+    CHECK(read_file(destination, copied) && copied == "new version");
+    CHECK(atomic_write(source, "") && atomic_copy(source, destination));
+    CHECK(fs::file_size(destination) == 0);
+    for (const auto& entry : fs::directory_iterator(root)) CHECK(entry.path().filename().string().find(".tmp.") == std::string::npos);
     fs::remove_all(root);
 
     CHECK(SDL_Init(SDL_INIT_GAMEPAD | SDL_INIT_EVENTS));
@@ -71,7 +91,30 @@ int main() {
         input.rumble(0, 12345, 23456);
     }
     CHECK(!motors.left && !motors.right); // shutdown
-    CHECK(SDL_DetachVirtualJoystick(id));
+    // A pad ignored at the four-port limit is promoted when a port opens.
+    {
+        std::array<SDL_JoystickID, 4> extra{};
+        for (auto& joystick : extra) joystick = SDL_AttachVirtualJoystick(&desc);
+        Input input;
+        CHECK(input.start() && input.connected_ports() == 15);
+        auto pump = [&] { SDL_Event e; while (SDL_PollEvent(&e)) input.on_event(e); };
+        pump();
+        CHECK(SDL_DetachVirtualJoystick(id));
+        pump();
+        CHECK(input.connected_ports() == 15); // fifth pad took port 0
+        SDL_Joystick* fifth = SDL_OpenJoystick(extra.back());
+        CHECK(fifth != nullptr);
+        if (fifth) {
+            CHECK(SDL_SetJoystickVirtualButton(fifth, SDL_GAMEPAD_BUTTON_SOUTH, true));
+            SDL_UpdateJoysticks(); pump();
+            CHECK(input.state(0).analog[kPadA] == 255);
+            CHECK(input.state(1).analog[kPadA] == 0);
+            SDL_CloseJoystick(fifth);
+        }
+        for (auto joystick : extra) CHECK(SDL_DetachVirtualJoystick(joystick));
+        pump();
+        CHECK(input.connected_ports() == 1); // only the keyboard remains
+    }
     SDL_Quit();
 
     SDL_SetHint(SDL_HINT_AUDIO_DRIVER, "not-a-real-driver");

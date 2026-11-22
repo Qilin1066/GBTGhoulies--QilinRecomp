@@ -220,6 +220,13 @@ Handle* find(uint32_t h) {
 // are deliberately excluded; title saves live on partition 1.
 bool preserve_save(const Device& device, const fs::path& path) {
     if (device.partition != 1) return true;
+    struct HistoryTime {
+        std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
+        ~HistoryTime() {
+            g_io_ns.fetch_add(uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count()),
+                              std::memory_order_relaxed);
+        }
+    } measured; // backup reads/writes belong in the long-frame file-I/O time too
     std::error_code ec;
     const bool exists = fs::exists(path, ec);
     if (ec) return false;
@@ -228,8 +235,7 @@ bool preserve_save(const Device& device, const fs::path& path) {
     fs::create_directories(folder, ec);
     if (ec) return false;
     auto copy = [](const fs::path& from, const fs::path& to) {
-        std::string bytes;
-        return platform::read_file(from, bytes) && platform::atomic_write(to, bytes);
+        return platform::atomic_copy(from, to);
     };
     for (int n = 4; n >= 1; --n) {
         const fs::path previous = folder / (std::to_string(n) + ".bin");

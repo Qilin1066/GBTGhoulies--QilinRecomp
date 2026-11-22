@@ -141,22 +141,28 @@ void nt_allocate_virtual_memory(rt::Context& c) {
             status = base ? kStatusConflictingAddresses : kStatusNoMemory;
             if (!base) out_of_memory("NtAllocateVirtualMemory", size);
         } else {
-            if (type & kMemCommit) v.commit(at, bytes, protect);
-            st(c, pbase, at);
-            st(c, psize, bytes);
+            if ((type & kMemCommit) && !v.commit(at, bytes, protect)) {
+                v.release(at);
+                status = kStatusConflictingAddresses;
+            } else {
+                st(c, pbase, at);
+                st(c, psize, bytes);
+            }
         }
     } else {  // commit inside an existing reservation
         VirtualMemory& v = space_of(base);
         const uint32_t first = base & ~(VirtualMemory::kPage - 1);
-        const uint32_t end = uint32_t((uint64_t(base) + size + VirtualMemory::kPage - 1) & ~uint64_t(VirtualMemory::kPage - 1));
-        if (&v == &virtual_memory() && !physical_room(v.uncommitted_bytes(base, size))) {
+        const uint64_t end = (uint64_t(base) + size + VirtualMemory::kPage - 1) & ~uint64_t(VirtualMemory::kPage - 1);
+        if (end > uint64_t(UINT32_MAX) || end <= first) {
+            status = kStatusInvalidParameter;
+        } else if (&v == &virtual_memory() && !physical_room(v.uncommitted_bytes(base, size))) {
             out_of_memory("NtAllocateVirtualMemory (commit)", size);
             status = kStatusNoMemory;
         } else if (!v.commit(base, size, protect)) {
             status = kStatusConflictingAddresses;
         } else {
             st(c, pbase, first);
-            st(c, psize, end - first);
+            st(c, psize, uint32_t(end - first));
         }
     }
     ret(c, status, 20);
@@ -177,6 +183,13 @@ void nt_free_virtual_memory(rt::Context& c) {
         }
     } else if (type == kMemDecommit) {
         if (!v.decommit(base, size)) status = kStatusMemoryNotAllocated;
+        else {
+            const uint32_t first = base & ~(VirtualMemory::kPage - 1);
+            const uint64_t end = size ? (uint64_t(base) + size + VirtualMemory::kPage - 1) & ~uint64_t(VirtualMemory::kPage - 1)
+                                      : uint64_t(base) + v.region_size(base);
+            st(c, pbase, first);
+            st(c, psize, uint32_t(end - first));
+        }
     } else {
         status = kStatusInvalidParameter;
     }

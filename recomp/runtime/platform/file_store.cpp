@@ -1,5 +1,6 @@
 #include "file_store.hpp"
 #include <span>
+#include <array>
 #include <atomic>
 #include <cerrno>
 #include <cstdio>
@@ -39,8 +40,9 @@ bool read_file(const std::filesystem::path& path, std::string& bytes) {
     return true;
 }
 
-bool atomic_write(const std::filesystem::path& destination, std::string_view text) {
-    const auto bytes = std::span(text.data(), text.size());
+namespace {
+template <typename Write>
+bool replace_file(const std::filesystem::path& destination, Write write) {
     static std::atomic<unsigned> serial{0};
 #ifdef _WIN32
     const int pid = _getpid();
@@ -60,7 +62,7 @@ bool atomic_write(const std::filesystem::path& destination, std::string_view tex
         if (!file && errno != EEXIST) break;
     }
     if (!file) return false;
-    bool ok = std::fwrite(bytes.data(), 1, bytes.size(), file) == bytes.size() && std::fflush(file) == 0;
+    bool ok = write(file) && std::fflush(file) == 0;
 #ifdef _WIN32
     if (ok) ok = _commit(_fileno(file)) == 0;
 #else
@@ -86,5 +88,31 @@ bool atomic_write(const std::filesystem::path& destination, std::string_view tex
         std::filesystem::remove(temporary, ignored);
     }
     return ok;
+}
+} // namespace
+
+bool atomic_write(const std::filesystem::path& destination, std::string_view text) {
+    return replace_file(destination, [&](std::FILE* file) {
+        return std::fwrite(text.data(), 1, text.size(), file) == text.size();
+    });
+}
+
+bool atomic_copy(const std::filesystem::path& source, const std::filesystem::path& destination) {
+    std::error_code ec;
+    if (!std::filesystem::is_regular_file(source, ec) || ec) return false;
+    std::ifstream input(source, std::ios::binary);
+    if (!input) return false;
+    return replace_file(destination, [&](std::FILE* file) {
+        std::array<char, 65536> buffer;
+        for (;;) {
+            input.read(buffer.data(), buffer.size());
+            const auto count = static_cast<size_t>(input.gcount());
+            if (input.bad() || (input.fail() && !input.eof()) || std::fwrite(buffer.data(), 1, count, file) != count) return false;
+            if (input.eof()) break;
+        }
+        // Close before replacement, including when source == destination on Windows.
+        input.clear(); input.close();
+        return !input.fail();
+    });
 }
 } // namespace qilin::platform

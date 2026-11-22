@@ -106,9 +106,13 @@ void VirtualMemory::init(uint8_t* ram, uint32_t lo, uint32_t hi, bool host_backe
 
 uint32_t VirtualMemory::reserve(uint32_t base, uint32_t size, uint32_t protect, bool top_down, uint32_t align, uint32_t lowest,
                                uint32_t highest) {
-    const uint64_t bytes = (uint64_t(size) + kPage - 1) & ~uint64_t(kPage - 1);
-    if (bytes == 0 || bytes > hi_ - lo_ || align == 0 || (align & (align - 1))) return 0;
+    if (!size || hi_ <= lo_ || !align || (align & (align - 1))) return 0;
+    const uint64_t first = base ? base & ~(kGranularity - 1) : 0;
+    const uint64_t end = (uint64_t(base) + size + kPage - 1) & ~uint64_t(kPage - 1);
+    const uint64_t bytes = base ? end - first : end;
+    if (bytes > uint64_t(hi_) - lo_) return 0;
     const uint64_t lim_lo = std::max<uint64_t>(lo_, lowest), lim_hi = std::min<uint64_t>(hi_, uint64_t(highest) + 1);
+    if (lim_hi <= lim_lo || bytes > lim_hi - lim_lo) return 0;
     auto free_at = [&](uint64_t at) {  // [at, at + bytes) inside the range and clear of every reservation
         if (at < lim_lo || at + bytes > lim_hi) return false;
         auto it = regions_.upper_bound(uint32_t(at));
@@ -121,7 +125,7 @@ uint32_t VirtualMemory::reserve(uint32_t base, uint32_t size, uint32_t protect, 
     };
     uint64_t at = 0;
     if (base) {
-        at = base & ~(kGranularity - 1);
+        at = first;
         if (!free_at(at)) return 0;
     } else {
         // Candidate starts: the range's ends and the edges of each reservation.
@@ -130,7 +134,7 @@ uint32_t VirtualMemory::reserve(uint32_t base, uint32_t size, uint32_t protect, 
         auto down = [&](uint64_t v) { return v & ~uint64_t(align - 1); };
         if (!top_down) {
             cands.push_back(up(lim_lo));
-            for (const auto& [b, r] : regions_) cands.push_back(up(uint64_t(b) + ((uint64_t(r.size) + kGranularity - 1) & ~uint64_t(kGranularity - 1))));
+            for (const auto& [b, r] : regions_) cands.push_back(up(uint64_t(b) + r.size));
         } else {
             if (lim_hi >= bytes) cands.push_back(down(lim_hi - bytes));
             for (auto it = regions_.rbegin(); it != regions_.rend(); ++it)
@@ -157,6 +161,7 @@ const std::pair<const uint32_t, VirtualMemory::Region>* VirtualMemory::find(uint
 }
 
 bool VirtualMemory::commit(uint32_t base, uint32_t size, uint32_t protect) {
+    if (!size) return false;
     const uint32_t first = base & ~(kPage - 1);
     const uint64_t end = (uint64_t(base) + size + kPage - 1) & ~uint64_t(kPage - 1);
     const auto* r = find(first);
@@ -174,7 +179,7 @@ bool VirtualMemory::commit(uint32_t base, uint32_t size, uint32_t protect) {
 bool VirtualMemory::decommit(uint32_t base, uint32_t size) {
     const uint32_t first = base & ~(kPage - 1);
     const auto* r = find(first);
-    if (!r) return false;
+    if (!r || (!size && base != r->first)) return false;
     const uint64_t end = size ? (uint64_t(base) + size + kPage - 1) & ~uint64_t(kPage - 1) : uint64_t(r->first) + r->second.size;
     if (end > uint64_t(r->first) + r->second.size) return false;
     auto& pages = const_cast<Region&>(r->second).page_protect;

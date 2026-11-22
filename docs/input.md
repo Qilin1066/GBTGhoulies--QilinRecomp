@@ -30,7 +30,7 @@ Any controller SDL3 knows (Xbox, PlayStation, Switch and generic pads, over USB 
 | Sticks, stick clicks | The sticks (y turned to positive up), stick clicks |
 | D-pad, Start, Back | D-pad, Menu (Start), View (Back) |
 
-The original controller's face, Black and White buttons are pressure-sensitive; SDL's buttons aren't, so a press reads fully pressed (255). Controllers take the lowest free port as they connect and keep it until they're removed; the player light, where a controller has one, shows the port. Controllers are read while the window is in the background, too.
+The original controller's face, Black and White buttons are pressure-sensitive; SDL's buttons aren't, so a press reads fully pressed (255). Controllers take the lowest free port as they connect and keep it until they're removed; the player light, where a controller has one, shows the port. Controllers are read while the window is in the background, too. Since v0.46.0, a gamepad waiting at the four-port limit automatically takes a port when one opens; already assigned pads keep their ports.
 
 Rumble: the Xbox's left motor is the low-frequency one, as SDL's. SDL's rumble runs for a set time (at most about a minute); the game sends its rumble every frame, so it lasts until the game changes it, as on the console.
 

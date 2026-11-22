@@ -175,6 +175,35 @@ int main() {
     CHECK(v.decommit(r1 + 0x1000, 0x1000) && v.commit(r1 + 0x1000, 1, 4) && vram[r1 + 0x1000] == 0);  // recommitted: zero again
     CHECK(v.release(r1) && !v.release(r1) && v.reserve(0, 0x1000, 4, false) == 0x10000);
 
+    // Reserve the full original range, not just size bytes after rounding
+    // a fixed base down. Validate before changing reservation/page state.
+    {
+        host::VirtualMemory ranges;
+        ranges.init(vram.get(), 0x10000, 0x100000);
+        const auto at = ranges.reserve(0x51001, 0x1000, 4, false);
+        CHECK(at == 0x50000 && ranges.region_size(at) == 0x3000);
+        CHECK(ranges.commit(0x51001, 0x1000, 4));
+        CHECK(ranges.query(0x52000)->state == host::VirtualMemory::kMemCommit);
+        vram[0x52000] = 0x77;
+        CHECK(ranges.commit(0x52000, 1, 4) && vram[0x52000] == 0x77);
+        CHECK(!ranges.commit(0x52001, 0, 4));
+        const auto committed = ranges.committed_bytes();
+        CHECK(!ranges.decommit(0x51000, 0) && ranges.committed_bytes() == committed);
+        CHECK(!ranges.commit(0xfffffff0, 0x100, 4));
+        CHECK(!ranges.decommit(at, 0xffffffff));
+        CHECK(ranges.committed_bytes() == committed);
+        CHECK(ranges.decommit(at, 0) && ranges.committed_bytes() == 0);
+        CHECK(ranges.commit(0x52000, 1, 4) && vram[0x52000] == 0);
+        CHECK(!ranges.reserve(0xfffff000, 0x2000, 4, false));
+        CHECK(!ranges.reserve(0x50001, 0, 4, false));
+        CHECK(!ranges.reserve(0, 0x1000, 4, false, 3));
+        CHECK(!ranges.reserve(0, 0x1000, 4, false, 0x1000, 0x90000, 0x80000));
+        host::VirtualMemory dense;
+        dense.init(vram.get(), 0x10000, 0x100000);
+        CHECK(dense.reserve(0, 0x1000, 4, false, 0x1000) == 0x10000);
+        CHECK(dense.reserve(0, 0x1000, 4, false, 0x1000) == 0x11000);
+    }
+
     // Guest RAM: the same pages at 0, 0x80000000 and 0xF0000000, zero to start.
     {
         std::string error;
@@ -216,6 +245,40 @@ int main() {
             std::fprintf(stderr, "map_guest_ram: %s\n", error.c_str());
         }
         rt::g_ram_aliases = false;
+    }
+
+    // Exercise native allocation/decommit out-parameters and failure rollback.
+    {
+        Guest guest;
+        host::register_kernel();
+        host::vm().init(guest.ram.get(), 0x10000, 0x80000);
+        host::virtual_memory().init(guest.ram.get(), 0x80000, 0x100000);
+        const auto base = guest.alloc(4), size = guest.alloc(4);
+        guest.put32(base, 0x91001); guest.put32(size, 0x1000);
+        CHECK(guest.call("NtAllocateVirtualMemory", {base, 0, size, 0x3000, 4}) == 0);
+        CHECK(guest.u32(base) == 0x90000 && guest.u32(size) == 0x3000);
+        CHECK(host::virtual_memory().query(0x92000)->state == host::VirtualMemory::kMemCommit);
+        guest.put32(base, 0x91001); guest.put32(size, 1);
+        CHECK(guest.call("NtFreeVirtualMemory", {base, size, 0x4000}) == 0);
+        CHECK(guest.u32(base) == 0x91000 && guest.u32(size) == 0x1000);
+        guest.put32(base, 0x91000); guest.put32(size, 0);
+        CHECK(guest.call("NtFreeVirtualMemory", {base, size, 0x4000}) == 0xC00000A0);
+        CHECK(guest.u32(base) == 0x91000 && guest.u32(size) == 0);
+        guest.put32(base, 0x90000); guest.put32(size, 0);
+        CHECK(guest.call("NtFreeVirtualMemory", {base, size, 0x4000}) == 0);
+        CHECK(guest.u32(base) == 0x90000 && guest.u32(size) == 0x3000);
+        guest.put32(size, 0);
+        CHECK(guest.call("NtFreeVirtualMemory", {base, size, 0x8000}) == 0);
+        guest.put32(base, 0xfffff000); guest.put32(size, 0x2000);
+        CHECK(guest.call("NtAllocateVirtualMemory", {base, 0, size, 0x1000, 4}) == 0xC000000D);
+        CHECK(guest.u32(base) == 0xfffff000 && guest.u32(size) == 0x2000);
+        // More committed virtual pages than physical RAM: no orphan reservation.
+        guest.put32(base, 0); guest.put32(size, 0x80000);
+        CHECK(guest.call("NtAllocateVirtualMemory", {base, 0, size, 0x3000, 4}) == 0xC0000017);
+        CHECK(host::virtual_memory().reserved_bytes() == 0);
+        CHECK(guest.u32(base) == 0 && guest.u32(size) == 0x80000);
+        host::vm().init(nullptr, 0, 0);
+        host::virtual_memory().init(nullptr, 0, 0);
     }
 
     // The I/O manager, over a disc and a hard disk in a scratch directory.
@@ -280,7 +343,9 @@ int main() {
         const auto save_name = g.attributes("\\Device\\Harddisk0\\Partition1\\save.dat");
         const auto history = root / "hdd" / "save-history" / "partition1" / "save.dat";
         for (uint32_t version = 1; version <= 6; ++version) {
+            host::take_file_read_ns();
             CHECK(g.call("NtCreateFile", {handle, 0xC0100000, save_name, iosb, 0, 0x80, 0, 5, 0x60}) == 0);
+            CHECK(host::take_file_read_ns() > 0); // history I/O is included before the new file is written
             const auto out = g.u32(handle);
             g.ram[text] = uint8_t('0' + version);
             CHECK(g.call("NtWriteFile", {out, 0, 0, 0, iosb, text, 1, 0}) == 0);
