@@ -11,6 +11,9 @@ Each release is a git tag (`vX.Y.Z`) with a matching GitHub release. The version
 
 ## [Unreleased]
 
+### Fixed
+- The launcher's file hashes resolve a relative path against PowerShell's current folder, as `Get-FileHash` did; .NET alone resolves against the process's folder.
+
 ## [0.48.0] - 2026-11-22
 
 ### Changed
