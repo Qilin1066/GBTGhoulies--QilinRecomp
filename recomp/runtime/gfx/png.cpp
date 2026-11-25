@@ -4,12 +4,16 @@
 // stored block when neither saves anything), for saving frames in tests and
 // from qilin_run. No dependencies.
 #include <algorithm>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <functional>
+#include <mutex>
 #include <queue>
+#include <thread>
 #include <utility>
 
 #include "gfx.hpp"
@@ -461,5 +465,73 @@ bool write_png(const std::string& path, const Image& image) {
     const bool ok = std::fwrite(out.data(), 1, out.size(), f) == out.size();
     return std::fclose(f) == 0 && ok;
 }
+
+namespace {
+
+// One thread that writes queued images in order. Whoever queues waits only
+// while the images not yet written hold more than kMaxQueued bytes, so a run
+// that makes frames faster than they compress (--dump-frames) is slowed to
+// the writer's pace instead of filling memory.
+class Writer {
+public:
+    static constexpr size_t kMaxQueued = size_t(256) << 20;
+
+    void add(std::string path, Image image) {
+        std::unique_lock lock(mutex_);
+        if (!thread_.joinable()) thread_ = std::thread([this] { run(); });
+        done_.wait(lock, [&] { return queued_bytes_ < kMaxQueued; });
+        queued_bytes_ += image.rgba.size();
+        queue_.emplace_back(std::move(path), std::move(image));
+        work_.notify_one();
+    }
+    void finish() {
+        std::unique_lock lock(mutex_);
+        done_.wait(lock, [&] { return queue_.empty() && !busy_; });
+    }
+    ~Writer() {  // at exit: what's queued is still written
+        {
+            std::lock_guard lock(mutex_);
+            stop_ = true;
+        }
+        work_.notify_one();
+        if (thread_.joinable()) thread_.join();
+    }
+
+private:
+    void run() {
+        std::unique_lock lock(mutex_);
+        for (;;) {
+            work_.wait(lock, [&] { return stop_ || !queue_.empty(); });
+            if (queue_.empty()) return;
+            auto [path, image] = std::move(queue_.front());
+            queue_.pop_front();
+            busy_ = true;
+            lock.unlock();
+            if (!write_png(path, image)) std::fprintf(stderr, "qilin: can't write %s\n", path.c_str());
+            lock.lock();
+            queued_bytes_ -= image.rgba.size();
+            busy_ = false;
+            done_.notify_all();
+        }
+    }
+
+    std::mutex mutex_;
+    std::condition_variable work_, done_;
+    std::deque<std::pair<std::string, Image>> queue_;
+    size_t queued_bytes_ = 0;
+    bool busy_ = false, stop_ = false;
+    std::thread thread_;
+};
+
+Writer& writer() {
+    static Writer w;
+    return w;
+}
+
+}  // namespace
+
+void write_png_later(std::string path, Image image) { writer().add(std::move(path), std::move(image)); }
+
+void finish_png_writes() { writer().finish(); }
 
 }  // namespace qilin::gfx

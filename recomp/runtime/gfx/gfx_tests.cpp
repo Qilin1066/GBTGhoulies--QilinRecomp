@@ -3,6 +3,9 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
+#include <filesystem>
+#include <fstream>
+#include <iterator>
 #include <string>
 
 #include "gfx.hpp"
@@ -29,6 +32,36 @@ bool pixel_is(const gfx::Image& im, uint32_t x, uint32_t y, uint8_t r, uint8_t g
 }  // namespace
 
 int main(int argc, char** argv) {
+    // The PNG writer (no GPU needed): a picture with flat, smooth and noisy
+    // parts compresses; noise alone is stored at little more than its size;
+    // the worker thread writes the same bytes as the direct call, every file
+    // done once finish_png_writes returns. (CI decodes nothing; the encoder
+    // was checked against zlib's inflate on captured frames.)
+    {
+        const auto file = [](const std::filesystem::path& p) {
+            std::ifstream in(p, std::ios::binary);
+            return std::string((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+        };
+        gfx::Image scene{300, 200, {}}, noise{97, 61, {}};
+        uint32_t seed = 1;
+        const auto next = [&] { return seed = seed * 1664525u + 1013904223u, uint8_t(seed >> 24); };
+        for (uint32_t y = 0; y < scene.height; ++y)
+            for (uint32_t x = 0; x < scene.width; ++x)
+                for (uint8_t v : {uint8_t(y < 50 ? 0 : x), uint8_t(y), uint8_t(y > 150 ? next() : x + y), uint8_t(255)}) scene.rgba.push_back(v);
+        for (size_t i = 0; i < size_t(noise.width) * noise.height * 4; ++i) noise.rgba.push_back(next());
+        const std::filesystem::path dir = std::filesystem::temp_directory_path() / ("qilin_png_" + std::to_string(seed));
+        std::filesystem::create_directories(dir);
+        CHECK(gfx::write_png((dir / "scene.png").string(), scene) && gfx::write_png((dir / "noise.png").string(), noise));
+        for (int i = 0; i < 4; ++i) gfx::write_png_later((dir / ("later" + std::to_string(i) + ".png")).string(), i % 2 ? noise : scene);
+        gfx::finish_png_writes();
+        const std::string a = file(dir / "scene.png"), b = file(dir / "noise.png");
+        CHECK(a.size() > 8 && a.compare(0, 8, "\x89PNG\r\n\x1A\n") == 0 && a.size() < scene.rgba.size() / 3);
+        CHECK(b.size() > noise.rgba.size() && b.size() < noise.rgba.size() + noise.height + 200);
+        for (int i = 0; i < 4; ++i) CHECK(file(dir / ("later" + std::to_string(i) + ".png")) == (i % 2 ? b : a));
+        CHECK(!gfx::write_png((dir / "none" / "x.png").string(), scene));  // no such folder
+        std::error_code ec;
+        std::filesystem::remove_all(dir, ec);
+    }
     // Vertex programs, before the renderer (no GPU needed): one of the game's
     // shaders as the lifted XGAssembleShader assembles it. Its source:
     //   dp4 r0, v0, c5 / m4x4 oPos, v0, c0 / sge r1.w, r0, c10 / m4x4 oT0, v0, c6 / mul oD0, r1.w, c4

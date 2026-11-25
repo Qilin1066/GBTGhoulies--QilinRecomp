@@ -314,7 +314,12 @@ public:
     virtual uint32_t resolution_scale_y() const = 0;
 };
 
-// Writes an image as a PNG (uncompressed). False if the file can't be written.
+// Writes an image as a PNG (deflated). False if the file can't be written.
 bool write_png(const std::string& path, const Image& image);
+// The same on a worker thread, in the order queued; a write that fails is
+// reported on stderr. finish_png_writes returns once every queued image is
+// written; whatever is still queued at exit is written then.
+void write_png_later(std::string path, Image image);
+void finish_png_writes();
 
 }  // namespace qilin::gfx
