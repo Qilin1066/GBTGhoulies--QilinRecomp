@@ -998,9 +998,10 @@ bool g_capture_wanted = false;  // a test run asks for a capture
 // lines are played, each "SECONDS what": `key NAME [held SECONDS]` holds a
 // key (SDL's name, as in the settings file; a quarter of a second unless
 // said), `capture` is F9, `quit` ends the run. Seconds count from the first
-// frame. The file is renamed selftest.ran first, so it runs once. It lets a
-// build be tried on a player's machine, on their GPU, without them playing
-// it: the log and the captures say what happened.
+// frame, leaving out the time captures take. The file is renamed
+// selftest.ran first, so it runs once. It lets a build be tried on a
+// player's machine, on their GPU, without them playing it: the log and the
+// captures say what happened.
 struct TestStep {
     double at = 0;
     enum What : uint8_t { Down, Up, Capture, Quit } what = Down;
@@ -1045,7 +1046,17 @@ void test_run(Device& d) {
         return true;
     }();
     if (!loaded) return;
-    const double now = std::chrono::duration<double>(std::chrono::steady_clock::now() - began).count();
+    // The script's clock stands still through a capture, as the game's step
+    // does: a captured frame takes from hundreds of milliseconds to seconds
+    // (more at high render resolutions and on slow disks), and on the wall
+    // clock the steps after it would land while the game had barely moved.
+    // The frame after a capture's last spans its packing and is held too:
+    // capture_step, which runs after this, clears g_capture_holds_step then.
+    static auto last = began;
+    static double now = 0;
+    const auto tick = std::chrono::steady_clock::now();
+    if (!g_capture_holds_step) now += std::chrono::duration<double>(tick - last).count();
+    last = tick;
     for (; next < steps.size() && steps[next].at <= now; ++next) {
         const TestStep& s = steps[next];
         switch (s.what) {

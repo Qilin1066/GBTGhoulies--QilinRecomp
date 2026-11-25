@@ -12,6 +12,7 @@ Each release is a git tag (`vX.Y.Z`) with a matching GitHub release. The version
 ## [Unreleased]
 
 ### Fixed
+- **A test run's clock stands still through a capture**, as the game's step does. On the wall clock, a capture that took 30 s (twelve 3440×1440 frames at 2-5 s each) let the script's next 30 s of steps land while the game moved 12 frames: in a 372 s run on a GTX 1080 Ti the game moved 70 frames between the first capture, at 205 s, and the end, and the script's later inputs and captures tested nothing.
 - The launcher's file hashes resolve a relative path against PowerShell's current folder, as `Get-FileHash` did; .NET alone resolves against the process's folder.
 
 ## [0.48.0] - 2026-11-22
