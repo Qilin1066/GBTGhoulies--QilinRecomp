@@ -351,17 +351,21 @@ mad oPos.xyz, oPos.xyzz, r1.x, c-37.xyzz
             };
             const gfx::TextureData cpu = gfx::decode_texture(shape, blocks.data());
             const uint32_t tex = r->create_texture(gfx::texture_blocks(shape, blocks.data()));
-            // The GPU's interpolation may round the thirds and fifths differently by 1 or 2.
+            // The GPU's interpolation may round the thirds, fifths and sevenths
+            // differently: BC decoding leaves its precision to the hardware.
+            // Mesa's lavapipe is within 2 of the decoder; a GTX 1080 Ti within
+            // 4 (DXT1 and DXT3 colours) and 3 (DXT5).
+            constexpr int kBcTolerance = 4;
             const int worst = drawn(tex, cpu);
-            if (worst > 2) std::fprintf(stderr, "DXT format %#x: the GPU's texels differ from the decoder's by up to %d\n", kd.code, worst);
-            CHECK(worst <= 2);
+            if (worst > kBcTolerance) std::fprintf(stderr, "DXT format %#x: the GPU's texels differ from the decoder's by up to %d\n", kd.code, worst);
+            CHECK(worst <= kBcTolerance);
             // New blocks into the same image (update_texture), then the decoded
             // texels as RGBA, made and updated: exact.
             std::vector<uint8_t> next(blocks.size());
             for (auto& v : next) v = rnd();
             const gfx::TextureData cpu2 = gfx::decode_texture(shape, next.data());
             CHECK(r->update_texture(tex, gfx::texture_blocks(shape, next.data())));
-            CHECK(drawn(tex, cpu2) <= 2);
+            CHECK(drawn(tex, cpu2) <= kBcTolerance);
             CHECK(!r->update_texture(tex, cpu2));  // another shape (RGBA): refused
             r->destroy_texture(tex);
             const uint32_t plain = r->create_texture(cpu);

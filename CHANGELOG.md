@@ -12,6 +12,8 @@ Each release is a git tag (`vX.Y.Z`) with a matching GitHub release. The version
 ## [Unreleased]
 
 ### Fixed
+- **Captures (F9) 15-30 times as fast at high render resolutions**: the frame read-back buffer is cached memory where the GPU offers it (it was write-combined, so the CPU read each byte of it over the bus), and its pixels are copied out in one pass before they're averaged or reordered. On a GTX 1080 Ti at 3200×1440, a captured frame took 2-8 s (median 3.0 s) and now takes 0.1 s, 0.23 s for the first frames, which are also saved at the render resolution. The same script ran its 8 captures to the same frame.
+- `qilin_gfx_tests` allows the GPU's BC1-3 decoding to differ from the decoder's by 4 levels, not 2: NVIDIA's hardware rounds the interpolated colours further from the exact thirds than Mesa's lavapipe (by 4 on a GTX 1080 Ti), which BC decoding allows. The test failed on NVIDIA GPUs.
 - **A test run's clock stands still through a capture**, as the game's step does. On the wall clock, a capture that took 30 s (twelve 3440×1440 frames at 2-5 s each) let the script's next 30 s of steps land while the game moved 12 frames: in a 372 s run on a GTX 1080 Ti the game moved 70 frames between the first capture, at 205 s, and the end, and the script's later inputs and captures tested nothing.
 - The launcher's file hashes resolve a relative path against PowerShell's current folder, as `Get-FileHash` did; .NET alone resolves against the process's folder.
 

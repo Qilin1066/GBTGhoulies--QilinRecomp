@@ -2046,10 +2046,20 @@ Image VulkanRenderer::read(Target& t, bool full) {
         check(vkCreateBuffer(device_, &info, nullptr, &readback_), "vkCreateBuffer");
         VkMemoryRequirements req{};
         vkGetBufferMemoryRequirements(device_, readback_, &req);
+        // Cached memory where there is some: the CPU reads this buffer, and
+        // memory that is only host-visible is write-combined on desktop GPUs,
+        // where every read goes over the bus uncached. Reading a 3200x1440
+        // frame from it took 2 s on a GTX 1080 Ti.
+        const VkMemoryPropertyFlags visible = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+        uint32_t type = UINT32_MAX;
+        for (uint32_t i = 0; i < memory_.memoryTypeCount && type == UINT32_MAX; ++i)
+            if ((req.memoryTypeBits & (1u << i)) &&
+                (memory_.memoryTypes[i].propertyFlags & (visible | VK_MEMORY_PROPERTY_HOST_CACHED_BIT)) == (visible | VK_MEMORY_PROPERTY_HOST_CACHED_BIT))
+                type = i;
+        if (type == UINT32_MAX) type = memory_type(req.memoryTypeBits, visible);
         VkMemoryAllocateInfo alloc{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
         alloc.allocationSize = req.size;
-        alloc.memoryTypeIndex =
-            memory_type(req.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+        alloc.memoryTypeIndex = type;
         check(vkAllocateMemory(device_, &alloc, nullptr, &readback_memory_), "vkAllocateMemory");
         check(vkBindBufferMemory(device_, readback_, readback_memory_, 0), "vkBindBufferMemory");
     }
@@ -2065,25 +2075,30 @@ Image VulkanRenderer::read(Target& t, bool full) {
     submit();
     wait_idle();
 
+    // Out of the mapping in one sequential copy, then worked on in ordinary
+    // memory: if the buffer had to be uncached, strided byte reads from it
+    // would each be a trip over the bus.
+    std::vector<uint8_t> host(static_cast<size_t>(bytes));
+    {
+        void* mapped = nullptr;
+        check(vkMapMemory(device_, readback_memory_, 0, bytes, 0, &mapped), "vkMapMemory");
+        std::memcpy(host.data(), mapped, host.size());
+        vkUnmapMemory(device_, readback_memory_);
+    }
+    const uint8_t* bgra = host.data();
+
     Image out;
     if (full) {  // as rendered
         out.width = t.width, out.height = t.height;
         out.rgba.resize(size_t(out.width) * out.height * 4);
-        void* mapped = nullptr;
-        check(vkMapMemory(device_, readback_memory_, 0, bytes, 0, &mapped), "vkMapMemory");
-        const uint8_t* bgra = static_cast<const uint8_t*>(mapped);
         for (size_t i = 0; i < size_t(t.width) * t.height; ++i)
             out.rgba[i * 4] = bgra[i * 4 + 2], out.rgba[i * 4 + 1] = bgra[i * 4 + 1], out.rgba[i * 4 + 2] = bgra[i * 4], out.rgba[i * 4 + 3] = bgra[i * 4 + 3];
-        vkUnmapMemory(device_, readback_memory_);
         return out;
     }
     // At the game's size: each pixel the average of the sx × sy it became.
     out.width = t.width / t.sx;
     out.height = t.height / t.sy;
     out.rgba.resize(size_t(out.width) * out.height * 4);
-    void* mapped = nullptr;
-    check(vkMapMemory(device_, readback_memory_, 0, bytes, 0, &mapped), "vkMapMemory");
-    const uint8_t* bgra = static_cast<const uint8_t*>(mapped);
     const uint32_t n = t.sx * t.sy;
     for (uint32_t y = 0; y < out.height; ++y)
         for (uint32_t x = 0; x < out.width; ++x) {
@@ -2095,7 +2110,6 @@ Image VulkanRenderer::read(Target& t, bool full) {
             uint8_t* o = &out.rgba[(size_t(y) * out.width + x) * 4];
             for (int k = 0; k < 4; ++k) o[k] = uint8_t((sum[k] + n / 2) / n);
         }
-    vkUnmapMemory(device_, readback_memory_);
     return out;
 }
 
