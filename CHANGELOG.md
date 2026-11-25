@@ -11,6 +11,9 @@ Each release is a git tag (`vX.Y.Z`) with a matching GitHub release. The version
 
 ## [Unreleased]
 
+### Changed
+- **Frames are saved as compressed PNGs**, so a capture is a file a player can send: the writer has its own deflate (per-row PNG filters, LZ77 over a 32 KiB window, dynamic or fixed Huffman codes, a stored block where neither saves anything) in place of stored blocks only. On captured frames, a 3200×1440 one went from 18.4 MB to 2.0 MB and a 640×480 one from 1.23 MB to 0.24 MB, so a capture from 76 MB to about 13 MB. Writing takes longer (0.4 s instead of 0.1 s for the large frame, 40 ms instead of 8 ms for the small one); a test run's clock and the game's step are held through a capture regardless. `--dump` writes its frames the same way. Python's zlib decodes them to the same pixels, as it does noise (kept stored), a flat frame and a 1×1 one.
+
 ### Fixed
 - **Captures (F9) 15-30 times as fast at high render resolutions**: the frame read-back buffer is cached memory where the GPU offers it (it was write-combined, so the CPU read each byte of it over the bus), and its pixels are copied out in one pass before they're averaged or reordered. On a GTX 1080 Ti at 3200×1440, a captured frame took 2-8 s (median 3.0 s) and now takes 0.1 s, 0.23 s for the first frames, which are also saved at the render resolution. The same script ran its 8 captures to the same frame.
 - `qilin_gfx_tests` allows the GPU's BC1-3 decoding to differ from the decoder's by 4 levels, not 2: NVIDIA's hardware rounds the interpolated colours further from the exact thirds than Mesa's lavapipe (by 4 on a GTX 1080 Ti), which BC decoding allows. The test failed on NVIDIA GPUs.
