@@ -16,6 +16,11 @@ Each release is a git tag (`vX.Y.Z`) with a matching GitHub release. The version
 - `qilin_gfx_tests` allows the GPU's BC1-3 decoding to differ from the decoder's by 4 levels, not 2: NVIDIA's hardware rounds the interpolated colours further from the exact thirds than Mesa's lavapipe (by 4 on a GTX 1080 Ti), which BC decoding allows. The test failed on NVIDIA GPUs.
 - **A test run's clock stands still through a capture**, as the game's step does. On the wall clock, a capture that took 30 s (twelve 3440×1440 frames at 2-5 s each) let the script's next 30 s of steps land while the game moved 12 frames: in a 372 s run on a GTX 1080 Ti the game moved 70 frames between the first capture, at 205 s, and the end, and the script's later inputs and captures tested nothing.
 - The launcher's file hashes resolve a relative path against PowerShell's current folder, as `Get-FileHash` did; .NET alone resolves against the process's folder.
+- Guest file names can no longer reach host files outside the disc or the data folder. `..` was refused, but a component such as `bundles/../../x` passed whole to the host, which split it at `/` (and, on Windows, `C:x` named another drive). A component holding `/`, `:` or a NUL now fails with `STATUS_OBJECT_NAME_INVALID`; neither FATX nor the disc's file system allows those characters, so the game's own names are unaffected.
+- `NtQueryDirectoryFile` answers `STATUS_NO_SUCH_FILE`, not `STATUS_NO_MORE_FILES`, when a mask matches nothing in a directory that isn't empty, as XAPI's `FindFirstFile` expects (`ERROR_FILE_NOT_FOUND`).
+
+### Tests
+- The I/O manager refuses separator, drive and NUL names on the disc and the hard disk (nothing is created outside the partition), and a mask that matches nothing is "no such file" on a fresh or restarted scan, while a restart with a matching mask finds its entry again.
 
 ## [0.48.0] - 2026-11-22
 

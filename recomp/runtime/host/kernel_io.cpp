@@ -140,8 +140,10 @@ void note_missing(const Resolved& r) {
 }
 
 // An object name, relative to `root` (an object name too) if it isn't
-// absolute, through symbolic links to a device and a host path.
-std::optional<Resolved> resolve(std::string name, const std::string& root) {
+// absolute, through symbolic links to a device and a host path. A name that
+// can't be resolved sets *status: STATUS_OBJECT_NAME_INVALID for a component
+// the host would read as more than one name, else STATUS_OBJECT_PATH_NOT_FOUND.
+std::optional<Resolved> resolve(std::string name, const std::string& root, uint32_t* status) {
     if (!root.empty() && (name.empty() || name[0] != '\\')) name = root + (root.back() == '\\' ? "" : "\\") + name;
     for (int depth = 0; depth < 8; ++depth) {  // a link may point at another link
         const std::string low = lower(name);
@@ -173,13 +175,24 @@ std::optional<Resolved> resolve(std::string name, const std::string& root) {
             }
             const size_t end = rest.find('\\', at);
             const std::string comp = rest.substr(at, end == std::string::npos ? std::string::npos : end - at);
-            if (comp == "..") return std::nullopt;  // never leave the device's directory
+            if (comp == "..") {  // never leave the device's directory
+                *status = kPathNotFound;
+                return std::nullopt;
+            }
+            // Nor through a host separator or drive (a '/' anywhere, "C:" on
+            // Windows), or a NUL the host would end the name at. FATX and the
+            // disc's file system allow none of them in a name.
+            if (comp.find_first_of(std::string_view("/:\0", 3)) != std::string::npos) {
+                *status = kObjectNameInvalid;
+                return std::nullopt;
+            }
             if (comp != ".") p = child(p, comp);
             at = end == std::string::npos ? rest.size() : end;
         }
         r.host = p;
         return r;
     }
+    *status = kPathNotFound;
     return std::nullopt;
 }
 
@@ -198,7 +211,7 @@ struct Handle {
     bool formatting = false;  // a raw partition handle that has written a FATX volume header
     std::vector<fs::directory_entry> entries;  // directory enumeration, filled on first query
     size_t cursor = 0;
-    bool scanned = false;
+    bool scanned = false, returned = false;  // returned: an entry has matched since the scan began
     std::string mask;
 };
 std::map<uint32_t, Handle>& handles() {
@@ -266,8 +279,7 @@ std::optional<Resolved> resolve_attributes(const rt::Context& c, uint32_t oa, ui
         base = h->object;
     }
     const std::string object = ansi(c, name);
-    auto r = resolve(object, base);
-    if (!r) *status = kPathNotFound;
+    auto r = resolve(object, base, status);
     // With QILIN_TRACE_HLE set, the trace shows each name and where it went.
     static const bool trace = [] {
         const char* v = std::getenv("QILIN_TRACE_HLE");
@@ -865,12 +877,16 @@ void nt_query_directory_file(rt::Context& c) {
         for (const auto& e : fs::directory_iterator(h->host, ec)) h->entries.push_back(e);
         std::ranges::sort(h->entries, {}, [](const fs::directory_entry& e) { return lower(e.path().filename().string()); });
         h->cursor = 0;
+        h->returned = false;
         if (mask || !h->scanned) h->mask = ansi(c, mask);
         h->scanned = true;
     }
     while (h->cursor < h->entries.size() && !wildcard(h->mask, h->entries[h->cursor].path().filename().string())) ++h->cursor;
     if (h->cursor >= h->entries.size()) {
-        const uint32_t status = h->entries.empty() || h->cursor == 0 ? kNoSuchFile : kNoMoreFiles;
+        // Nothing matched since the scan began: no such file, as for an
+        // empty directory (a mask that skipped every entry used to leave the
+        // cursor at the end and read as "no more files").
+        const uint32_t status = h->returned ? kNoMoreFiles : kNoSuchFile;
         io_status(c, iosb, status, 0);
         ret(c, status, 40);
         return;
@@ -893,6 +909,7 @@ void nt_query_directory_file(rt::Context& c) {
     const uint32_t fit = std::min<uint32_t>(uint32_t(name.size()), len - 64);
     for (uint32_t k = 0; k < fit; ++k) rt::st8(mem(c), out + 64 + k, uint8_t(name[k]), 0);
     ++h->cursor;
+    h->returned = true;
     const uint32_t status = fit < name.size() ? kBufferOverflow : kSuccess;
     io_status(c, iosb, status, std::min(need, len));
     ret(c, status, 40);

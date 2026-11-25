@@ -103,7 +103,7 @@ Replacements read stdcall arguments with `host::arg(c, i)` and return with `host
 | `\Device\Harddisk0\Partition0` | The whole disk, raw. Its first 512 KB, the configuration area, is the file `partition0.bin` (sparse: unwritten sectors read as zero). It holds the cache partition database that XAPI reads and writes at start-up |
 | `\??\D:` and the other drive letters | Symbolic links made by `IoCreateSymbolicLink`, followed when names resolve |
 
-Names are matched case-insensitively, as on FATX and the disc's XDVDFS (an exact match first), relative to a handle or to `ObDosDevicesDirectory()` (`D:\…` names), and can't climb out of a device with `..`.
+Names are matched case-insensitively, as on FATX and the disc's XDVDFS (an exact match first), relative to a handle or to `ObDosDevicesDirectory()` (`D:\…` names), and can't climb out of a device with `..`, nor through a component holding a host separator (`/`), a drive name (`:`) or a NUL, which fail as `STATUS_OBJECT_NAME_INVALID`. A directory query whose mask matches nothing since its scan began answers `STATUS_NO_SUCH_FILE`; once something has matched, the end is `STATUS_NO_MORE_FILES`.
 
 | Kernel function | Implementation |
 |---|---|
@@ -149,7 +149,7 @@ In the runs so far the game starts no threads of its own (`qilin_run` prints eac
 
 ## Tests
 
-`qilin_host_tests` (CI, no game files) covers the kernel export table, a replacement called through `rt::call_unlifted` with stdcall argument popping, `describe()`, virtual memory (granularity, top-down reservations, commit zeroing, queries, release), and the file system on a scratch disc and hard disk: links, case-insensitive names, reads at offsets and to the end, the read-only disc, `..`, directory masks, creating and writing a save, attributes, formatting a cache partition, and the configuration area.
+`qilin_host_tests` (CI, no game files) covers the kernel export table, a replacement called through `rt::call_unlifted` with stdcall argument popping, `describe()`, virtual memory (granularity, top-down reservations, commit zeroing, queries, release), and the file system on a scratch disc and hard disk: links, case-insensitive names, reads at offsets and to the end, the read-only disc, `..` and host separators in names, directory masks (one that matches nothing), creating and writing a save, attributes, formatting a cache partition, and the configuration area.
 
 ## Next
 

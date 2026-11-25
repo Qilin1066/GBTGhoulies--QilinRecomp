@@ -362,6 +362,19 @@ int main() {
         CHECK(g.call("NtOpenFile", {handle, 0x40100000, g.attributes("D:\\bundles\\common.bnl", kDos), iosb, 0, 0x60}) == 0xC00000A2);
         CHECK(g.call("NtOpenFile", {handle, 0x80100000, g.attributes("D:\\..\\x", kDos), iosb, 1, 0x60}) == 0xC000003A);
         CHECK(g.call("NtOpenFile", {handle, 0x80100000, g.attributes("D:\\missing", kDos), iosb, 1, 0x60}) == 0xC0000034);
+        // Nor through a host separator, a drive name or a NUL inside a component
+        // (STATUS_OBJECT_NAME_INVALID): "bundles/../../x" would leave the disc.
+        fs::create_directories(root / "outside");
+        std::ofstream(root / "outside" / "x", std::ios::binary) << "out";
+        CHECK(g.call("NtOpenFile", {handle, 0x80100000, g.attributes("D:\\bundles/../../outside/x", kDos), iosb, 1, 0x60}) == 0xC0000033);
+        CHECK(g.call("NtOpenFile", {handle, 0x80100000, g.attributes("D:\\bundles\\C:x", kDos), iosb, 1, 0x60}) == 0xC0000033);
+        CHECK(g.call("NtQueryFullAttributesFile", {g.attributes("D:\\bundles/../../outside/x", kDos), buf}) == 0xC0000033);
+        CHECK(g.call("NtCreateFile", {handle, 0xC0100000, g.attributes("\\Device\\Harddisk0\\Partition1\\a/../../../outside/y"), iosb, 0, 0x80, 0, 5, 0x60}) == 0xC0000033);
+        CHECK(!fs::exists(root / "outside" / "y"));
+        {
+            const char with_nul[] = "D:\\bundles\\common.bnl\0.txt";
+            CHECK(g.call("NtOpenFile", {handle, 0x80100000, g.attributes(std::string(with_nul, sizeof with_nul - 1), kDos), iosb, 1, 0x60}) == 0xC0000033);
+        }
 
         // A directory, enumerated through a mask, one entry per call.
         CHECK(g.call("NtOpenFile", {handle, 0x80100001, g.attributes("\\Device\\CdRom0\\bundles"), iosb, 3, 0x21}) == 0);
@@ -369,6 +382,14 @@ int main() {
         CHECK(g.call("NtQueryDirectoryFile", {dir, 0, 0, 0, iosb, buf, 0x200, 1, mask, 0}) == 0);
         CHECK(g.u32(buf + 40) == 10 && g.u32(buf + 60) == 10 && std::memcmp(g.ram.get() + buf + 64, "Common.bnl", 10) == 0);
         CHECK(g.call("NtQueryDirectoryFile", {dir, 0, 0, 0, iosb, buf, 0x200, 1, 0, 0}) == 0x80000006);  // STATUS_NO_MORE_FILES
+        // A mask that matches nothing, in a directory that isn't empty, is no such file, rescanned or not.
+        const uint32_t none = g.object_string("*.xyz");
+        CHECK(g.call("NtQueryDirectoryFile", {dir, 0, 0, 0, iosb, buf, 0x200, 1, none, 1}) == 0xC000000F);  // STATUS_NO_SUCH_FILE
+        CHECK(g.u32(iosb) == 0xC000000F);
+        CHECK(g.call("NtQueryDirectoryFile", {dir, 0, 0, 0, iosb, buf, 0x200, 1, 0, 0}) == 0xC000000F);
+        // Restarting with the first mask finds its entry again, then no more.
+        CHECK(g.call("NtQueryDirectoryFile", {dir, 0, 0, 0, iosb, buf, 0x200, 1, mask, 1}) == 0);
+        CHECK(g.call("NtQueryDirectoryFile", {dir, 0, 0, 0, iosb, buf, 0x200, 1, 0, 0}) == 0x80000006);
         CHECK(g.call("NtClose", {dir}) == 0);
 
         // The hard disk: create, write, close, and the file is on the host.
