@@ -62,7 +62,7 @@ def peak_rss_mb():
 import mpmath  # pip install mpmath: the reference for x87 transcendentals (EmuFixups)
 
 from unicorn import (UC_ARCH_X86, UC_ERR_WRITE_PROT, UC_HOOK_CODE, UC_HOOK_INTR, UC_HOOK_MEM_WRITE, UC_MODE_32, UC_PROT_ALL,
-                     UC_PROT_EXEC, UC_PROT_READ, Uc, UcError)
+                     UC_PROT_EXEC, UC_PROT_READ, UC_PROT_WRITE, Uc, UcError)
 from unicorn.x86_const import (UC_X86_REG_CR0, UC_X86_REG_CR4, UC_X86_REG_CS, UC_X86_REG_DS, UC_X86_REG_EAX,
                                UC_X86_REG_EBP, UC_X86_REG_ES, UC_X86_REG_FS, UC_X86_REG_GDTR, UC_X86_REG_SS,
                                UC_X86_REG_EBX, UC_X86_REG_ECX, UC_X86_REG_EDI, UC_X86_REG_EDX,
@@ -299,6 +299,12 @@ class EmuFixups:
         the double registers: the trial is skipped. Game code never makes one;
       - fnsave stores the last instruction and operand pointers, which the
         lifted code (like nothing but frstor) doesn't track: zeroed here;
+      - the lifted code keeps the x87 status word's condition codes and TOP,
+        not its sticky exception flags (IE, DE, ZE, OE, UE, PE, SF, ES:
+        docs/recompiler-core.md), so they are cleared before each fnstsw
+        reads them. The game only tests the condition codes (fnstsw ax, then
+        ah); the C runtime's maths epilogue tests PE, and its handler for a
+        masked inexact result returns the same value;
       - fst/fstp st(i) into an empty register leaves it tagged empty: Intel
         tags it valid (C runtime maths ends with `fstp st1` on a one-value stack);
       - fyl2x with an operand <= 0 doesn't pop: the trial is skipped;
@@ -313,6 +319,7 @@ class EmuFixups:
         self.rdtsc, self.fcomi, self.fyl2x, self.trans, self.fst_reg, self.crt_x87, self.fnsave = [], [], [], [], [], [], []
         self.sse_aligned = []  # (address, operand text) of SSE instructions that need a 16-byte aligned m128
         self.sse_arith = []  # (address, next address, lanes, destination, source text) of add/sub/mul/div ss/ps
+        self.fnstsw = []  # where the status word is read
         for line in open(insns_path):
             parts = line.split(None, 3)
             a, n, m = int(parts[0], 16), int(parts[1]), parts[3].split("\t")[0]
@@ -328,9 +335,11 @@ class EmuFixups:
             if m in ("addss", "subss", "mulss", "divss", "addps", "subps", "mulps", "divps"):
                 ops = text.split(None, 1)[1].split(", ", 1)
                 if ops[0].startswith("xmm"):
-                    self.sse_arith.append((a, a + n, 1 if m.endswith("ss") else 4, int(ops[0][3:]), ops[1]))
+                    self.sse_arith.append((a, a + n, 1 if m.endswith("ss") else 4, int(ops[0][3:]), ops[1].strip()))
             if "xmmword ptr [" in text and m not in ("movups", "movupd", "movdqu", "lddqu"):
                 self.sse_aligned.append((a, text[text.index("xmmword ptr [") + 13:text.index("]", text.index("xmmword ptr ["))]))
+            if m in ("fnstsw", "fstsw"):
+                self.fnstsw.append(a)
             if m == "fnsave":
                 self.fnsave.append((a, a + n))
             if m in ("fst", "fstp"):
@@ -399,6 +408,11 @@ class EmuFixups:
                 state["fnsave"] = None
                 if f[1] is not None:
                     u.mem_write(f[1] + 12, bytes(16))
+        def on_fnstsw(u, a, size, ud):  # the sticky exception flags, which the lifted code doesn't keep
+            u.reg_write(UC_X86_REG_FPSW, u.reg_read(UC_X86_REG_FPSW) & ~0x00FF)
+        for a in self.fnstsw:
+            uc.hook_add(UC_HOOK_CODE, on_fnstsw, None, a, a)
+
         for a, nxt in self.fnsave:
             uc.hook_add(UC_HOOK_CODE, on_fnsave, None, a, a)
             uc.hook_add(UC_HOOK_CODE, after_fnsave, None, nxt, nxt)
@@ -450,7 +464,7 @@ class EmuFixups:
                 return
             _, nxt, lanes, dst, src = ins
             d = u.reg_read(UC_X86_REG_XMM0 + dst)
-            if src.startswith("xmm"):
+            if src[:3] == "xmm" and src[3:].isdigit():  # a register (not "xmmword ptr [...]")
                 s = u.reg_read(UC_X86_REG_XMM0 + int(src[3:]))
             else:
                 expr = src[src.index("[") + 1:src.index("]")]
@@ -595,6 +609,16 @@ class Runner:
         self.uc2 = Uc(UC_ARCH_X86, UC_MODE_32)
         self.uc2.mem_map_ptr(0, MEM_SIZE, UC_PROT_ALL, C.addressof(self.hmem))
         self.uc2.mem_protect(CODE_LO, CODE_HI - CODE_LO, UC_PROT_READ | UC_PROT_EXEC)
+        # Only the code runs. A trial whose random frame sends the original
+        # into data (an entry inside a function that returns through its
+        # parent's frame, as the C runtime's SEH handlers do) faults fetching
+        # there, where the lifted code's return check traps, instead of
+        # running the data as code. The sentinel's page stays executable:
+        # Unicorn stops at an address when it translates the block there.
+        for u in (self.uc, self.uc2):
+            u.mem_protect(0, CODE_LO, UC_PROT_READ | UC_PROT_WRITE)
+            u.mem_protect(CODE_HI, MEM_SIZE - CODE_HI, UC_PROT_READ | UC_PROT_WRITE)
+            u.mem_protect(SENTINEL & ~0xFFF, 0x1000, UC_PROT_ALL)
         enable_sse(self.uc2)
         self.uc2_writes = []
         self.uc2.hook_add(UC_HOOK_MEM_WRITE, lambda uc, acc, a, sz, v, ud: self.uc2_writes.append((a, sz)))

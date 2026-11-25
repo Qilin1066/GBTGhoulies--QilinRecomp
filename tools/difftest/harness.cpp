@@ -60,7 +60,13 @@ void preempt() {}
 // faults on them: the lifted code traps, and the trial counts as faulting in both.
 uint32_t mmio_read32(uint32_t addr, uint32_t at) { (void)addr; trap(at, "device register read"); }
 void mmio_write32(uint32_t addr, uint32_t value, uint32_t at) { (void)addr; (void)value; trap(at, "device register write"); }
-uint64_t rdtsc(uint32_t at) { trap(at, "rdtsc (the clock differs from the reference's)"); }
+// The reference's clock (EmuFixups' rdtsc: from 0 each trial, 1000 a read), so
+// code that reads it compares instead of trapping.
+uint64_t g_tsc = 0;
+uint64_t rdtsc(uint32_t at) {
+    (void)at;
+    return g_tsc += 1000;
+}
 void trace_write(uint32_t addr, uint32_t size) {
     g_writes.push_back(addr);
     g_writes.push_back(size);
@@ -110,6 +116,7 @@ EXPORT uint32_t qd_function_addr(int i) { return functions()[size_t(i)].addr; }
 // 4 = the lifted code ran away (recursion or call count far past the original's)
 EXPORT int qd_call(uint32_t addr, qilin::rt::Context* c, char* err, int errlen) {
     g_writes.clear();
+    qilin::rt::g_tsc = 0;
     g_depth = 0;
     g_calls = g_ticks = g_unlifted_calls = 0;
     g_tail = false;
