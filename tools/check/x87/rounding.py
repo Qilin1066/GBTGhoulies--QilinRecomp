@@ -2,7 +2,9 @@
 
 Cross-check rt::fadd/fsub/fmul/fdiv/fsqrt at 24-bit precision control against
 exact rational arithmetic rounded to a 24-bit significand (ties to even)."""
+import os
 import random
+import shlex
 import struct
 import subprocess
 import sys
@@ -12,9 +14,10 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parents[2]
-CXX = sys.argv[2] if len(sys.argv) > 2 else "g++-14"
-DRIVER = str(Path(tempfile.mkdtemp()) / "x87driver")
-subprocess.run([CXX, "-std=c++23", "-O2", "-ffp-contract=off", "-I", str(ROOT / "recomp" / "runtime"),
+# The compiler may be a command and its options ("zig c++"); Windows runs only an .exe by that name.
+CXX = shlex.split(sys.argv[2], posix=os.name != "nt") if len(sys.argv) > 2 else ["g++-14"]
+DRIVER = str(Path(tempfile.mkdtemp()) / ("x87driver.exe" if os.name == "nt" else "x87driver"))
+subprocess.run([*CXX, "-std=c++23", "-O2", "-ffp-contract=off", "-I", str(ROOT / "recomp" / "runtime"),
                 str(HERE / "driver.cpp"), "-o", DRIVER], check=True)
 
 

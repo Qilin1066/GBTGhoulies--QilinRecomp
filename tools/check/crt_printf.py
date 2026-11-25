@@ -86,7 +86,7 @@ def main():
     ap.add_argument("--count", type=int, default=3000)
     ap.add_argument("--seed", type=int, default=1)
     args = ap.parse_args()
-    R = D.Runner(os.path.join(args.work, "image.bin"), os.path.join(args.work, "libdifftest.so"))
+    R = D.Runner(os.path.join(args.work, "image.bin"), os.path.join(args.work, D.LIB_NAME))
     rng = random.Random(args.seed)
     text = bytes(rng.choice(b"abcdefghijklmnopqrstuvwxyz ABC0123456789") for _ in range(80)) + b"\0"
     stats, fails = {}, 0

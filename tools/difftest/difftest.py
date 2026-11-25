@@ -25,6 +25,10 @@ Usage:
               [--trials 24] [--only ADDR] [--cxx g++-14] [--sanitize]
 
 Exit status 1 if any function mismatches. Needs: pip install unicorn
+
+On Windows, --cxx names a compiler that takes GCC's options and makes a DLL,
+such as Zig's ("path/to/zig.exe c++", from pip install ziglang); the
+library is libdifftest.dll.
 """
 import argparse
 import concurrent.futures as cf
@@ -34,13 +38,26 @@ import math
 import mmap
 import os
 import random
-import resource
+import shlex
 import struct
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from collections import Counter
+
+try:
+    import resource  # POSIX only: the workers' peak memory, in their logs
+except ImportError:
+    resource = None
+
+WINDOWS = os.name == "nt"
+LIB_NAME = "libdifftest.dll" if WINDOWS else "libdifftest.so"
+
+
+def peak_rss_mb():
+    return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss >> 10 if resource else 0
 
 import mpmath  # pip install mpmath: the reference for x87 transcendentals (EmuFixups)
 
@@ -114,7 +131,10 @@ def x802d(v):
     if mant == 0:
         return (-0.0 if sign else 0.0), True
     q = fractions.Fraction(mant, 1 << 63) * fractions.Fraction(2) ** (e - 16383)
-    d = float(q)  # correctly rounded
+    try:
+        d = float(q)  # correctly rounded
+    except OverflowError:  # beyond a double's range (the x87 reaches 2^16384): an infinity, inexactly
+        return math.copysign(math.inf, -1 if sign else 1), False
     return (-d if sign else d), fractions.Fraction(d) == q
 
 
@@ -228,24 +248,27 @@ def build(args, work):
     srcs.append(os.path.join(ROOT, "recomp", "runtime", "dispatch.cpp"))
     # Production optimisation level and FP rules; warnings are errors, so a
     # generator regression that produces sloppy C++ fails here too.
-    flags = ["-std=c++23", "-O2", "-fPIC", "-ffp-contract=off", "-Wall", "-Wextra", "-Werror",
+    flags = ["-std=c++23", "-O2", "-ffp-contract=off", "-Wall", "-Wextra", "-Werror",
              "-DQILIN_CHECKED_MEMORY", "-DQILIN_TRACE_WRITES", "-DQILIN_TEST_HOOKS",
              "-I", os.path.join(ROOT, "recomp", "runtime")]
+    if not WINDOWS:
+        flags.append("-fPIC")  # (a DLL needs none, and Clang refuses it for Windows targets)
     if args.sanitize:
         # Undefined behaviour in generated code (shifts, overflow, bad casts) aborts the run.
         flags += ["-fsanitize=undefined", "-fno-sanitize-recover=undefined"]
+    cxx = shlex.split(args.cxx, posix=not WINDOWS)  # a command and its options, such as "zig c++"
     objs = []
 
     def cc(src):
         obj = os.path.join(work, os.path.basename(src) + ".o")
-        subprocess.run([args.cxx, *flags, "-c", src, "-o", obj], check=True)
+        subprocess.run([*cxx, *flags, "-c", src, "-o", obj], check=True)
         return obj
 
-    with cf.ThreadPoolExecutor(os.cpu_count() or 2) as ex:
+    with cf.ThreadPoolExecutor(args.jobs) as ex:
         objs = list(ex.map(cc, srcs))
-    lib = os.path.join(work, "libdifftest.so")
+    lib = os.path.join(work, LIB_NAME)
     link = ["-fsanitize=undefined"] if args.sanitize else []
-    subprocess.run([args.cxx, "-shared", *link, "-o", lib, *objs], check=True)
+    subprocess.run([*cxx, "-shared", *link, "-o", lib, *objs], check=True)
     return img, lib
 
 
@@ -267,6 +290,9 @@ class EmuFixups:
         mulps, shufps …) don't check its alignment; the hardware raises #GP,
         and the lifted code traps. A misaligned one is sent to an unmapped
         address, so the original faults too;
+      - SSE add, sub, mul and div (scalar and packed single) with a NaN in both
+        operands return the second operand's: Intel returns the first's (the
+        destination), quietened, as the lifted code does (rt::sse_nan);
       - after each x87 instruction of the C runtime's maths, a register value
         outside double's exponent range (pow's underflow and overflow paths
         rescale such values by 2^1536) is a known, documented limitation of
@@ -286,6 +312,7 @@ class EmuFixups:
     def __init__(self, insns_path):
         self.rdtsc, self.fcomi, self.fyl2x, self.trans, self.fst_reg, self.crt_x87, self.fnsave = [], [], [], [], [], [], []
         self.sse_aligned = []  # (address, operand text) of SSE instructions that need a 16-byte aligned m128
+        self.sse_arith = []  # (address, next address, lanes, destination, source text) of add/sub/mul/div ss/ps
         for line in open(insns_path):
             parts = line.split(None, 3)
             a, n, m = int(parts[0], 16), int(parts[1]), parts[3].split("\t")[0]
@@ -298,6 +325,10 @@ class EmuFixups:
             if m.startswith("f") and 0x165C00 <= a < 0x1707B0 and m not in ("fwait", "fnstcw", "fldcw", "fnstsw"):
                 self.crt_x87.append(a + n)
             text = parts[3].split("\t")[1] if "\t" in parts[3] else ""
+            if m in ("addss", "subss", "mulss", "divss", "addps", "subps", "mulps", "divps"):
+                ops = text.split(None, 1)[1].split(", ", 1)
+                if ops[0].startswith("xmm"):
+                    self.sse_arith.append((a, a + n, 1 if m.endswith("ss") else 4, int(ops[0][3:]), ops[1]))
             if "xmmword ptr [" in text and m not in ("movups", "movupd", "movdqu", "lddqu"):
                 self.sse_aligned.append((a, text[text.index("xmmword ptr [") + 13:text.index("]", text.index("xmmword ptr ["))]))
             if m == "fnsave":
@@ -395,6 +426,62 @@ class EmuFixups:
                 u.reg_write(UC_X86_REG_EIP, 0xFFFFF000)  # #GP stand-in: fetch from an unmapped page
         for a, expr in self.sse_aligned:
             uc.hook_add(UC_HOOK_CODE, on_sse_aligned, expr, a, a)
+
+        # Both operands NaN: the destination's NaN, quietened (Intel); Unicorn gives the source's.
+        def is_nan32(v):
+            return (v & 0x7FFFFFFF) > 0x7F800000
+
+        arith_at = {ins[0]: ins for ins in self.sse_arith}
+
+        # One hook at every such instruction and every one after: first the
+        # correction the instruction just run needs (consecutive SSE
+        # instructions are common), then a look at this one's operands.
+        def on_sse_arith(u, a, size, ud):
+            pending = state.get("sse_nan")
+            if pending and pending[0] == a:
+                _, dst, fix = pending
+                v = u.reg_read(UC_X86_REG_XMM0 + dst)
+                for k, lane in fix.items():
+                    v = v & ~(0xFFFFFFFF << (32 * k)) | lane << (32 * k)
+                u.reg_write(UC_X86_REG_XMM0 + dst, v)
+            state["sse_nan"] = None
+            ins = arith_at.get(a)
+            if ins is None:
+                return
+            _, nxt, lanes, dst, src = ins
+            d = u.reg_read(UC_X86_REG_XMM0 + dst)
+            if src.startswith("xmm"):
+                s = u.reg_read(UC_X86_REG_XMM0 + int(src[3:]))
+            else:
+                expr = src[src.index("[") + 1:src.index("]")]
+                ea = 0
+                for term in expr.replace("-", "+-").split("+"):
+                    term = term.strip()
+                    if not term:
+                        continue
+                    neg = term.startswith("-")
+                    term = term.lstrip("-")
+                    if "*" in term:
+                        r, k = term.split("*")
+                        v = u.reg_read(regs[r]) * int(k, 0)
+                    elif term in regs:
+                        v = u.reg_read(regs[term])
+                    else:
+                        v = int(term, 16)
+                    ea += -v if neg else v
+                try:
+                    s = int.from_bytes(bytes(u.mem_read(ea & 0xFFFFFFFF, 4 * lanes)), "little")
+                except UcError:
+                    return  # the instruction faults on its own
+            fix = {}
+            for k in range(lanes):
+                x, y = d >> (32 * k) & 0xFFFFFFFF, s >> (32 * k) & 0xFFFFFFFF
+                if is_nan32(x) and is_nan32(y):
+                    fix[k] = x | 0x00400000
+            if fix:
+                state["sse_nan"] = (nxt, dst, fix)
+        for a in sorted({ins[0] for ins in self.sse_arith} | {ins[1] for ins in self.sse_arith}):
+            uc.hook_add(UC_HOOK_CODE, on_sse_arith, None, a, a)
 
         def after_crt_x87(u, a, size, ud):
             fx = x87_read(u)
@@ -667,7 +754,7 @@ class Runner:
         x87_write(uc, self.fpcw, 0, ftop, fvalid, fst)
         self.wide_from_unlifted = self.wide_reg = False
         for st in (self.fix_uc, self.fix_uc2):
-            st["tsc"], st["fix_at"], st["trans"] = 0, None, None
+            st["tsc"], st["fix_at"], st["trans"], st["sse_nan"] = 0, None, None, None
         self.fixups.quirk = ""
         self.uc_writes = []
         self.uc2_writes = []
@@ -830,7 +917,7 @@ def worker(job):
     """Run all trials for a slice of functions in this process, on a thread
     with a large stack: lifted code recurses on the host stack as deeply as
     the guest does, and the harness stops runaway recursion at a fixed depth."""
-    threading.stack_size(512 << 20)
+    threading.stack_size((255 if WINDOWS else 512) << 20)  # Python on Windows takes less than 256 MiB
     out = []
     t = threading.Thread(target=lambda: out.append(worker_body(job)))
     t.start()
@@ -864,7 +951,7 @@ def worker_body(job):
                 if time.time() - t0 > args.fn_seconds:
                     per[f]["timeout"] += 1
                     break
-            log.write(f"{f:08X} v{v} {dict(per[f])} rss={resource.getrusage(resource.RUSAGE_SELF).ru_maxrss >> 10}MB\n")
+            log.write(f"{f:08X} v{v} {dict(per[f])} rss={peak_rss_mb()}MB\n")
             log.flush()
     return per, first_fail
 
@@ -873,7 +960,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--qilin", required=True)
     ap.add_argument("--xbe", required=True)
-    ap.add_argument("--work", default="/tmp/qilin-difftest")
+    ap.add_argument("--work", default=os.path.join(tempfile.gettempdir(), "qilin-difftest"))
     ap.add_argument("--trials", type=int, default=24)
     ap.add_argument("--variants", type=int, default=3, help="distinct scratch-heap images")
     ap.add_argument("--only", help="lift only this function (its callees then run as original code)")
@@ -887,7 +974,7 @@ def main():
     ap.add_argument("--sanitize", action="store_true", help="build the lifted code with UBSan (use GCC)")
     args = ap.parse_args()
     os.makedirs(args.work, exist_ok=True)
-    lib = os.path.join(args.work, "libdifftest.so")
+    lib = os.path.join(args.work, LIB_NAME)
     img = os.path.join(args.work, "image.bin")
     if not (args.reuse and os.path.exists(lib) and os.path.exists(img)):
         img, lib = build(args, args.work)

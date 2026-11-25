@@ -10,7 +10,9 @@ operands, including hard ones, with their correctly rounded results. CI runs
 them on every platform, so they check that each host gets the same bits."""
 import argparse
 import math
+import os
 import random
+import shlex
 import struct
 import subprocess
 import tempfile
@@ -122,8 +124,8 @@ def main():
             expr = call[op].format(a=f"rt::dfrom(0x{d2b(a):016X}ull)", b=f"rt::dfrom(0x{d2b(b):016X}ull)")
             print(f"        {{rt::dbits(rt::{expr}), 0x{d2b(r):016X}ull}},  // {NAMES[op]}({a!r}{', ' + repr(b) if op in 'AL' else ''}) = {r!r}")
         return
-    driver = str(Path(tempfile.mkdtemp()) / "x87driver")
-    subprocess.run([args.cxx, "-std=c++23", "-O2", "-ffp-contract=off", "-I", str(ROOT / "recomp" / "runtime"),
+    driver = str(Path(tempfile.mkdtemp()) / ("x87driver.exe" if os.name == "nt" else "x87driver"))
+    subprocess.run([*shlex.split(args.cxx, posix=os.name != "nt"), "-std=c++23", "-O2", "-ffp-contract=off", "-I", str(ROOT / "recomp" / "runtime"),
                     str(HERE / "driver.cpp"), "-o", driver], check=True)
     rng = random.Random(args.seed)
     jobs = []

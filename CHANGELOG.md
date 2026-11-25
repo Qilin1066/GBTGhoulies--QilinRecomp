@@ -33,6 +33,9 @@ The first seven from a review of the graphics code against the NV2A and the game
 
 ### Tests
 - The I/O manager refuses separator, drive and NUL names on the disc and the hard disk (nothing is created outside the partition), and a mask that matches nothing is "no such file" on a fresh or restarted scan, while a restart with a matching mask finds its entry again.
+- **The differential test and the x87 checks run on Windows**, with Zig's C++ compiler (`pip install ziglang`): `libdifftest.dll`, no `-fPIC`, a compiler given as a command and its options (`"zig.exe c++"`), worker stacks of 255 MiB (Python's most there), `.exe` drivers. First run against the real disc on Windows (2026-11-25): every lifted function built at `-O2` with warnings as errors under Zig's Clang; 4,471 of the 6,214 functions tested (36,833 matching trials) before the machine ran short of memory with 14 workers; `rounding.py` 40,000 cases and `transcendental.py` every range, 0 mismatches.
+- **The differential test's reference follows Intel's SSE NaN rule**: with a NaN in both operands of add, sub, mul or div (scalar or packed), Unicorn returns the source's NaN, the hardware the destination's, quietened, as the lifted code does. The one mismatch of that run (`0x54170`, `addss` of `FFC00000` and `FFFFC000` at `0x542C6`, the wrong NaN then carried on through memory) was the reference's; with the correction it and its callees match over 2,000 trials.
+- `x802d`, the difftest's 80-bit to double conversion, gives an infinity for a value beyond a double's range instead of stopping the worker with Python's OverflowError (the x87 reaches 2^16384).
 
 ## [0.48.0] - 2026-11-22
 
