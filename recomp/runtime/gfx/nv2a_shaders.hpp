@@ -56,6 +56,8 @@ struct CombinerSetup {
     // take the position within the point, (0, 0) top left to (1, 1), for
     // their texture coordinates; stage 3 keeps its own.
     uint32_t point_sprite = 0;
+    // D3DTSS_ALPHAKILL per stage (bit n for stage n): pixels whose texel there has alpha 0 are discarded.
+    uint32_t alpha_kill = 0;
 
     bool operator==(const CombinerSetup&) const = default;
     uint64_t hash() const;

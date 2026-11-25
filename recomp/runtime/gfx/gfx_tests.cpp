@@ -145,6 +145,17 @@ mad oPos.xyz, oPos.xyzz, r1.x, c-37.xyzz
         CHECK(gfx::nv2a::combiners_unsupported(cs) == nullptr);
         const auto spv = gfx::nv2a::combiners(cs);
         CHECK(spv.size() > 5 && spv[0] == 0x07230203u);
+        // D3DTSS_ALPHAKILL: one more OpKill (the alpha test has one) for a stage
+        // that samples, none for a stage without a texture mode.
+        {
+            const auto kills = [](const std::vector<uint32_t>& code) { return std::ranges::count(code, (1u << 16) | 252u); };
+            gfx::nv2a::CombinerSetup k = cs;
+            k.alpha_kill = 1;
+            const auto killing = gfx::nv2a::combiners(k);
+            CHECK(kills(killing) == kills(spv) + 1 && k.hash() != cs.hash());
+            k.alpha_kill = 2;  // stage 1: no texture mode
+            CHECK(kills(gfx::nv2a::combiners(k)) == kills(spv));
+        }
         if (const char* dir = std::getenv("QILIN_SPV_DIR"))
             if (std::FILE* f = std::fopen((std::string(dir) + "/test_ps.spv").c_str(), "wb")) {
                 std::fwrite(spv.data(), 4, spv.size(), f);

@@ -1956,7 +1956,7 @@ enum Rs : uint32_t {
 };
 
 // A texture stage's texture, decoded and uploaded once (and again when its
-// texels change; they're compared once a frame).
+// texels change; they're compared once a frame, and after a lock).
 const Device::CachedTexture* target_texture(rt::Context& c, Device& d, uint32_t tex);
 const Device::CachedTexture* depth_texture(rt::Context& c, Device& d, uint32_t tex);
 // A palettized (P8) texture reads the stage's palette, which the device
@@ -1982,7 +1982,10 @@ const Device::CachedTexture* stage_texture(rt::Context& c, Device& d, const char
     }
     const uint64_t key = (uint64_t(data) << 32 ^ uint64_t(format) * 0x9E3779B1u ^ size) + palette_hash * 31;
     Device::CachedTexture& e = d.textures[key];
-    if (e.id && e.checked == d.swaps) return &e;
+    // Compared once a frame, and again within it after a lock of its memory:
+    // the CPU's new texels are for the draws after the lock (D3D's Lock waits
+    // for the GPU), and the renderer's upload lands between them in order.
+    if (e.id && e.checked == d.swaps && e.checked_lock >= d.locked_within(data, shape.bytes)) return &e;
     const uint8_t* texels = c.mem + data;
     // Texels still for kSettledSwaps frames get the quick look (above), unless one of the texture's levels was locked since.
     const bool kept = e.id && e.texels.size() == shape.bytes;
@@ -2762,6 +2765,9 @@ void issue_draw(rt::Context& c, Device& d, const char* fn, uint32_t prim, Vertic
     const FogUnit fog = fog_unit(c);
     cs.fog_mode = fog.mode;
     cs.point_sprite = prim == 1 && rs(kRsPointSpriteEnable);
+    // D3DTSS_ALPHAKILL (0xB; the game sets D3DTALPHAKILL_ENABLE, 4, on stage 0 at 0x61F2C).
+    for (uint32_t stage = 0; stage < 4; ++stage)
+        if (ld(c, kTextureStateTable + 4 * (32 * stage + 0xB))) cs.alpha_kill |= 1u << stage;
     fsu[gfx::nv2a::kFsFogParams * 4 + 0] = fog.p0;
     fsu[gfx::nv2a::kFsFogParams * 4 + 1] = fog.p1;
     for (uint32_t stage = 0; stage < 4; ++stage) {
@@ -2938,7 +2944,6 @@ void issue_draw(rt::Context& c, Device& d, const char* fn, uint32_t prim, Vertic
         if (!(cs.texture_modes >> (5 * stage) & 0x1F)) continue;
         if (ld(c, kTextureStateTable + 4 * (32 * stage + 0x9))) notice_once(d, "colour keys (D3DTSS_COLORKEYOP: texels kept)");
         if (ld(c, kTextureStateTable + 4 * (32 * stage + 0xA))) notice_once(d, "signed texture channels (D3DTSS_COLORSIGN: read unsigned)");
-        if (ld(c, kTextureStateTable + 4 * (32 * stage + 0xB))) notice_once(d, "alpha kill (D3DTSS_ALPHAKILL: texels of alpha 0 kept)");
     }
     cmd.depth_test = zenable != 0;
     cmd.depth_write = zenable != 0 && rs(kRsZWriteEnable);

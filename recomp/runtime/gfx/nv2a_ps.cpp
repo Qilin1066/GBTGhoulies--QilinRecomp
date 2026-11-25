@@ -333,6 +333,18 @@ std::vector<uint32_t> combiners(const CombinerSetup& s) {
         }
         p.regs[kT0 + i] = result;
     }
+    // D3DTSS_ALPHAKILL: a pixel whose texel in such a stage has alpha 0 isn't
+    // drawn (decided after every stage has sampled, so none samples in a
+    // quad with a lane already gone).
+    {
+        Id killed = 0;
+        for (uint32_t i = 0; i < 4; ++i) {
+            if (!(s.alpha_kill >> i & 1) || mode_of(s, i) == kNone) continue;
+            const Id zero_alpha = b.op(op::FOrdEqual, p.boolean, {p.comp(p.regs[kT0 + i], 3), b.c_float(0)});
+            killed = killed ? b.op(op::LogicalOr, p.boolean, {killed, zero_alpha}) : zero_alpha;
+        }
+        if (killed) b.kill_if(killed);
+    }
 
     // The register file.
     p.regs[kZero] = p.zero4;
