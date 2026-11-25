@@ -2934,9 +2934,22 @@ void issue_draw(rt::Context& c, Device& d, const char* fn, uint32_t prim, Vertic
     cmd.write_mask = uint8_t((cw >> 16 & 1) | (cw >> 8 & 1) << 1 | (cw & 1) << 2 | (cw >> 24 & 1) << 3);
     const uint32_t zenable = rs(kRsZEnable);
     if (zenable == 2) notice_once(d, "w-buffering (D3DZB_USEW, drawn as z)");
-    // States nothing here reads, at their defaults wherever the audit looked
-    // (docs/graphics.md): said once if a draw meets one that isn't.
-    if (ld(c, 0x181DA4)) notice_once(d, "two-sided lighting (D3DRS_TWOSIDEDLIGHTING: back faces get the front colours)");
+    // States nothing here reads: said once if a draw meets one where it could
+    // show. Two-sided lighting is on from the game's device setup (0x5D3E6),
+    // but only changes back faces (culling off) whose combiners read the
+    // vertex colours: none in the captures to date.
+    if (ld(c, 0x181DA4) && !rs(kRsCullMode)) {
+        bool colours = false;
+        const auto reads = [&](uint32_t word) {
+            for (uint32_t k = 0; k < 32; k += 8) {
+                const uint32_t reg = word >> k & 0xF;
+                colours = colours || reg == 4 || reg == 5 || reg == 14;  // v0, v1, V1R0_SUM
+            }
+        };
+        for (uint32_t i = 0; i < std::min(cs.combiner_count & 0xFu, 8u); ++i) reads(cs.rgb_inputs[i]), reads(cs.alpha_inputs[i]);
+        reads(cs.final_abcd), reads(cs.final_efgh);
+        if (colours) notice_once(d, "two-sided lighting (D3DRS_TWOSIDEDLIGHTING: back faces get the front colours)");
+    }
     for (const uint32_t fill : {ld(c, 0x181D9C), ld(c, 0x181DA0)})
         if (fill && fill != 0x1B02u) notice_once(d, "point or wireframe fill (D3DRS_FILLMODE, D3DRS_BACKFILLMODE: drawn solid)");
     if (ld(c, 0x181DC8)) notice_once(d, "a logic op (D3DRS_LOGICOP: blended as without)");
