@@ -1,44 +1,55 @@
 # GBTGhoulies--QilinRecomp
 
-A static recompilation of **Grabbed by the Ghoulies** (Rare, original Xbox, 2003) into portable C++23 with a Vulkan 1.3 renderer, aimed at 64-bit Windows, Linux and macOS, on x86-64 or ARM64. Anything with a Vulkan 1.3 driver is in scope, including the Raspberry Pi 4 (Mesa 24.3+); every 64-bit Mac with a Metal GPU that runs macOS 10.15 (Catalina) or later, Intel or Apple Silicon, is covered through MoltenVK. Efficiency is the first priority: a Raspberry Pi 4–class board is our reference for typical low-end hardware, not a floor.
+A static recompilation of **Grabbed by the Ghoulies** (Rare / Microsoft Game Studios, original Xbox, 2003) into portable C++23 with a Vulkan 1.3 renderer, for 64-bit Windows, Linux and macOS on x86-64 or ARM64. Any GPU with a Vulkan 1.3 driver is in scope, down to the Raspberry Pi 4 (Mesa 24.3+). Macs run it through MoltenVK (macOS 10.15 or later).
 
-> **No game data is included, and none ever will be.** You need your own copy of the game. The tools read `default.xbe` and the disc files from a path you give them. `.gitignore` keeps game files, and anything generated from them, out of the repo.
+> **No game data is included, and none ever will be.** You need your own copy of the game: the USA release (MS-083), extracted to a folder holding `default.xbe` and the disc files. The tools read it from a path you give them. `.gitignore` keeps game files, and anything generated from them, out of the repository.
 
 ## Status
 
-The recompiler core accounts for all lifted code; the native runtime is playable
-and still being developed. **The current validation record does not establish a complete end-to-end
-playthrough.** Code coverage is not a measure of whole-game compatibility. See
-[the 0.48.0 validation record](docs/validation-0.48.md) for the latest reliability
-checks and the evidence still needed for a complete-game claim.
+Plays from the attract sequence and save-slot menu through Chapter 1's story and first fight into the mansion, with sound, controllers and saves. Not yet tested to the end.
 
-| Piece | State |
+| Part | State |
 |---|---|
-| XBE loader (headers, certificate, sections, libraries, kernel thunks, flat image) | ✅ output identical to the Python prototype |
-| x86 decoder (Zydis, vendored) | ✅ agrees with LLVM on every reachable instruction |
-| Function discovery + CFG (recursive descent, switch tables, C++ EH tables, data-as-code validation) | ✅ 8,842 functions, 556 jump tables (every one in lifted code has a proven size); **100% of the lifted code accounted for** (`qilin coverage`: 0 unknown bytes in the game code, Rare libraries and EH funclets) |
-| Lifter → C++ (integer, scalar SSE, x87 with the game's 24-bit precision control, jump tables, string ops; direct, indirect and tail calls; C++ exception frames) | ✅ all 6,214 functions (game code, Rare libraries, and the 471 C runtime and XAPI functions they reach; 3 more belong to Bink and are replaced with it), differentially tested against the original x86 under Unicorn, whole call trees included, also under UBSan: 0 mismatches |
-| Runtime: `qilin_run` loads the game and runs the lifted `main`, with a registry of native replacements for everything that isn't lifted | 🔨 started: XAPI and the C runtime lifted, the kernel beneath them native (memory, critical sections, timers, settings, the file system over your extracted disc and a data folder); XACT and XGraphics lifted too; the game runs its attract sequence, takes START, shows its save-slot menu and saves (see `docs/runtime.md`) |
-| HLE of the XDK libraries, Vulkan | 🔨 started: the Vulkan 1.3 renderer (clears and frame flips, tested on Mesa's software driver in CI) and the first Direct3D replacements: the device, its frame buffers, clears, swaps at the display's vblank (see `docs/graphics.md`). Since v0.22.0 the game draws: vertex programs and pixel combiners as generated SPIR-V, textures, in a window (SDL3) since v0.23.0, with controllers and the keyboard since v0.24.0 (`docs/input.md`). DirectSound replaced over a software mixer (PCM and Xbox ADPCM voices, mix bins, streams, `--dump-audio`), playing through SDL3 since v0.25.0 (see `docs/audio.md`). Since v0.28.0 Chapter 1 is playable from the story to its first fight, and since v0.29.0 past it, into the mansion |
+| XBE loader | ✅ headers, certificate, sections, libraries, kernel thunks, flat image |
+| x86 decoder (Zydis) | ✅ agrees with LLVM on every reachable instruction |
+| Function discovery and CFG | ✅ 8,842 functions, 556 jump tables; `qilin coverage`: 0 unknown bytes in lifted code |
+| Lifter → C++ | ✅ 6,214 functions (game, Rare libraries, C runtime, XAPI); differential test: 0 mismatches |
+| Kernel and runtime | 🔨 native kernel, file system over the extracted disc and a data folder, guest threads; see `docs/runtime.md` |
+| Graphics | 🔨 Direct3D 8 on Vulkan 1.3, shaders as generated SPIR-V, SMAA, FSR 1; see `docs/graphics.md` |
+| Audio | 🔨 DirectSound over a software mixer, XACT lifted on top, out through SDL3; see `docs/audio.md` |
+| Input | 🔨 controllers and keyboard through SDL3, settings menu (F1); see `docs/input.md` |
 
-## Versions and changes
+The latest checks are in [the 0.48.0 validation record](docs/validation-0.48.md).
 
-Releases are tagged `vX.Y.Z` on GitHub, and every release is recorded in [`CHANGELOG.md`](CHANGELOG.md). Past entries are kept, never rewritten. The version lives in one place, `project(... VERSION ...)` in `CMakeLists.txt`, and `qilin --version` prints it. While the recompiler is being built, a minor bump (0.**x**) marks a milestone and a patch bump (0.x.**y**) a fix. 1.0.0 will be the first build that plays the game.
+## Playing
 
-## Playing on Windows
+### Windows download
 
-**The download (nothing to install).** `.github/workflows/player-kit.yml` builds `GBTGhoulies--QilinRecomp-<version>-windows-x64.zip` (about 80 MB) on every push, as its sister projects ApbArcade--QilinRecomp and PunchOutWii--QilinRecomp do (an artifact of the run; attached to a release when one is tagged). Unpack it and double-click **`Play Ghoulies.bat`**: the first time it asks for your extracted disc folder (the one holding `default.xbe`; the USA release, MS-083) and builds the game from it, with the compiler inside the download (LLVM-MinGW: Clang, free and open source); after that it starts the game at once. The game's messages go to `run.log` and errors to `run-errors.log` beside it. The download has everything but the game's own code, prebuilt: the recompiler, the runtime, the renderer, SDL3. The code made from the disc is made on the player's PC, from their own copy, and never distributed. See `tools/player-kit/` (`package.sh` builds the download on Linux; `play.ps1` is what Play runs).
+Each tagged release has `GBTGhoulies--QilinRecomp-<version>-windows-x64.zip` attached (`.github/workflows/player-kit.yml` also builds one on every push to `main`, as a run artifact). Unpack it and double-click **`Play Ghoulies.bat`**: the first time, it asks for your extracted disc folder and builds the game from it with the bundled compiler (LLVM-MinGW); after that it starts the game at once. `-ChooseDisc` picks another disc folder. Messages go to `run.log` and errors to `run-errors.log`. The game's code is built on your PC from your copy and never distributed. The download's `README.txt` lists the controls and settings.
 
-**From the source, double-click.** With Visual Studio 2022 (17.10 or newer, the free Community edition, with "Desktop development with C++") and Git installed, in the project's folder:
+### From the source on Windows
 
-- **`Play Ghoulies.bat`** starts the game. The first time it builds it (10 to 40 minutes), asking for your extracted disc folder with a folder picker.
-- **`Update Ghoulies.bat`** gets the latest code, rebuilds only what changed, and starts the game.
+With Visual Studio 2022 (17.10 or newer, with "Desktop development with C++") and Git installed, in the project's folder:
 
-Both run `tools/build-ghoulies.ps1`, which finds Visual Studio's CMake and Git itself; the game's messages go to `build-game\run.log` and `build-game\run-errors.log`.
+- **`Play Ghoulies.bat`** starts the game. The first time it builds it (10 to 40 minutes), asking for your extracted disc folder.
+- **`Update Ghoulies.bat`** pulls the latest code, rebuilds what changed and starts the game.
+
+Both run `tools/build-ghoulies.ps1`. Messages go to `build-game\run.log` and `build-game\run-errors.log`.
+
+### Linux and macOS
+
+After [building](#building), lift the game and build `qilin_run` from it:
+
+```sh
+build/qilin lift path/to/default.xbe --out gen
+cmake -S . -B build -DQILIN_GEN_DIR=$PWD/gen
+cmake --build build --parallel --target qilin_run
+build/qilin_run path/to/default.xbe
+```
 
 ## Building
 
-The whole project (recompiler, runtime and generated code) is **C++23**. You need CMake ≥ 3.25 and one of:
+The whole project (recompiler, runtime and generated code) is C++23. You need CMake 3.25 or later and one of:
 
 | Compiler | Minimum | Notes |
 |---|---|---|
@@ -47,9 +58,7 @@ The whole project (recompiler, runtime and generated code) is **C++23**. You nee
 | Apple Clang | Xcode 16 | |
 | MSVC | Visual Studio 2022 17.10 | |
 
-CMake stops with a clear message if the compiler is older.
-
-The one other dependency is **SDL3** (window, input, audio output). CMake uses an installed SDL3 (3.2 or later) if it finds one; otherwise it downloads SDL 3.4.20 (checked against its SHA-256) and builds it static, which needs network access once. On Linux, SDL needs the development headers of what it supports, or the build has no window or sound there. On Debian, Ubuntu and Raspberry Pi OS:
+The one other dependency is **SDL3**: an installed SDL3 3.2 or later, or else CMake downloads SDL 3.4.20 (SHA-256 checked) once and builds it static. On Linux, SDL needs these development headers for a window and sound (Debian, Ubuntu, Raspberry Pi OS):
 
 ```sh
 sudo apt install libx11-dev libxext-dev libxrandr-dev libxcursor-dev libxfixes-dev libxi-dev libxss-dev libxtst-dev \
@@ -65,21 +74,26 @@ cmake --build build --parallel
 ctest --test-dir build --output-on-failure
 ```
 
+Options: `-DQILIN_GEN_DIR=<dir>` builds `qilin_run` from lifted code; `-DQILIN_SANITIZE=address,undefined` (or `thread`) instruments the runtime's own code, not the generated code (`LSAN_OPTIONS=suppressions=tools/lsan.supp` hides graphics-driver leaks); `-DQILIN_CHECKED_MEMORY=ON` bounds-checks every guest memory access.
+
 CI builds and tests with warnings as errors on Linux x64 (GCC 14 and Clang 19), Linux ARM64 (GCC 14), macOS ARM64 and x64 (the runtime built for macOS 10.15) and Windows x64 (MSVC).
 
 ## Using it
 
 ```sh
-build/qilin info     path/to/default.xbe                 # header, sections, XDK libraries, kernel imports (JSON)
-build/qilin cfg      path/to/default.xbe --json cfg.json # function discovery + control flow
-build/qilin insns    path/to/default.xbe [--linear] -o listing.txt
-build/qilin suspects path/to/default.xbe                 # kept functions with problems, for review
-build/qilin coverage path/to/default.xbe [--list]        # every byte: code, table, padding or unknown (exit 3 if lifted code has unknown bytes)
-build/qilin lift     path/to/default.xbe --out gen/      # lift to C++ (gen/ is gitignored: never commit it)
-build/qilin_run      path/to/default.xbe [--game-dir DIR] [--data-dir DIR] [--ram-mb N] [--dump-frames DIR] [--dump-audio FILE.wav] [--frames N] [--gpu N] [--headless] [--fullscreen] [--mute]  # run it (built with -DQILIN_GEN_DIR=gen)
-
-Code that compiles lifted C++ must link the `qilin_runtime` CMake target (or pass `-ffp-contract=off`): SSE results are only bit-exact without fused multiply-add.
+build/qilin info     path/to/default.xbe [--json out.json]  # header, sections, XDK libraries, kernel imports
+build/qilin cfg      path/to/default.xbe [--json cfg.json]  # function discovery and control flow
+build/qilin insns    path/to/default.xbe [--linear] [-o listing.txt]
+build/qilin suspects path/to/default.xbe                    # kept functions with problems, for review
+build/qilin coverage path/to/default.xbe [--list]           # every byte: code, table, padding or unknown (exit 3 if lifted code has unknown bytes)
+build/qilin lift     path/to/default.xbe --out gen/ [--range lo-hi] [--only addr]  # lift to C++ (gen/ is gitignored: never commit it)
+build/qilin image    path/to/default.xbe out.bin            # the flat memory image
+build/qilin --version
+build/qilin_run      path/to/default.xbe [--game-dir DIR] [--data-dir DIR] [--ram-mb N] [--dump-frames DIR] [--dump-audio FILE.wav]
+                     [--frames N] [--gpu N] [--audio-channels 2|6] [--headless] [--fullscreen] [--mute]
 ```
+
+`--game-dir` is the extracted disc (default: `default.xbe`'s folder), `--data-dir` the saves and caches; `docs/runtime.md` covers every option. Code that compiles lifted C++ must link the `qilin_runtime` CMake target (or pass `-ffp-contract=off`): SSE results are only bit-exact without fused multiply-add.
 
 ### Full check against your copy of the game
 
@@ -87,7 +101,9 @@ Code that compiles lifted C++ must link the `qilin_runtime` CMake target (or pas
 tools/check/check_xbe.sh path/to/default.xbe
 ```
 
-This runs the unit tests and the CFG pass, then cross-checks Zydis against LLVM's disassembler. Finally it runs the differential test, which compares each lifted function with the original x86 code run in the Unicorn emulator. It needs Python 3, `libLLVM` (Debian/Ubuntu: `apt install libllvm18`) and `pip install unicorn`. Set `CXX` to a C++23 compiler for the differential test, which builds the lifted code at `-O2` with warnings as errors. For the runtime's own code, `cmake -B build -DQILIN_SANITIZE=address,undefined` (or `thread`) builds its libraries and tests with those sanitizers (the generated code isn't instrumented); `tools/lsan.supp` holds suppressions for leaks inside graphics drivers (`LSAN_OPTIONS=suppressions=tools/lsan.supp`). Pass `--sanitize` to `tools/difftest/difftest.py` for an UndefinedBehaviorSanitizer build, and `--variants 4` to add two float-heavy heap images, which make rounding differences more likely to show. `tools/check/x87/rounding.py` checks the x87 precision-control arithmetic against exact rational results, and `tools/check/x87/transcendental.py` checks `fsin`, `fcos`, `fptan`, `fpatan` and `fyl2x` against mpmath (`pip install mpmath`, which the differential test also needs). **On Windows**, the differential test and the x87 checks run with Zig's C++ compiler (`pip install ziglang unicorn mpmath`): `python tools/difftest/difftest.py --qilin C:/full/path/qilin.exe --xbe default.xbe --cxx "C:/full/path/zig.exe c++" --jobs 4` (it builds `libdifftest.dll`; each worker holds an emulator and the library, so a few hundred MB, and 14 at once ran a 32 GB machine out of memory), and `tools/check/x87/rounding.py 7 "C:/full/path/zig.exe c++"`, `transcendental.py --cxx "…"`. The decoder check is:
+Runs the unit tests, the CFG pass, the decoder check and the differential test. Needs Python 3, `libLLVM` (Debian/Ubuntu: `apt install libllvm18`) and `pip install unicorn mpmath`; `CXX` names the C++23 compiler.
+
+### Decoder check
 
 - **Strict on every reachable instruction:** same length and same mnemonic.
 - **Strict on a linear sweep of every code section too**, except for three classes it reports instead of failing, because they only occur in data bytes:
@@ -95,35 +111,63 @@ This runs the unit tests and the CFG pass, then cross-checks Zydis against LLVM'
   - LLVM returning a lone prefix byte;
   - encodings no Pentium III can run, such as `mov cs` or EVEX.
 
+### Differential test
+
+`tools/difftest/difftest.py` runs each lifted function, call trees included, against the original x86 in Unicorn, built at `-O2` with warnings as errors. `--sanitize` adds UndefinedBehaviorSanitizer; `--variants 4` adds two float-heavy heap images to expose rounding differences.
+
+### x87 checks
+
+`tools/check/x87/rounding.py` checks precision-controlled arithmetic against exact rationals; `transcendental.py` checks `fsin`, `fcos`, `fptan`, `fpatan` and `fyl2x` against mpmath.
+
+### On Windows
+
+The differential test and the x87 checks run with Zig's C++ compiler (`pip install ziglang unicorn mpmath`):
+
+```sh
+python tools/difftest/difftest.py --qilin C:/full/path/qilin.exe --xbe default.xbe --cxx "C:/full/path/zig.exe c++" --jobs 4
+python tools/check/x87/rounding.py 7 "C:/full/path/zig.exe c++"
+python tools/check/x87/transcendental.py --cxx "C:/full/path/zig.exe c++"
+```
+
+Each difftest worker takes a few hundred MB, so keep `--jobs` low.
+
 ## Layout
 
 | Path | What |
 |---|---|
-| `recomp/src/` | Recompiler core: `xbe` loader, `decoder` (Zydis wrapper), `cfg` (function discovery + control flow), `lifter` (x86 → C++), `main` (CLI) |
+| `recomp/src/` | Recompiler core: `xbe` loader, `decoder` (Zydis wrapper), `cfg` (function discovery and control flow), `lifter` (x86 → C++), `main` (CLI) |
 | `recomp/tests/` | Unit tests on a synthetic in-memory XBE, so they need no game files |
-| `tools/analysis/` | The original Python analysis prototype, using LLVM via ctypes. Kept as the reference the C++ port is checked against |
 | `recomp/runtime/` | Runtime headers the generated C++ includes (guest memory, flag and float helpers, x87 maths) |
-| `recomp/runtime/host/` | The runtime's host side: `qilin_run`, the replacement registry, the guest heap and the replacements themselves (kernel, file system, Direct3D, XInput) |
+| `recomp/runtime/host/` | `qilin_run`, the replacement registry, the guest heap and the replacements (kernel, file system, Direct3D, DirectSound, XInput) |
 | `recomp/runtime/gfx/` | The renderer: Vulkan 1.3, loaded at run time |
-| `recomp/runtime/platform/` | The window, the controllers and sound output, through SDL3 |
+| `recomp/runtime/platform/` | The window, controllers and sound output, through SDL3 |
 | `recomp/runtime/audio/` | The audio engine: voices (PCM, Xbox ADPCM) and the 48 kHz mixer |
-| `tools/check/` | The LLVM decoder cross-check, the x87 rounding and transcendental cross-checks, the C++ exception-handling report and the full local check script |
+| `recomp/runtime/ui/` | The settings menu (Dear ImGui) |
+| `tools/analysis/` | The Python analysis prototype (LLVM via ctypes), the reference the C++ port is checked against |
+| `tools/check/` | The LLVM decoder cross-check, the x87 checks, the C++ exception-handling report, the launcher check and the full local check script |
 | `tools/difftest/` | Differential test: lifted C++ against the original x86 under Unicorn |
-| `third_party/` | Vendored dependencies: Zydis and Zycore (MIT), the Vulkan headers (Apache-2.0 or MIT), volk (MIT), nxdk's kernel export list (CC0). See `third_party/README.md` |
-| `docs/` | Design notes |
+| `tools/gen/` | Generators for committed sources: SPIR-V for FSR, SMAA and depth packing, the kernel export list, the XDK symbol names |
+| `tools/player-kit/` | The Windows download: packaging, launcher and its README |
+| `tools/build-ghoulies.ps1` | The source build and launcher behind `Play Ghoulies.bat` and `Update Ghoulies.bat` |
+| `third_party/` | Vendored dependencies; see `third_party/README.md` |
+| `docs/` | Design notes, analysis and validation records |
+
+## Versions and changes
+
+Releases are tagged `vX.Y.Z` on GitHub, and every release is recorded in [`CHANGELOG.md`](CHANGELOG.md). The version lives in one place, `project(... VERSION ...)` in `CMakeLists.txt`, and `qilin --version` prints it. A minor bump (0.**x**) marks a milestone and a patch bump (0.x.**y**) a fix. 1.0.0 will be the first build that plays the whole game.
 
 ## Licence
 
-This project's own code and documentation are under the [GNU General Public License, version 3](LICENSE) (GPL-3.0), as in the other QilinRecomp projects: you may use, share, change and sell it, but anything you distribute that is built from it must come with its full source under the same licence. (Versions before 2026-11-21 were released under MIT, and those copies stay under MIT.) The vendored code in `third_party/` keeps its own licences, listed in `third_party/README.md`: Zydis and Zycore, Dear ImGui, FSR 1, SMAA, volk and XbSymbolDatabase (MIT), the Vulkan headers (Apache-2.0 or MIT) and nxdk's kernel export list (CC0-1.0). SDL3, fetched by CMake at build time, keeps its zlib licence.
+This project's own code and documentation are under the [GNU General Public License, version 3](LICENSE) (GPL-3.0): you may use, share, change and sell it, but anything you distribute that is built from it must come with its full source under the same licence. Versions before 2026-11-21 were released under MIT, and those copies stay under MIT. The vendored code in `third_party/` keeps its own licences, listed in `third_party/README.md`: Zydis and Zycore, Dear ImGui, FSR 1, SMAA, volk and XbSymbolDatabase (MIT), the Vulkan headers (Apache-2.0 or MIT) and nxdk's kernel export list (CC0-1.0). SDL3, fetched by CMake at build time, keeps its zlib licence.
 
 The game itself is Microsoft's and Rare's and is not covered by anything here: you need your own copy, and nothing built from it may be shared.
 
-## Design targets (short version)
+## Design targets
 
-- **Efficiency and reliability come first.** Every choice is judged by whether it makes the game cheaper to run on low-end hardware, and whether it fails loudly instead of misbehaving quietly.
+- **Efficiency and reliability come first.** Every choice is judged by whether it makes the game cheaper to run on low-end hardware, and whether it fails loudly instead of misbehaving quietly. A Raspberry Pi 4-class board is the reference for typical low-end hardware.
 - **Static recompilation, x86 → C++, compiled ahead of time.** No interpreter and no JIT. Hand-written C++ can override any lifted function.
-- **No DirectX.** D3D8 is translated at API level to Vulkan 1.3, using a deliberately small baseline feature set (1.3 core plus what the Pi 4's driver offers) so one render path runs on everything from low-end ARM GPUs upwards. macOS runs through MoltenVK.
-- **The kernel and XDK libraries are replaced natively**, not recompiled: D3D8, DSOUND, XACT, XPP, WMADEC and Bink. The C runtime and XAPI are lifted with the game, for exact behaviour, over a native kernel.
+- **Vulkan 1.3 only.** D3D8 is translated at API level to a small baseline (1.3 core plus what the Pi 4's driver offers), so one render path runs everywhere. macOS runs through MoltenVK.
+- **The kernel and XDK libraries are replaced natively**, not recompiled: D3D8, DSOUND, XPP, WMADEC and Bink. The C runtime, XAPI, XACT and XGraphics are lifted with the game, for exact behaviour, over a native kernel.
 - **Ground truth is xemu** running the original game.
 
-See `docs/` for the full roadmap and the analysis notes.
+See [`docs/`](docs/) for the roadmap and the analysis notes.
