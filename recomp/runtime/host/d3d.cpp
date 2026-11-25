@@ -1451,7 +1451,7 @@ uint32_t attribute_bytes(uint32_t format) {
     switch (type) {
         case 0: case 4: return size;        // UB_D3D, UB_OGL
         case 1: case 5: return 2 * size;    // S1, S32K
-        case 2: return 4 * size;            // F
+        case 2: return size == 7 ? 12 : 4 * size;  // F; size 7 is "3W" (D3DVSDT_FLOAT2H): three floats
         case 6: return 4 * size;            // CMP (11:11:10)
         default: return 0;
     }
@@ -1526,6 +1526,11 @@ void convert_attribute(const uint8_t* p, uint32_t format, float* out) {
             }
             break;
         case 2:  // F
+            if (size == 7) {  // 3W, D3DVSDT_FLOAT2H: (x, y, 0, w) from three floats
+                std::memcpy(&out[0], p, 8);
+                std::memcpy(&out[3], p + 8, 4);
+                break;
+            }
             for (uint32_t k = 0; k < size && k < 4; ++k) std::memcpy(&out[k], p + 4 * k, 4);
             break;
         case 6: {  // CMP: 11, 11 and 10 signed bits, normalized
@@ -2571,6 +2576,19 @@ constexpr uint32_t kRsSpecularEnable = 103, kRsTextureFactor = 148;
 constexpr uint32_t kTsColorOp = 12, kTsAlphaOp = 16, kTsResultArg = 20;
 constexpr uint32_t kOne = 0x20;  // the zero register, inverted: 1
 
+// The final combiner the original's fog flush (0x178AC0) sets when the
+// texture stages run without a pixel shader, and when a pixel shader has no
+// final combiner of its own (its +0x784 flag 0): with fog, rgb = fog.a × r0
+// + (1 − fog.a) × fog colour; without, r0; r0 + the specular colour
+// (V1R0_SUM) in place of r0 with D3DRS_SPECULARENABLE; alpha r0's, the sum
+// clamped.
+void default_final_combiner(const rt::Context& c, gfx::nv2a::CombinerSetup& cs) {
+    auto rs = [&](uint32_t i) { return ld(c, kRenderStateTable + 4 * i); };
+    const bool specular = rs(kRsSpecularEnable) != 0;
+    cs.final_abcd = rs(kRsFogEnable) ? 0x130C0300u | (specular ? 0x20000u : 0u) : (specular ? 0x0Eu : 0x0Cu);
+    cs.final_efgh = 0x1C80u;
+}
+
 void fixed_function_combiners(rt::Context& c, const char* fn, gfx::nv2a::CombinerSetup& cs, std::vector<float>& fsu) {
     auto rs = [&](uint32_t i) { return ld(c, kRenderStateTable + 4 * i); };
     auto ts = [&](uint32_t stage, uint32_t i) { return ld(c, kTextureStateTable + 4 * (32 * stage + i)); };
@@ -2632,13 +2650,7 @@ void fixed_function_combiners(rt::Context& c, const char* fn, gfx::nv2a::Combine
     }
     cs.combiner_count = stages | 0x1000u;  // each stage its own C0 (all the texture factor)
     cs.texture_modes = modes;
-    // The final combiner, as the original's fog flush (0x178AC0) sets it:
-    // with fog, rgb = fog.a × r0 + (1 − fog.a) × fog colour; without, r0;
-    // r0 + the specular colour (V1R0_SUM) in place of r0 with
-    // D3DRS_SPECULARENABLE; alpha r0's, the sum clamped.
-    const bool specular = rs(kRsSpecularEnable) != 0;
-    cs.final_abcd = rs(kRsFogEnable) ? 0x130C0300u | (specular ? 0x20000u : 0u) : (specular ? 0x0Eu : 0x0Cu);
-    cs.final_efgh = 0x1C80u;
+    default_final_combiner(c, cs);
     for (uint32_t i = 0; i < 8; ++i) color_to_float(rs(kRsTextureFactor), &fsu[(gfx::nv2a::kFsC0 + i) * 4]);
 }
 
@@ -2744,6 +2756,8 @@ void issue_draw(rt::Context& c, Device& d, const char* fn, uint32_t prim, Vertic
     if (fixed_pixels) {
         fixed_function_combiners(c, fn, cs, fsu);
         cs.alpha_func = rs(kRsAlphaTestEnable) ? rs(kRsAlphaFunc) : 0;
+    } else if (!ld(c, dev + 0x784)) {
+        default_final_combiner(c, cs);  // as the original's flush: fog and specular for shaders without one
     }
     const FogUnit fog = fog_unit(c);
     cs.fog_mode = fog.mode;
@@ -2761,7 +2775,11 @@ void issue_draw(rt::Context& c, Device& d, const char* fn, uint32_t prim, Vertic
         if (stage && (mode == 6 || mode == 7)) {
             const uint32_t from = fixed_pixels ? stage - 1 : stage;
             auto tsf = [&](uint32_t i) { return std::bit_cast<float>(ld(c, kTextureStateTable + 4 * (32 * from + i))); };
-            for (uint32_t k = 0; k < 4; ++k) fsu[(gfx::nv2a::kFsBumpMat + stage) * 4 + k] = tsf(kTsBumpEnvMat00 + k);
+            // The XDK numbers them MAT00, MAT01, MAT11, MAT10 (22-25: the game's own
+            // setter, 0x15AE49, stores its matrix's M10 to 25 and M11 to 24); the
+            // shader takes M00, M01, M10, M11.
+            constexpr uint32_t kOrder[4] = {0, 1, 3, 2};
+            for (uint32_t k = 0; k < 4; ++k) fsu[(gfx::nv2a::kFsBumpMat + stage) * 4 + k] = tsf(kTsBumpEnvMat00 + kOrder[k]);
             fsu[(gfx::nv2a::kFsBumpLum + stage) * 4 + 0] = tsf(kTsBumpEnvLScale);
             fsu[(gfx::nv2a::kFsBumpLum + stage) * 4 + 1] = tsf(kTsBumpEnvLOffset);
         }
@@ -2910,6 +2928,18 @@ void issue_draw(rt::Context& c, Device& d, const char* fn, uint32_t prim, Vertic
     cmd.write_mask = uint8_t((cw >> 16 & 1) | (cw >> 8 & 1) << 1 | (cw & 1) << 2 | (cw >> 24 & 1) << 3);
     const uint32_t zenable = rs(kRsZEnable);
     if (zenable == 2) notice_once(d, "w-buffering (D3DZB_USEW, drawn as z)");
+    // States nothing here reads, at their defaults wherever the audit looked
+    // (docs/graphics.md): said once if a draw meets one that isn't.
+    if (ld(c, 0x181DA4)) notice_once(d, "two-sided lighting (D3DRS_TWOSIDEDLIGHTING: back faces get the front colours)");
+    for (const uint32_t fill : {ld(c, 0x181D9C), ld(c, 0x181DA0)})
+        if (fill && fill != 0x1B02u) notice_once(d, "point or wireframe fill (D3DRS_FILLMODE, D3DRS_BACKFILLMODE: drawn solid)");
+    if (ld(c, 0x181DC8)) notice_once(d, "a logic op (D3DRS_LOGICOP: blended as without)");
+    for (uint32_t stage = 0; stage < 4; ++stage) {
+        if (!(cs.texture_modes >> (5 * stage) & 0x1F)) continue;
+        if (ld(c, kTextureStateTable + 4 * (32 * stage + 0x9))) notice_once(d, "colour keys (D3DTSS_COLORKEYOP: texels kept)");
+        if (ld(c, kTextureStateTable + 4 * (32 * stage + 0xA))) notice_once(d, "signed texture channels (D3DTSS_COLORSIGN: read unsigned)");
+        if (ld(c, kTextureStateTable + 4 * (32 * stage + 0xB))) notice_once(d, "alpha kill (D3DTSS_ALPHAKILL: texels of alpha 0 kept)");
+    }
     cmd.depth_test = zenable != 0;
     cmd.depth_write = zenable != 0 && rs(kRsZWriteEnable);
     cmd.depth_compare = compare(fn, rs(kRsZFunc));

@@ -5,6 +5,7 @@
 //
 // The semantics follow the NV2A as documented by xemu's vertex shader
 // translator (nv2a/vsh.c), which was checked against hardware.
+#include <limits>
 #include <stdexcept>
 
 #include "nv2a_shaders.hpp"
@@ -131,15 +132,22 @@ struct Vs {
                 const Id t = b.ext(glsl::FAbs, f, {s});
                 const Id l = b.ext(glsl::Log2, f, {t});
                 const Id e = b.ext(glsl::Floor, f, {l});
-                const Id m = b.op(op::FDiv, f, {t, b.ext(glsl::Exp2, f, {e})});
+                // The mantissa is 1 for 0 and infinity, as the hardware's (0/0 and inf/inf here otherwise).
+                const Id finite = b.op(op::LogicalAnd, boolean,
+                                       {b.op(op::FOrdGreaterThan, boolean, {t, b.c_float(0)}),
+                                        b.op(op::FOrdLessThan, boolean, {t, b.c_float(std::numeric_limits<float>::infinity())})});
+                const Id m = b.op(op::Select, f, {finite, b.op(op::FDiv, f, {t, b.ext(glsl::Exp2, f, {e})}), b.c_float(1)});
                 return b.vec4(e, m, l, b.c_float(1));
             }
             case vsh::Ilu::Lit: {
                 const float eps = 1.0f / 256.0f;
                 const Id diffuse = b.ext(glsl::FMax, f, {x(c), b.c_float(0)});
                 const Id power = b.ext(glsl::FClamp, f, {w(c), b.c_float(-(128 - eps)), b.c_float(128 - eps)});
-                const Id spec = b.ext(glsl::Pow, f, {b.ext(glsl::FMax, f, {y(c), b.c_float(0)}), power});
-                const Id lit = b.op(op::FOrdGreaterThan, boolean, {diffuse, b.c_float(0)});
+                // pow(0, p) is undefined in SPIR-V (NaN on GPUs that take exp2(p × log2 0)):
+                // no specular unless y > 0, as xemu.
+                const Id spec = b.ext(glsl::Pow, f, {b.ext(glsl::FMax, f, {y(c), b.c_float(1e-30f)}), power});
+                const Id lit = b.op(op::LogicalAnd, boolean, {b.op(op::FOrdGreaterThan, boolean, {diffuse, b.c_float(0)}),
+                                                              b.op(op::FOrdGreaterThan, boolean, {y(c), b.c_float(0)})});
                 return b.vec4(b.c_float(1), diffuse, b.op(op::Select, f, {lit, spec, b.c_float(0)}), b.c_float(1));
             }
             default: throw std::logic_error("vertex program: ILU operation");
