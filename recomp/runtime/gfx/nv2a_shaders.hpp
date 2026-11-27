@@ -58,6 +58,7 @@ struct CombinerSetup {
     uint32_t point_sprite = 0;
     // D3DTSS_ALPHAKILL per stage (bit n for stage n): pixels whose texel there has alpha 0 are discarded.
     uint32_t alpha_kill = 0;
+    uint32_t two_sided = 0;  // select back diffuse/specular outputs on back faces
 
     bool operator==(const CombinerSetup&) const = default;
     uint64_t hash() const;

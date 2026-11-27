@@ -52,6 +52,33 @@ int main() {
         std::memcpy(ram.get() + 0x2000, presentation.data(), sizeof(presentation));
         host::call_guest(context, create->address, {0, 0, 0, 0, 0x2000, 0x3000});
         if (context.eax) return 1;
+        // Exercise the native viewport setter against a synthetic surface.
+        // Origins outside a temporary target and overflowing extents must
+        // yield an empty/clipped viewport, never enormous unsigned sizes.
+        const auto* viewport = host::xdk_symbol("D3DDevice_SetViewport");
+        if (!viewport) return 1;
+        const auto read32 = [&](uint32_t a) { uint32_t v; std::memcpy(&v, ram.get() + a, 4); return v; };
+        const auto write32 = [&](uint32_t a, uint32_t v) { std::memcpy(ram.get() + a, &v, 4); };
+        constexpr uint32_t dev = 0x181E10, surface = 0x4000, vp = 0x5000;
+        const uint32_t saved = read32(dev + 0x19F4);
+        write32(surface + 12, 0x12u << 8);
+        write32(surface + 16, 63u | 47u << 12);
+        write32(dev + 0x19F4, surface);
+        struct ViewCase { uint32_t x, y, w, h, cx, cy, cw, ch; };
+        for (const auto& v : {ViewCase{0, 0, 64, 48, 0, 0, 64, 48},
+                              {60, 45, 20, 20, 60, 45, 4, 3},
+                              {100, 100, 8, 8, 64, 48, 0, 0},
+                              {1, 1, UINT32_MAX, UINT32_MAX, 1, 1, 63, 47},
+                              {UINT32_MAX, UINT32_MAX, 2, 2, 64, 48, 0, 0},
+                              {32, 24, 0, 0, 32, 24, 0, 0}}) {
+            const std::array<uint32_t, 6> values{v.x, v.y, v.w, v.h, 0, 0x3F800000};
+            std::memcpy(ram.get() + vp, values.data(), sizeof(values));
+            host::call_guest(context, viewport->address, {vp});
+            if (read32(dev + 0xED0) != v.cx || read32(dev + 0xED4) != v.cy ||
+                read32(dev + 0xED8) != v.cw || read32(dev + 0xEDC) != v.ch ||
+                read32(dev + 0xEE0) != 0 || read32(dev + 0xEE4) != 0x3F800000) return 1;
+        }
+        write32(dev + 0x19F4, saved);
         host::shutdown_d3d();
         host::shutdown_d3d(); // idempotent; a subsequent device can be created
         // Cache streams are closed by renderer teardown, not left alive until

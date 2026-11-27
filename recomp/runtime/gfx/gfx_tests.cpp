@@ -7,6 +7,7 @@
 #include <fstream>
 #include <iterator>
 #include <string>
+#include <utility>
 
 #include "gfx.hpp"
 #include "nv2a_shaders.hpp"
@@ -28,6 +29,162 @@ int failures = 0;
 bool pixel_is(const gfx::Image& im, uint32_t x, uint32_t y, uint8_t r, uint8_t g, uint8_t b, uint8_t a) {
     const uint8_t* p = &im.rgba[(size_t(y) * im.width + x) * 4];
     return p[0] == r && p[1] == g && p[2] == b && p[3] == a;
+}
+// Synthetic readback regressions: lighting, transparent effects, temporary
+// depth attachments, texture detail and submission rollover, without a disc.
+void graphics_regressions(gfx::Renderer& r, const gfx::Config& cfg) {
+    gfx::vsh::Program prog;
+    for (const auto& [input, output] : {std::pair{0u, gfx::vsh::kPos}, {3u, gfx::vsh::kD0}, {4u, gfx::vsh::kD1},
+                                      {5u, gfx::vsh::kB0}, {6u, gfx::vsh::kB1}, {9u, gfx::vsh::kT0}}) {
+        gfx::vsh::Instruction mov{};
+        mov.mac = gfx::vsh::Mac::Mov; mov.a.kind = gfx::vsh::Src::Input; mov.a.index = uint8_t(input);
+        mov.out_mask = 0xF; mov.out_address = uint8_t(output);
+        prog.code.push_back(mov);
+    }
+    prog.code.back().final = true;
+    constexpr uint32_t inputs = 1u | 1u << 3 | 1u << 4 | 1u << 5 | 1u << 6 | 1u << 9;
+    const auto vs = gfx::nv2a::vertex_program(prog, inputs);
+    std::vector<float> vsu(gfx::nv2a::kVsUniformVec4s * 4, 0), fsu(gfx::nv2a::kFsUniformVec4s * 4, 0);
+    vsu[gfx::nv2a::kVsPixels * 4] = vsu[gfx::nv2a::kVsPixels * 4 + 1] = 1;
+    vsu[gfx::nv2a::kVsScreen * 4] = 2.0f / cfg.width;
+    vsu[gfx::nv2a::kVsScreen * 4 + 1] = 2.0f / cfg.height;
+    vsu[gfx::nv2a::kVsScreen * 4 + 2] = 1;
+    for (int i = 0; i < 4; ++i) fsu[gfx::nv2a::kFsTexScale * 4 + i] = 1;
+    const float positions[3][4] = {{0, 0, .5f, 1}, {128, 0, .5f, 1}, {0, 96, .5f, 1}};
+    float front0[4] = {1, 1, 1, 1}, front1[4] = {.75f, .75f, .75f, 1};
+    const float back0[4] = {0, 1, 0, .25f}, back1[4] = {0, 0, 1, .5f}, uv[4] = {.5f, .5f, 0, 1};
+    const uint32_t reverse[3] = {0, 2, 1};
+    const float black[4] = {};
+    gfx::DrawCmd d;
+    d.vs_key = 10000; d.vs_code = &vs;
+    d.inputs = inputs; d.constant_inputs = inputs & ~1u; d.vertex_count = 3;
+    d.attributes[0] = &positions[0][0]; d.attributes[3] = front0; d.attributes[4] = front1;
+    d.attributes[5] = back0; d.attributes[6] = back1; d.attributes[9] = uv;
+    d.vs_uniforms = vsu.data(); d.fs_uniforms = fsu.data(); d.scissor = {0, 0, cfg.width, cfg.height};
+    uint64_t key = 10001;
+    auto draw = [&](const gfx::nv2a::CombinerSetup& cs) {
+        const auto fs = gfx::nv2a::combiners(cs);
+        d.fs_key = key++; d.fs_code = &fs;
+        if (const char* dir = std::getenv("QILIN_SPV_DIR"))
+            if (std::FILE* f = std::fopen((std::string(dir) + "/regression_ps_" + std::to_string(d.fs_key) + ".spv").c_str(), "wb")) {
+                std::fwrite(fs.data(), 4, fs.size(), f); std::fclose(f);
+            }
+        r.draw(d);
+    };
+    auto check = [&](const gfx::nv2a::CombinerSetup& cs, int wr, int wg, int wb, int wa) {
+        r.clear(nullptr, 0, gfx::kClearColor, black, 1, 0); draw(cs);
+        const auto im = r.read_back_buffer(); const auto* p = &im.rgba[(5 * im.width + 5) * 4];
+        const int want[] = {wr, wg, wb, wa};
+        for (int i = 0; i < 4; ++i) {
+            if (std::abs(int(p[i]) - want[i]) > 1)
+                std::fprintf(stderr, "graphics case %llu channel %d got %u expected %d\n",
+                             static_cast<unsigned long long>(d.fs_key), i, p[i], want[i]);
+            CHECK(std::abs(int(p[i]) - want[i]) <= 1);
+        }
+    };
+    gfx::nv2a::CombinerSetup cs{};
+    cs.combiner_count = 1; cs.rgb_inputs[0] = 0x01200000; cs.rgb_outputs[0] = 0xC00;
+    cs.final_abcd = 0x020E0000; cs.final_efgh = 0x1C00;
+    for (int i = 0; i < 4; ++i) fsu[gfx::nv2a::kFsC0 * 4 + i] = .75f;
+    for (int i = 0; i < 4; ++i) fsu[gfx::nv2a::kFsFinalC1 * 4 + i] = .5f;
+    check(cs, 191, 191, 191, 255);
+    cs.final_efgh |= 0x80; check(cs, 128, 128, 128, 255);
+    cs.rgb_inputs[0] = 0x01E40000; cs.final_abcd = 0xE; cs.final_efgh = 0x1C00;
+    for (float& v : front1) v = .25f;
+    check(cs, 0, 0, 0, 255);
+    cs.final_abcd = 0x020E0000; cs.final_efgh |= 0x20; check(cs, 255, 255, 255, 255);
+    cs.final_abcd = 0x20; cs.final_efgh = 0x1E00; check(cs, 255, 255, 255, 0);
+    // Transparent effect rectangles must leave the background untouched.
+    d.blend = true; d.src_color = gfx::BlendFactor::SrcAlpha; d.dst_color = gfx::BlendFactor::OneMinusSrcAlpha;
+    check(cs, 0, 0, 0, 0); d.blend = false;
+    cs.final_efgh = 0x20201F00; check(cs, 255, 255, 255, 0);
+    cs = {}; cs.two_sided = 1; cs.final_abcd = 4; cs.final_efgh = 0x1400;
+    front0[1] = front0[2] = 0;
+    check(cs, 255, 0, 0, 255);
+    d.indices = reverse; d.index_count = 3; check(cs, 0, 255, 0, 64);
+    d.cull = gfx::Cull::Clockwise; check(cs, 0, 255, 0, 64);
+    cs.final_abcd = 5; cs.final_efgh = 0x1500; check(cs, 0, 0, 255, 128);
+    d.cull = gfx::Cull::CounterClockwise; check(cs, 0, 0, 0, 0);
+    d.cull = gfx::Cull::None; cs.two_sided = 0; cs.final_abcd = 4; cs.final_efgh = 0x1400;
+    check(cs, 255, 0, 0, 255);
+
+    // A default depth buffer must not reappear when the game unbinds it.
+    r.set_render_target(0, gfx::Renderer::kDeviceDepth);
+    r.clear(nullptr, 0, gfx::kClearDepth | gfx::kClearStencil, black, .1f, 1);
+    d.depth_test = true; check(cs, 0, 0, 0, 0);
+    r.set_render_target(0, 0); check(cs, 255, 0, 0, 255);
+    const auto depth = r.create_depth_target(cfg.width, cfg.height);
+    r.set_render_target(0, depth);
+    r.clear(nullptr, 0, gfx::kClearDepth | gfx::kClearStencil, black, .9f, 2);
+    check(cs, 255, 0, 0, 255);
+    r.set_render_target(0, gfx::Renderer::kDeviceDepth); check(cs, 0, 0, 0, 0);
+    d.depth_test = false; d.stencil_test = true; d.stencil_compare = gfx::Compare::Equal; d.stencil_ref = 2;
+    r.set_render_target(0, depth); check(cs, 255, 0, 0, 255);
+    r.set_render_target(0, gfx::Renderer::kDeviceDepth); check(cs, 0, 0, 0, 0);
+    r.set_render_target(0, 0); check(cs, 255, 0, 0, 255);
+    d.stencil_test = false;
+    // Destroy a currently attached custom depth buffer: subsequent draws
+    // must neither retain it nor silently substitute the default buffer.
+    r.set_render_target(0, depth); r.destroy_texture(depth);
+    d.depth_test = true; check(cs, 255, 0, 0, 255); d.depth_test = false;
+    r.set_render_target(0, gfx::Renderer::kDeviceDepth);
+
+    // End and restart attachment passes without changing their layouts.
+    // Synchronization validation checks the dependency between the passes.
+    const auto scratch = r.create_render_target(cfg.width, cfg.height);
+    cs.final_abcd = 1; cs.final_efgh = 0x20001400;
+    for (int i = 0; i < 4; ++i) fsu[gfx::nv2a::kFsFinalC0 * 4 + i] = .25f;
+    r.clear(nullptr, 0, gfx::kClearColor, black, 1, 0); draw(cs);
+    r.set_render_target(scratch, 0); r.clear(nullptr, 0, gfx::kClearColor, black, 1, 0); draw(cs);
+    r.set_render_target(0, gfx::Renderer::kDeviceDepth);
+    d.blend = true; d.src_color = d.dst_color = gfx::BlendFactor::One;
+    d.src_alpha = gfx::BlendFactor::One; d.dst_alpha = gfx::BlendFactor::Zero;
+    draw(cs);
+    const auto combined = r.read_back_buffer();
+    CHECK(std::abs(int(combined.rgba[(5 * combined.width + 5) * 4]) - 128) <= 1);
+    d.blend = false; r.destroy_texture(scratch);
+
+    // Texture sets exceed the deliberately small test pool. Uniforms and
+    // indexed vertex data must all live in the new slot after a rollover.
+    cs = {}; cs.combiner_count = 1; cs.rgb_inputs[0] = 0x01040000; cs.rgb_outputs[0] = 0xC00;
+    cs.final_abcd = 0xC; cs.final_efgh = 0x1C00;
+    const auto fs = gfx::nv2a::combiners(cs); d.fs_code = &fs; d.fs_key = key++;
+    std::vector<uint32_t> textures;
+    r.clear(nullptr, 0, gfx::kClearColor, black, 1, 0);
+    for (uint32_t i = 0; i < 2 * cfg.descriptor_sets; ++i) {
+        gfx::TextureData tex; tex.width = tex.height = 1; tex.rgba = {255, 255, 255, 255};
+        textures.push_back(r.create_texture(tex)); d.textures[0] = textures.back();
+        d.scissor = {int32_t(i % cfg.width), 5, 1, 1};
+        front0[1] = float(i & 1);
+        for (int k = 0; k < 4; ++k) fsu[gfx::nv2a::kFsC0 * 4 + k] = (i & 1) ? .75f : .5f;
+        r.draw(d);
+    }
+    const auto im = r.read_back_buffer();
+    for (uint32_t x = 0; x < cfg.width; ++x) {
+        const auto* p = &im.rgba[(5 * im.width + x) * 4]; const int want = (x & 1) ? 191 : 128;
+        CHECK(std::abs(int(p[0]) - want) <= 1);
+        CHECK(std::abs(int(p[1]) - ((x & 1) ? want : 0)) <= 1);
+        CHECK(p[2] == 0 && p[3] == 255);
+    }
+    for (const auto tex : textures) r.destroy_texture(tex);
+    d.scissor = {0, 0, cfg.width, cfg.height};
+
+    // Each mip is a different solid colour, so sampling the wrong one is
+    // observable even with magnification and constant texture coordinates.
+    gfx::TextureData tex; tex.width = tex.height = 4; tex.levels = 3;
+    for (uint32_t l = 0; l < 3; ++l)
+        for (uint32_t i = 0; i < tex.level_width(l) * tex.level_height(l); ++i)
+            for (uint32_t ch = 0; ch < 4; ++ch) tex.rgba.push_back(ch == l || ch == 3 ? 255 : 0);
+    const auto id = r.create_texture(tex); d.textures[0] = id;
+    cs = {}; cs.texture_modes = 1; cs.texture_dims[0] = 2; cs.final_abcd = 8; cs.final_efgh = 0x1800;
+    auto& smp = d.samplers[0]; smp.mipmaps = true; smp.max_level = 2; smp.anisotropy = 0;
+    for (const uint32_t minimum : {0u, 1u, 2u, 99u}) {
+        smp.min_level = minimum;
+        check(cs, minimum == 0 ? 255 : 0, minimum == 1 ? 255 : 0, minimum >= 2 ? 255 : 0, 255);
+    }
+    smp.mipmaps = false; check(cs, 255, 0, 0, 255); r.destroy_texture(id);
+    CHECK(r.validation_errors() == 0);
+    std::puts("graphics regressions: combiners, back faces, depth/stencil, pass ordering, descriptor rollover and mip limits passed");
 }
 }  // namespace
 
@@ -225,6 +382,7 @@ mad oPos.xyz, oPos.xyzz, r1.x, c-37.xyzz
     gfx::Config cfg;
     cfg.width = 64;
     cfg.height = 48;
+    cfg.descriptor_sets = 32;
     cfg.validation = true;  // if the layers are installed
     std::string error;
     auto r = gfx::Renderer::create(cfg, &error);
@@ -318,6 +476,8 @@ mad oPos.xyz, oPos.xyzz, r1.x, c-37.xyzz
         CHECK(tex != 0);
         r->destroy_texture(tex);
     }
+
+    graphics_regressions(*r, cfg);
 
     // DXT1, 3 and 5 sampled from their blocks on the GPU (BC1-3) against the
     // CPU decoder: an 8×8 texture of pseudo-random blocks (both DXT1 modes,
@@ -446,7 +606,7 @@ mad oPos.xyz, oPos.xyzz, r1.x, c-37.xyzz
         } else {
             std::printf("depth targets can't be sampled on this device: packing skipped\n");
         }
-        r->set_render_target(0, 0);
+        r->set_render_target(0, gfx::Renderer::kDeviceDepth);
         r->destroy_texture(packed);
         r->destroy_texture(depth);
         r->destroy_texture(target);

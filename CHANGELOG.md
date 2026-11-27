@@ -41,6 +41,30 @@ The first seven from a review of the graphics code against the NV2A and the game
 - **The difftest harness's `rdtsc` gives the reference's clock** (from 0 each trial, 1000 a read) instead of trapping, so code that reads it (`0x1AFA60`) compares.
 - **The x87 sticky exception flags are cleared before each `fnstsw`/`fstsw` in the reference,** as the lifted model keeps only C0-C3 and TOP (`docs/recompiler-core.md`). The one difference it hid was `0x1C8E8B`'s ZE bit left in `eax`.
 
+## [0.48.2] - 2026-11-27
+
+### Fixed
+- Back-buffer rendering now uses the depth/stencil attachment the game actually selected: the device buffer, a different depth surface, or none. Previously it always used the device buffer, so an unbound depth/stencil test could still hide pixels and a temporary buffer's mask was ignored. Destroying a custom depth buffer attached to the back buffer detaches it safely.
+- Viewport clipping handles origins outside a smaller target and overflowing extents without unsigned wraparound or enormous widths/heights. Valid viewports retain their existing dimensions and depth range.
+- Restarted dynamic-rendering passes explicitly order writes to colour/depth attachments even when their layouts stay the same. The previous early return only considered layout changes; Vulkan does not guarantee ordering across separate rendering instances. This removes that dependency on driver behaviour; the software driver did not reproduce a visible failure from this omission.
+
+### Diagnostics and tests
+- F9 captures include model-view/composite matrix changes, projection updates, viewport, film format, aspect ratio, time step and selected targets, including ordinary back-buffer draws omitted by the detailed draw filter. These are for investigating the reported basement pickup camera; no scene-specific camera fix is claimed without a reproducer.
+- Added pixel readback for unbound/replaced/destroyed back-buffer depth attachments, stencil masks, interrupted passes, and transparent effect rectangles, plus native viewport boundary/overflow tests over two device lifetimes. Restoring the previous attachment behaviour fails six pixel checks; restoring the previous viewport arithmetic fails the native test.
+- See [the validation record](docs/validation-0.48.2.md) for completed checks and remaining in-game verification.
+
+## [0.48.1] - 2026-11-27
+
+### Fixed
+- Final-combiner inputs retain values above one until the final arithmetic unless `CLAMP_SUM` requests saturation. Signed `V1R0_SUM` terms are added before mapping, and complements use signed values. RGB-only `V1R0_SUM` and `EF_PROD` expose zero alpha instead of unrelated values affecting transparency.
+- Two-sided lighting selects back diffuse/specular vertex outputs on back faces. Clockwise front-face winding stays stable when culling changes.
+- Descriptor-pool rollover occurs before uploading vertex, index and uniform data, so every part of a draw uses the resulting submission slot's ring. Draws roll over before exhausting the pool, leaving space for presentation. A configurable smaller pool allows inexpensive regression tests.
+- `D3DTSS_MAXMIPLEVEL` limits the most detailed sampled mip and clamps to the available levels. Disabling mip filtering still uses level zero.
+
+### Tests
+- Pixel readback covers final-combiner arithmetic/alpha, both face colours and culling modes, descriptor rollover with changing constants and indexed geometry, and mip selection including oversized limits. Restoring the previous combiner translator failed 21 pixel checks before the additional transparency regression was added.
+- The previously unpublished patch was restored against upstream commit `45495d4` after the workspace resumed from an older snapshot; these fixes and the 0.48.2 changes are revalidated together.
+
 ## [0.48.0] - 2026-11-22
 
 ### Changed

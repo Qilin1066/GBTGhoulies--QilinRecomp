@@ -2033,6 +2033,7 @@ gfx::SamplerDesc stage_sampler(rt::Context& c, const char* fn, uint32_t stage, c
     s.mipmaps = ts(5) != 0 && levels > 1;
     s.mip = ts(5) >= 2 ? gfx::Filter::Linear : gfx::Filter::Nearest;
     s.max_level = levels ? levels - 1 : 0;
+    s.min_level = s.mipmaps ? std::min(ts(7), s.max_level) : 0;
     s.lod_bias = std::bit_cast<float>(ts(6));
     s.border = ts(29);
     return s;
@@ -2185,24 +2186,7 @@ Device::TargetTexture& texture_target(rt::Context& c, Device& d, uint32_t data, 
     return t;
 }
 
-std::pair<uint32_t, uint32_t> apply_target(rt::Context& c, Device& d, const char* fn) {
-    if (!d.cpu_frames.empty()) flush_cpu_frames(c, d);
-    const uint32_t target = ld(c, kDeviceStorage + kDevRenderTarget), depth = ld(c, kDeviceStorage + kDevDepth);
-    if (target == d.frame_buffers[d.renderer->back_index()]) {
-        d.renderer->set_render_target(0, gfx::Renderer::kDeviceDepth);
-        return {d.width, d.height};
-    }
-    for (uint32_t fb : d.frame_buffers)
-        if (fb == target) unmodelled(fn, "drawing into the front buffer");
-    const uint32_t format = ld(c, target + 12), fmt = (format >> 8) & 0xFF;
-    if (fmt != kFmtA8R8G8B8 && fmt != kFmtX8R8G8B8 && fmt != kFmtLinA8R8G8B8 && fmt != kFmtLinX8R8G8B8)
-        unmodelled(fn, strf("rendering into a surface of format %#x", fmt));
-    const auto [w, h] = surface_size(c, target);
-    // The depth buffer with it, at least its size (as D3D requires): the
-    // device's is the renderer's own; another D24S8 surface gets a depth
-    // target of its own, made the first time, by the guest address of its
-    // data. What a depth surface holds isn't in guest memory: a title that
-    // reads or writes one with the CPU isn't modelled.
+uint32_t resolve_depth(rt::Context& c, Device& d, const char* fn, uint32_t depth, uint32_t w, uint32_t h) {
     uint32_t depth_id = 0;
     if (depth) {
         const auto [dw, dh] = surface_size(c, depth);
@@ -2240,6 +2224,28 @@ std::pair<uint32_t, uint32_t> apply_target(rt::Context& c, Device& d, const char
             depth_id = dt.id;
         }
     }
+    return depth_id;
+}
+
+std::pair<uint32_t, uint32_t> apply_target(rt::Context& c, Device& d, const char* fn) {
+    if (!d.cpu_frames.empty()) flush_cpu_frames(c, d);
+    const uint32_t target = ld(c, kDeviceStorage + kDevRenderTarget), depth = ld(c, kDeviceStorage + kDevDepth);
+    if (target == d.frame_buffers[d.renderer->back_index()]) {
+        d.renderer->set_render_target(0, resolve_depth(c, d, fn, depth, d.width, d.height));
+        return {d.width, d.height};
+    }
+    for (uint32_t fb : d.frame_buffers)
+        if (fb == target) unmodelled(fn, "drawing into the front buffer");
+    const uint32_t format = ld(c, target + 12), fmt = (format >> 8) & 0xFF;
+    if (fmt != kFmtA8R8G8B8 && fmt != kFmtX8R8G8B8 && fmt != kFmtLinA8R8G8B8 && fmt != kFmtLinX8R8G8B8)
+        unmodelled(fn, strf("rendering into a surface of format %#x", fmt));
+    const auto [w, h] = surface_size(c, target);
+    // The depth buffer with it, at least its size (as D3D requires): the
+    // device's is the renderer's own; another D24S8 surface gets a depth
+    // target of its own, made the first time, by the guest address of its
+    // data. What a depth surface holds isn't in guest memory: a title that
+    // reads or writes one with the CPU isn't modelled.
+    const uint32_t depth_id = resolve_depth(c, d, fn, depth, w, h);
     const uint32_t data = ld(c, target + 4);
     if (size_t(data) + size_t(w) * h * 4 > c.mem_size) unmodelled(fn, strf("a render target past the end of memory (%08X)", data));
     const bool linear = fmt == kFmtLinA8R8G8B8 || fmt == kFmtLinX8R8G8B8;
@@ -2764,6 +2770,7 @@ void issue_draw(rt::Context& c, Device& d, const char* fn, uint32_t prim, Vertic
     }
     const FogUnit fog = fog_unit(c);
     cs.fog_mode = fog.mode;
+    cs.two_sided = ld(c, 0x181DA4) != 0;
     cs.point_sprite = prim == 1 && rs(kRsPointSpriteEnable);
     // D3DTSS_ALPHAKILL (0xB; the game sets D3DTALPHAKILL_ENABLE, 4, on stage 0 at 0x61F2C).
     for (uint32_t stage = 0; stage < 4; ++stage)
@@ -2934,22 +2941,7 @@ void issue_draw(rt::Context& c, Device& d, const char* fn, uint32_t prim, Vertic
     cmd.write_mask = uint8_t((cw >> 16 & 1) | (cw >> 8 & 1) << 1 | (cw & 1) << 2 | (cw >> 24 & 1) << 3);
     const uint32_t zenable = rs(kRsZEnable);
     if (zenable == 2) notice_once(d, "w-buffering (D3DZB_USEW, drawn as z)");
-    // States nothing here reads: said once if a draw meets one where it could
-    // show. Two-sided lighting is on from the game's device setup (0x5D3E6),
-    // but only changes back faces (culling off) whose combiners read the
-    // vertex colours: none in the captures to date.
-    if (ld(c, 0x181DA4) && !rs(kRsCullMode)) {
-        bool colours = false;
-        const auto reads = [&](uint32_t word) {
-            for (uint32_t k = 0; k < 32; k += 8) {
-                const uint32_t reg = word >> k & 0xF;
-                colours = colours || reg == 4 || reg == 5 || reg == 14;  // v0, v1, V1R0_SUM
-            }
-        };
-        for (uint32_t i = 0; i < std::min(cs.combiner_count & 0xFu, 8u); ++i) reads(cs.rgb_inputs[i]), reads(cs.alpha_inputs[i]);
-        reads(cs.final_abcd), reads(cs.final_efgh);
-        if (colours) notice_once(d, "two-sided lighting (D3DRS_TWOSIDEDLIGHTING: back faces get the front colours)");
-    }
+    // States still unmodelled are reported when a draw uses them.
     for (const uint32_t fill : {ld(c, 0x181D9C), ld(c, 0x181DA0)})
         if (fill && fill != 0x1B02u) notice_once(d, "point or wireframe fill (D3DRS_FILLMODE, D3DRS_BACKFILLMODE: drawn solid)");
     if (ld(c, 0x181DC8)) notice_once(d, "a logic op (D3DRS_LOGICOP: blended as without)");
@@ -3437,6 +3429,26 @@ void create_vertex_shader(rt::Context& c) {
 // writes GPU commands: the draw calls turn the state into Vulkan.
 constexpr uint32_t kTransformDirty = 0x17FD90;  // the dirty bits each transform sets (a table in D3D's data)
 
+// F9 captures include every camera/model-view change, including normal
+// back-buffer draws omitted by the detailed draw filter. This separates a
+// wrong guest camera from stale viewport/render-target state in a capture.
+void trace_view(rt::Context& c, const char* source, uint32_t matrix = 0) {
+    if (!g_capture.log) return;
+    const uint32_t dev = kDeviceStorage;
+    std::string line = strf("view %s frame=%u film=%u wide=%u aspect=%.9g dt=%.9g rt=%08X zs=%08X vp=%u,%u %ux%u matrix=%08X\n",
+        source, g_device->swaps, ld(c, 0x5077F8), uint32_t(rt::ld8({c.mem, c.mem_size}, 0x509703, 0)),
+        double(g_device->aspect), double(std::bit_cast<float>(ld(c, 0x5096C0))),
+        ld(c, dev + kDevRenderTarget), ld(c, dev + kDevDepth), ld(c, dev + kDevViewport),
+        ld(c, dev + kDevViewport + 4), ld(c, dev + kDevViewport + 8), ld(c, dev + kDevViewport + 12), matrix);
+    if (matrix)
+        for (uint32_t row = 0; row < 4; ++row) {
+            line += "  matrix";
+            for (uint32_t col = 0; col < 4; ++col) line += strf(" %.9g", double(std::bit_cast<float>(ld(c, matrix + 16 * row + 4 * col))));
+            line += "\n";
+        }
+    trace_line(line);
+}
+
 // VOID D3DDevice_SetTransform(D3DTRANSFORMSTATETYPE, CONST D3DMATRIX*): as the
 // original, the matrix into the device (GetTransform, lifted, reads it
 // there) and the transform's dirty bits. The values the original derives
@@ -3446,6 +3458,7 @@ void set_transform(rt::Context& c) {
     if (state > 21) unmodelled("D3DDevice_SetTransform", strf("transform state %u", state));
     for (uint32_t k = 0; k < 16; ++k) st(c, kDeviceStorage + kDevTransforms + 64 * state + 4 * k, ld(c, m + 4 * k));
     st(c, kDirtyFlags, ld(c, kDirtyFlags) | ld(c, kTransformDirty + 4 * state));
+    if (state == 1) trace_view(c, "projection", m);
     ret(c, c.eax, 8);
 }
 
@@ -3470,16 +3483,17 @@ void set_viewport(rt::Context& c) {
     uint32_t target = ld(c, kDeviceStorage + kDevRenderTarget);
     if (target == ld(c, kDeviceStorage + kDevFrameBuffers)) target = ld(c, kDeviceStorage + kDevFrameBuffers + 4);
     const auto [tw, th] = surface_size(c, target);
-    const uint32_t x = ld(c, vp), y = ld(c, vp + 4);
-    const uint32_t right = std::min(x + ld(c, vp + 8), tw), bottom = std::min(y + ld(c, vp + 12), th);
+    const uint32_t x = std::min(ld(c, vp), tw), y = std::min(ld(c, vp + 4), th);
+    const uint32_t width = std::min(ld(c, vp + 8), tw - x), height = std::min(ld(c, vp + 12), th - y);
     st(c, kDeviceStorage + kDevViewport, x);
     st(c, kDeviceStorage + kDevViewport + 4, y);
-    st(c, kDeviceStorage + kDevViewport + 8, right - x);
-    st(c, kDeviceStorage + kDevViewport + 12, bottom - y);
+    st(c, kDeviceStorage + kDevViewport + 8, width);
+    st(c, kDeviceStorage + kDevViewport + 12, height);
     st(c, kDeviceStorage + kDevViewport + 16, ld(c, vp + 16));  // MinZ
     st(c, kDeviceStorage + kDevViewport + 20, ld(c, vp + 20));  // MaxZ
     st(c, kDirtyFlags, ld(c, kDirtyFlags) | 0x100u);
     (void)d;
+    trace_view(c, "viewport");
     ret(c, c.eax, 4);
 }
 
@@ -3853,6 +3867,8 @@ void set_model_view(rt::Context& c) {
     Device& d = device(fn);
     const uint32_t mv = arg(c, 0), inv = arg(c, 1), comp = arg(c, 2);
     const uint32_t dirty = ld(c, kDirtyFlags);
+    trace_view(c, "model-view", mv);
+    if (comp) trace_view(c, "composite", comp);
     if (!comp) {
         st(c, kDirtyFlags, (dirty & 0x7FFFFDFFu) | 0x200u);
         ret(c, c.eax, 12);

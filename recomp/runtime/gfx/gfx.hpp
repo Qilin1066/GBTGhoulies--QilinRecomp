@@ -27,6 +27,7 @@ struct Config {
     uint32_t scale_x = 1, scale_y = 1;
     bool depth_stencil = true;           // a 24-bit depth, 8-bit stencil buffer
     int gpu = -1;                        // index among the Vulkan devices; -1 picks the best one
+    uint32_t descriptor_sets = 8192;  // per-submission pool capacity, at least 16; small for rollover tests
     bool validation = false;             // Vulkan validation layers, if installed (also QILIN_VK_VALIDATION=1)
     // Where compiled pipelines are kept between runs (Vulkan's pipeline
     // cache, saved as the driver gives it); empty for none.
@@ -106,7 +107,7 @@ struct SamplerDesc {
     Address u = Address::Wrap, v = Address::Wrap, w = Address::Wrap;
     uint32_t border = 0;  // A8R8G8B8
     float lod_bias = 0;
-    uint32_t max_level = 0, anisotropy = 1;
+    uint32_t min_level = 0, max_level = 0, anisotropy = 1;  // min_level: D3DTSS_MAXMIPLEVEL
     bool operator==(const SamplerDesc&) const = default;
 };
 
@@ -263,8 +264,8 @@ public:
 
     // Rendering into textures: a texture (an id like create_texture's, which
     // draws can sample and destroy_texture frees) that draws and clears go to
-    // while it's the render target. 0 is the back buffer, with the depth
-    // buffer. `depth` is what goes with a texture target: 0 none, kDeviceDepth
+    // while it's the render target. 0 is the back buffer. `depth` selects
+    // the attachment for either a back buffer or texture target: 0 none, kDeviceDepth
     // the depth buffer, or a depth target (create_depth_target), any of them
     // at least the target's size. A draw can't sample the texture it draws into.
     static constexpr uint32_t kDeviceDepth = 0xFFFFFFFFu;

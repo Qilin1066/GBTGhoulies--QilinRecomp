@@ -49,7 +49,7 @@ namespace deco {
 enum : uint32_t { Block = 2, ArrayStride = 6, BuiltIn = 11, NoPerspective = 13, Flat = 14, Invariant = 18, Location = 30, Binding = 33, DescriptorSet = 34, Offset = 35, NoContraction = 42 };
 }
 namespace builtin {
-enum : uint32_t { Position = 0, PointSize = 1, FragCoord = 15, PointCoord = 16, FragDepth = 22 };
+enum : uint32_t { Position = 0, PointSize = 1, FragCoord = 15, PointCoord = 16, FrontFacing = 17, FragDepth = 22 };
 }
 
 class Builder {

@@ -209,7 +209,17 @@ std::vector<uint32_t> combiners(const CombinerSetup& s) {
     Ps p;
     Builder& b = p.b;
 
-    const Id d0 = p.varying(kVaryD0), d1 = p.varying(kVaryD1), fog = p.varying(kVaryFog);
+    Id d0 = p.varying(kVaryD0), d1 = p.varying(kVaryD1);
+    const Id fog = p.varying(kVaryFog);
+    if (s.two_sided) {
+        const Id back0 = p.varying(kVaryB0), back1 = p.varying(kVaryB1);
+        const Id face = b.builtin_var(spv::Storage::Input, p.boolean, spv::builtin::FrontFacing);
+        p.interface.push_back(face);
+        const Id front = b.load(p.boolean, face);
+        const Id select = b.op(op::CompositeConstruct, b.t_bvec(4), {front, front, front, front});
+        d0 = b.op(op::Select, p.v4, {select, d0, back0});
+        d1 = b.op(op::Select, p.v4, {select, d1, back1});
+    }
     Id t[4];
     for (uint32_t i = 0; i < 4; ++i) t[i] = p.varying(kVaryT0 + i);
     if (s.point_sprite) {
@@ -426,17 +436,20 @@ std::vector<uint32_t> combiners(const CombinerSetup& s) {
     const uint32_t efgh = s.final_efgh;
     {
         Id v1 = p.regs[kV1], r0 = p.regs[kR0];
-        if (efgh & 0x40) v1 = b.op(op::FSub, p.v4, {p.one4, p.clamp01(v1)});
-        if (efgh & 0x20) r0 = b.op(op::FSub, p.v4, {p.one4, p.clamp01(r0)});
-        Id sum = b.op(op::FAdd, p.v4, {b.ext(glsl::FMax, p.v4, {v1, p.zero4}), b.ext(glsl::FMax, p.v4, {r0, p.zero4})});
+        if (efgh & 0x40) v1 = b.op(op::FSub, p.v4, {p.one4, v1});
+        if (efgh & 0x20) r0 = b.op(op::FSub, p.v4, {p.one4, r0});
+        // Signed values must cancel before the input mapping is applied.
+        Id sum = b.op(op::FAdd, p.v4, {v1, r0});
         if (efgh & 0x80) sum = p.clamp01(sum);
-        p.regs[kV1R0Sum] = sum;
+        p.regs[kV1R0Sum] = b.vec4(p.comp(sum, 0), p.comp(sum, 1), p.comp(sum, 2), b.c_float(0));
         p.regs[kEfProd] = p.zero4;
         const Id E = p.input(efgh >> 24 & 0xFF, false), F = p.input(efgh >> 16 & 0xFF, false);
-        p.regs[kEfProd] = b.op(op::FMul, p.v4, {E, F});
+        const Id prod = b.op(op::FMul, p.v4, {E, F});
+        p.regs[kEfProd] = b.vec4(p.comp(prod, 0), p.comp(prod, 1), p.comp(prod, 2), b.c_float(0));
     }
     const uint32_t abcd = s.final_abcd;
-    auto fin = [&](uint32_t code, bool alpha) { return p.clamp01(p.input(code & 0xFF, alpha)); };  // unsigned mappings only
+    // Unclamped V1R0_SUM may exceed one until the final arithmetic.
+    auto fin = [&](uint32_t code, bool alpha) { return p.input(code & 0xFF, alpha); };
     const Id A = fin(abcd >> 24, false), B = fin(abcd >> 16, false), C = fin(abcd >> 8, false), D = fin(abcd, false);
     const Id G = fin(efgh >> 8, true);
     const Id rgb = b.op(op::FAdd, p.v4, {b.op(op::FAdd, p.v4, {b.op(op::FMul, p.v4, {A, B}),

@@ -19,7 +19,7 @@ Plays from the attract sequence and save-slot menu through Chapter 1's story and
 | Audio | 🔨 DirectSound over a software mixer, XACT lifted on top, out through SDL3; see `docs/audio.md` |
 | Input | 🔨 controllers and keyboard through SDL3, settings menu (F1); see `docs/input.md` |
 
-The latest checks are in [the 0.48.0 validation record](docs/validation-0.48.md).
+The latest checks are in [the 0.48.2 validation record](docs/validation-0.48.2.md).
 
 ## Playing
 

@@ -250,7 +250,7 @@ private:
     Target& target() { return current_rt_ ? render_targets_.at(current_rt_) : color_[back_]; }  // what draws and clears go to
     // The depth buffer draws and clears use, or null.
     Target* depth_target() {
-        const uint32_t d = current_rt_ ? rt_depth_ : Renderer::kDeviceDepth;
+        const uint32_t d = rt_depth_;
         if (d == Renderer::kDeviceDepth) return depth_.image ? &depth_ : nullptr;
         auto it = depth_targets_.find(d);
         return it == depth_targets_.end() ? nullptr : &it->second;
@@ -448,7 +448,7 @@ private:
     // current_rt_ is the one draws go to, 0 for the back buffer.
     std::unordered_map<uint32_t, Target> render_targets_;
     uint32_t current_rt_ = 0;
-    uint32_t rt_depth_ = 0;  // what goes with the render target: 0, kDeviceDepth or a depth target
+    uint32_t rt_depth_ = Renderer::kDeviceDepth;  // what goes with the render target: 0, kDeviceDepth or a depth target
     std::unordered_map<uint32_t, Target> depth_targets_;  // by the same ids as textures
     std::vector<Texture> dead_textures_;                                  // freed once the GPU is done with them
     std::vector<std::pair<VkBuffer, VkDeviceMemory>> staging_;            // likewise
@@ -940,7 +940,11 @@ void VulkanRenderer::record() {
 }
 
 void VulkanRenderer::transition(Target& t, VkImageLayout to) {
-    if (t.layout == to) return;
+    if (t.layout == to && to != VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL &&
+        to != VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL && to != VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL &&
+        to != VK_IMAGE_LAYOUT_GENERAL) return;
+    // Dynamic-rendering instances have no implicit external dependency.
+    // A retained layout does not order the previous pass's writes.
     VkImageMemoryBarrier2 b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};
     layout_use(t.layout, b.srcStageMask, b.srcAccessMask);
     layout_use(to, b.dstStageMask, b.dstAccessMask);
@@ -2142,7 +2146,7 @@ void VulkanRenderer::create_draw_objects() {
     pl.pSetLayouts = &set_layout_;
     check(vkCreatePipelineLayout(device_, &pl, nullptr, &pipeline_layout_), "vkCreatePipelineLayout");
 
-    const uint32_t sets = 8192;
+    const uint32_t sets = std::max(16u, config_.descriptor_sets);
     const VkDescriptorPoolSize sizes[3] = {{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 2 * sets},
                                            {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, kSamplers * sets},
                                            {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 8}};  // FSR's, two a frame
@@ -2631,7 +2635,7 @@ VkSampler VulkanRenderer::sampler(const SamplerDesc& wanted) {
     info.addressModeW = kAddress[size_t(d.w)];
     info.mipLodBias = d.lod_bias;
     if (d.anisotropy > 1) info.anisotropyEnable = VK_TRUE, info.maxAnisotropy = float(d.anisotropy);
-    info.minLod = 0;
+    info.minLod = d.mipmaps ? float(std::min(d.min_level, d.max_level)) : 0.0f;
     info.maxLod = d.mipmaps ? float(d.max_level) : 0.25f;
     // Core Vulkan has only black or white borders: the nearest of the two.
     const uint32_t a = d.border >> 24, l = ((d.border >> 16 & 0xFF) + (d.border >> 8 & 0xFF) + (d.border & 0xFF)) / 3;
@@ -2838,13 +2842,13 @@ void VulkanRenderer::upload_texels(VkImage image, const TextureData& t, bool fre
 
 void VulkanRenderer::destroy_texture(uint32_t id) {
     if (auto rt = render_targets_.find(id); rt != render_targets_.end()) {
-        if (id == current_rt_) end_pass(), current_rt_ = 0;
+        if (id == current_rt_) end_pass(), current_rt_ = 0, rt_depth_ = Renderer::kDeviceDepth;
         dead_textures_.push_back({rt->second.image, rt->second.memory, rt->second.view});
         render_targets_.erase(rt);
         return;
     }
     if (auto dt = depth_targets_.find(id); dt != depth_targets_.end()) {
-        if (current_rt_ && id == rt_depth_) end_pass(), rt_depth_ = 0;
+        if (id == rt_depth_) end_pass(), rt_depth_ = 0;
         dead_textures_.push_back({dt->second.image, dt->second.memory, dt->second.view});
         depth_targets_.erase(dt);
         return;
@@ -2862,7 +2866,7 @@ void VulkanRenderer::copy_frame_to_target(uint32_t frame_index, uint32_t target_
     if (frame_index >= color_.size() || it == render_targets_.end() || regions.empty()) return;
     Target& from = color_[frame_index];
     Target& to = it->second;
-    if (target_id == current_rt_) end_pass(), current_rt_ = 0;  // not drawn into while it's copied into
+    if (target_id == current_rt_) end_pass(), current_rt_ = 0, rt_depth_ = Renderer::kDeviceDepth;  // not drawn into while it's copied into
     end_pass();
     record();
     transition(from, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
@@ -3108,14 +3112,13 @@ bool VulkanRenderer::pack_depth(uint32_t depth_id, uint32_t rt_id) {
 }
 
 void VulkanRenderer::set_render_target(uint32_t id, uint32_t depth) {
-    if (!id) depth = 0;
     if (id == current_rt_ && depth == rt_depth_) return;
     if (id && !render_targets_.count(id)) {
         std::fprintf(stderr, "qilin: renderer: no render target %u\n", id);
         std::exit(3);
     }
     if (depth) {
-        const Target& rt = render_targets_.at(id);
+        const Target& rt = id ? render_targets_.at(id) : color_[back_];
         const Target* dt = depth == kDeviceDepth ? (depth_.image ? &depth_ : nullptr)
                                                   : (depth_targets_.count(depth) ? &depth_targets_.at(depth) : nullptr);
         if (!dt || dt->width < rt.width || dt->height < rt.height) {
@@ -3157,30 +3160,7 @@ void VulkanRenderer::draw(const DrawCmd& c) {
     }
     begin_pass();
 
-    // Data into the ring: each attribute, the indices, the two uniform blocks.
-    VkBuffer buffers[16];
-    VkDeviceSize offsets[16];
-    uint32_t first = 0, count = 0;
-    for (uint32_t n = 0; n < 16; ++n)
-        if (c.inputs & (1u << n)) {
-            if (!count) first = n;
-            if (c.arena[n] != DrawCmd::kNoArena) {
-                buffers[count] = arena_;
-                offsets[count++] = c.arena[n];
-            } else {
-                buffers[count] = ring_;
-                const VkDeviceSize elements = (c.constant_inputs >> n & 1) ? 1 : c.vertex_count;
-                offsets[count++] = ring_alloc(elements * 16, 16, c.attributes[n]);
-            }
-        }
-    VkDeviceSize index_at = 0;
-    if (c.indices) index_at = ring_alloc(VkDeviceSize(c.index_count) * 4, 4, c.indices);
     const VkDeviceSize vs_bytes = nv2a::kVsUniformVec4s * 16, fs_bytes = nv2a::kFsUniformVec4s * 16;
-    const uint32_t uniform_offsets[2] = {uint32_t(ring_alloc(vs_bytes, uniform_align_, c.vs_uniforms)),
-                                         uint32_t(ring_alloc(fs_bytes, uniform_align_, c.fs_uniforms))};
-    // (A ring flush above may have ended the pass: make sure it's open.)
-    begin_pass();
-
     // The descriptor set: the ring's two uniform blocks (dynamic offsets per
     // draw) and the four textures. Draws with the same textures and samplers
     // in a submission share one set (the slot's cache, emptied with its pool).
@@ -3195,6 +3175,10 @@ void VulkanRenderer::draw(const DrawCmd& c) {
         key.views[i] = view, key.samplers[i] = images[i].sampler;
     }
     VkDescriptorSet set = VK_NULL_HANDLE;
+    // Keep eight sets available for presentation and postprocessing.
+    if (!slots_[slot_].sets.contains(key) && slots_[slot_].sets.size() >= std::max(16u, config_.descriptor_sets) - 8) {
+        end_pass(); submit(); record(); begin_pass();
+    }
     auto& cache = slots_[slot_].sets;
     if (auto hit = cache.find(key); hit != cache.end()) {
         set = hit->second;
@@ -3235,6 +3219,31 @@ void VulkanRenderer::draw(const DrawCmd& c) {
         slots_[slot_].sets.emplace(key, set);
     }
 
+    // Descriptor allocation may switch submission slots. Upload vertices,
+    // indices and uniforms only after that switch, into the resulting ring.
+    // Data into the ring: each attribute, the indices, the two uniform blocks.
+    VkBuffer buffers[16];
+    VkDeviceSize offsets[16];
+    uint32_t first = 0, count = 0;
+    for (uint32_t n = 0; n < 16; ++n)
+        if (c.inputs & (1u << n)) {
+            if (!count) first = n;
+            if (c.arena[n] != DrawCmd::kNoArena) {
+                buffers[count] = arena_;
+                offsets[count++] = c.arena[n];
+            } else {
+                buffers[count] = ring_;
+                const VkDeviceSize elements = (c.constant_inputs >> n & 1) ? 1 : c.vertex_count;
+                offsets[count++] = ring_alloc(elements * 16, 16, c.attributes[n]);
+            }
+        }
+    VkDeviceSize index_at = 0;
+    if (c.indices) index_at = ring_alloc(VkDeviceSize(c.index_count) * 4, 4, c.indices);
+    const uint32_t uniform_offsets[2] = {uint32_t(ring_alloc(vs_bytes, uniform_align_, c.vs_uniforms)),
+                                         uint32_t(ring_alloc(fs_bytes, uniform_align_, c.fs_uniforms))};
+    // (A ring flush above may have ended the pass: make sure it's open.)
+    begin_pass();
+
     // State the command buffer doesn't hold already.
     DrawState& was = drawn_;
     const bool all = !was.valid;
@@ -3265,8 +3274,9 @@ void VulkanRenderer::draw(const DrawCmd& c) {
     if (all || std::memcmp(&was.scissor, &scissor, sizeof scissor) != 0) vkCmdSetScissor(cmd_, 0, 1, &scissor), was.scissor = scissor;
     // Culling a winding: screen space runs y down as in the framebuffer, so
     // "clockwise" is the same on both.
-    const VkCullModeFlags cull = c.cull == Cull::None ? VK_CULL_MODE_NONE : VK_CULL_MODE_BACK_BIT;
-    const VkFrontFace front = c.cull == Cull::Clockwise ? VK_FRONT_FACE_COUNTER_CLOCKWISE : VK_FRONT_FACE_CLOCKWISE;
+    const VkCullModeFlags cull = c.cull == Cull::None ? VK_CULL_MODE_NONE :
+                                 c.cull == Cull::Clockwise ? VK_CULL_MODE_FRONT_BIT : VK_CULL_MODE_BACK_BIT;
+    const VkFrontFace front = VK_FRONT_FACE_CLOCKWISE;  // stable for two-sided colours
     if (all || was.cull != cull) vkCmdSetCullMode(cmd_, cull), was.cull = cull;
     if (all || was.front != front) vkCmdSetFrontFace(cmd_, front), was.front = front;
     const bool has_depth = target_has_depth();
