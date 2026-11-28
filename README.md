@@ -23,9 +23,18 @@ The latest checks are in [the 0.48.2 validation record](docs/validation-0.48.2.m
 
 ## Playing
 
-### Windows download
+### Downloads
 
-Each tagged release has `GBTGhoulies--QilinRecomp-<version>-windows-x64.zip` attached (`.github/workflows/player-kit.yml` also builds one on every push to `main`, as a run artifact). Unpack it and double-click **`Play Ghoulies.bat`**: the first time, it asks for your extracted disc folder and builds the game from it with the bundled compiler (LLVM-MinGW); after that it starts the game at once. `-ChooseDisc` picks another disc folder. Messages go to `run.log` and errors to `run-errors.log`. The game's code is built on your PC from your copy and never distributed. The download's `README.txt` lists the controls and settings.
+Each release on the [Releases page](https://github.com/Qilin1066/GBTGhoulies--QilinRecomp/releases) has a download for each system:
+
+| System | Download | Then |
+|---|---|---|
+| Windows 10 or 11, 64-bit | `GBTGhoulies--QilinRecomp-<version>-windows-x64.zip` | unzip it, double-click **Play Grabbed by the Ghoulies.exe** |
+| Linux x86-64 (glibc 2.35 or later) | `GBTGhoulies--QilinRecomp-<version>-linux-x86_64.tar.gz` | unpack it, double-click **Play Grabbed by the Ghoulies** |
+| Linux ARM64: Raspberry Pi 4 or 5 (64-bit Raspberry Pi OS) | `GBTGhoulies--QilinRecomp-<version>-linux-arm64.tar.gz` | the same |
+| macOS 14.5 or later, Apple silicon or Intel | `GBTGhoulies--QilinRecomp-<version>-macos.dmg` | drag the app onto Applications and open it; the first time, Privacy & Security's **Open Anyway** |
+
+Then choose the folder you extracted your disc into (the one holding `default.xbe`), or drag it onto the window: it says straight away if it's another game or another release. The first start builds the game from it on your computer, in a few minutes (longer on a Raspberry Pi); after that, **Play** starts it. Each download's `README.txt` has the details, the controls and where saves go. Windows and Linux bring their own compiler (LLVM-MinGW, zig); a Mac uses Apple's command line tools, which the app offers to install. A graphics driver with Vulkan 1.3 is needed everywhere (on a Pi, Raspberry Pi OS Trixie or later). The game's code is built from your copy and never distributed. The launcher is the one all the QilinRecomp projects share (`tools/player-kit/launcher`, from ToyCommander--QilinRecomp); `docs/platforms.md` describes the downloads.
 
 ### From the source on Windows
 
@@ -144,10 +153,10 @@ Each difftest worker takes a few hundred MB, so keep `--jobs` low.
 | `recomp/runtime/audio/` | The audio engine: voices (PCM, Xbox ADPCM) and the 48 kHz mixer |
 | `recomp/runtime/ui/` | The settings menu (Dear ImGui) |
 | `tools/analysis/` | The Python analysis prototype (LLVM via ctypes), the reference the C++ port is checked against |
-| `tools/check/` | The LLVM decoder cross-check, the x87 checks, the C++ exception-handling report, the launcher check and the full local check script |
+| `tools/check/` | The LLVM decoder cross-check, the x87 checks, the C++ exception-handling report and the full local check script |
 | `tools/difftest/` | Differential test: lifted C++ against the original x86 under Unicorn |
 | `tools/gen/` | Generators for committed sources: SPIR-V for FSR, SMAA and depth packing, the kernel export list, the XDK symbol names |
-| `tools/player-kit/` | The Windows download: packaging, launcher and its README |
+| `tools/player-kit/` | The downloads (Windows, Linux, macOS): packaging, their checks and READMEs, and the launcher (`launcher/`, shared with the other QilinRecomp projects) |
 | `tools/build-ghoulies.ps1` | The source build and launcher behind `Play Ghoulies.bat` and `Update Ghoulies.bat` |
 | `third_party/` | Vendored dependencies; see `third_party/README.md` |
 | `docs/` | Design notes, analysis and validation records |

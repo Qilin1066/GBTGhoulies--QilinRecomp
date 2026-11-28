@@ -9,6 +9,10 @@
 //                                                    lift to C++ (generated code: never commit it)
 //   qilin image    <default.xbe> <out.bin>           flat guest image (for the differential tests)
 //   qilin coverage <default.xbe> [--list]            byte accounting: code / tables / padding / unknown
+//   qilin identify <disc folder> --json [--build <title>]
+//                                                    what the player's extracted disc is, as one JSON
+//                                                    object (identify.hpp): exit 0 the supported build,
+//                                                    3 another game or release, 2 unreadable
 //
 // Exit status is non-zero on any error; nothing fails silently.
 #include <array>
@@ -32,6 +36,7 @@
 
 #include "cfg.hpp"
 #include "decoder.hpp"
+#include "identify.hpp"
 #include "lifter.hpp"
 #include "xbe.hpp"
 
@@ -203,6 +208,7 @@ int usage() {
                "  qilin lift     <xbe> --out <dir> [--range lo-hi] [--only addr]\n"
                "  qilin image    <xbe> <out.bin>\n"
                "  qilin coverage <xbe> [--list]   (exit 3 while any lifted byte is unaccounted for)\n"
+               "  qilin identify <disc folder> --json [--build <title>]\n"
                "  qilin --version\n");
     return 2;
 }
@@ -479,6 +485,37 @@ int cmd_lift(const Xbe& xbe, Decoder& dec, std::span<const std::string_view> arg
     return 0;
 }
 
+// The launcher's contract (identify.hpp): JSON whatever happens, and only
+// exit codes 0, 3 and 2.
+int cmd_identify(int argc, char** argv) {
+    std::optional<std::string> path, build;
+    bool json = false;
+    std::string problem;
+    for (int i = 2; i < argc; ++i) {
+        const std::string_view a = argv[i];
+        if (a == "--json") json = true;
+        else if (a == "--build" && i + 1 < argc) build = argv[++i];
+        else if (!a.starts_with("-") && !path) path = std::string(a);
+        else problem = std::format("identify: unexpected argument {}", a);
+    }
+    if (!path) problem = "identify takes one folder";
+    if (!json) problem = "identify needs --json";
+    Identity id;
+    if (!problem.empty()) {
+        id.message = problem;
+    } else {
+        try {
+            id = identify(qilin::native_path(*path), build.value_or(""));
+        } catch (const std::exception& e) {
+            id = Identity{};
+            id.message = std::format("The recompiler failed: {}.", e.what());
+        }
+    }
+    std::print("{}", to_json(id));
+    std::fflush(stdout);
+    return id.code;
+}
+
 int run(std::string_view cmd, const std::string& path, std::span<const std::string_view> args) {
     auto loaded = Xbe::load(path);
     if (!loaded) {
@@ -574,6 +611,7 @@ int main(int argc, char** argv) {
         std::println("qilin {}", QILIN_VERSION);
         return 0;
     }
+    if (argc >= 2 && std::string_view(argv[1]) == "identify") return cmd_identify(argc, argv);
     if (argc < 3) return usage();
     const std::vector<std::string_view> args(argv + 3, argv + argc);
     try {

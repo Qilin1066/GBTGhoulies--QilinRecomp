@@ -16,6 +16,7 @@
 #include "cfg.hpp"
 #include "decoder.hpp"
 #include "guest.hpp"
+#include "identify.hpp"
 #include "json.hpp"
 #include "lifter.hpp"
 #include "xbe.hpp"
@@ -696,6 +697,71 @@ int main() {
         uint32_t v;
         std::memcpy(&v, &mem[24], 4);
         CHECK(v == 0x11223344u && edi == 28 && ecx == 0);
+    }
+
+    // ---------------------------------------------------------------- identify
+    // The launcher's contract (identify.hpp): the supported build, another
+    // game, another release, an incomplete or unreadable folder.
+    {
+        namespace fs = std::filesystem;
+        auto with = [](uint32_t title_id, uint32_t timestamp, uint32_t region) {
+            auto d = make_xbe();
+            put32(d, 0x114, timestamp);
+            put32(d, 0x408, title_id);
+            put32(d, 0x4A0, region);  // the certificate's game region
+            return d;
+        };
+        const auto right = with(kGhoulies.title_id, kGhoulies.timestamp, 1);
+        Identity i = identify_xbe(right, "");
+        CHECK(i.code == 0 && i.ok && i.title == "Grabbed by the Ghoulies (USA)" && i.id == "MS-083" && i.version == "0");
+        CHECK(i.message == "This is Grabbed by the Ghoulies (USA), MS-083 (built 24 September 2003): the right disc.");
+
+        i = identify_xbe(with(0x4D530004u, kGhoulies.timestamp, 1), "");
+        CHECK(i.code == 3 && !i.ok && i.id == "MS-004" && i.title == "T\xF0\x9F\x98\x80 (USA)");
+        CHECK(i.message.contains("(USA, MS-004), not Grabbed by the Ghoulies.") &&
+              i.message.ends_with("This download is for Grabbed by the Ghoulies (USA), MS-083 (built 24 September 2003)."));
+
+        i = identify_xbe(with(kGhoulies.title_id, kGhoulies.timestamp + 20 * 86400, 4), "");
+        CHECK(i.code == 3 && !i.ok && i.id == "MS-083" && i.title == "T\xF0\x9F\x98\x80 (Europe)");
+        CHECK(i.message.starts_with("This is Grabbed by the Ghoulies (Europe), but another release of it: its default.xbe was built 14 October 2003"));
+
+        i = identify_xbe(right, "bundles");
+        CHECK(i.code == 2 && !i.ok && i.title == "Grabbed by the Ghoulies (USA)" && i.message.contains("no bundles folder"));
+        CHECK(identify_xbe(std::vector<uint8_t>{9, 0}, "").code == 2);
+        CHECK(xbe_date(0) == "1 January 1970" && xbe_date(951782400) == "29 February 2000" && xbe_date(kGhoulies.timestamp) == "24 September 2003");
+
+        // On a folder, as the launcher runs it (a Unicode name, any case).
+        const fs::path dir = fs::temp_directory_path() / fs::path(u8"ghoulies-identify-\u4fdd\u5b58");
+        std::error_code ec;
+        fs::remove_all(dir, ec);
+        fs::create_directories(dir / "Bundles");
+        fs::create_directories(dir / "xwavebank");
+        auto put = [](const fs::path& path, std::span<const uint8_t> bytes) {
+            std::ofstream output(path, std::ios::binary);
+            output.write(reinterpret_cast<const char*>(bytes.data()), std::streamsize(bytes.size()));
+        };
+        put(dir / "default.xbe", right);
+        i = identify(dir);
+        CHECK(i.code == 2 && i.message.contains("no demand folder"));
+        fs::create_directories(dir / "DEMAND");
+        CHECK(identify(dir).code == 0);
+        CHECK(identify(dir, "Grabbed by the Ghoulies (USA)").code == 0);
+        CHECK(identify(dir / "default.xbe").code == 0);
+        CHECK(identify(dir, "Grabbed by the Ghoulies (Europe)").code == 2);
+        CHECK(identify(dir / "missing").code == 2);
+        i = identify(dir / "Bundles");
+        CHECK(i.code == 2 && i.message.starts_with("There's no default.xbe in this folder."));
+        const uint8_t two[] = {9, 0};
+        put(dir / "game.iso", two);
+        i = identify(dir / "game.iso");
+        CHECK(i.code == 2 && i.message.starts_with("This is a file, not a folder."));
+        put(dir / "default.xbe", two);
+        CHECK(identify(dir).code == 2);
+        fs::remove_all(dir, ec);
+
+        Identity quoted;
+        quoted.message = "a \"b\"\n";
+        CHECK(to_json(quoted) == "{\"ok\": false, \"title\": \"\", \"id\": \"\", \"version\": \"\", \"message\": \"a \\\"b\\\"\\n\"}\n");
     }
 
     // ---------------------------------------------------------------- JSON
