@@ -825,7 +825,7 @@ void pack_capture(const std::filesystem::path& dir) {
         std::ifstream in(entry.path(), std::ios::binary);
         const std::string data((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
         char h[512] = {};
-        std::snprintf(h, 100, "%s", entry.path().filename().string().c_str());
+        std::snprintf(h, 100, "%s", qilin::utf8_path(entry.path().filename()).c_str());
         std::snprintf(h + 100, 8, "%07o", 0644u);
         std::snprintf(h + 108, 8, "%07o", 0u);
         std::snprintf(h + 116, 8, "%07o", 0u);
@@ -3081,7 +3081,12 @@ void issue_draw(rt::Context& c, Device& d, const char* fn, uint32_t prim, Vertic
                             std::fprintf(g_capture.log, "  target %08X as %u_%04u_%08X.pam\n", addr, d.swaps, n, addr);
                         }
                         const gfx::Image im = d.renderer->read_render_target(tt.texture.id);
-                        if (FILE* f = std::fopen(strf("%s/%u_%04u_%08X.pam", dir, d.swaps, n++, addr).c_str(), "wb")) {
+                        const std::string pam = strf("%s/%u_%04u_%08X.pam", dir, d.swaps, n++, addr);  // UTF-8
+#ifdef _WIN32
+                        if (FILE* f = _wfopen(qilin::native_path(pam).c_str(), L"wb")) {
+#else
+                        if (FILE* f = std::fopen(pam.c_str(), "wb")) {
+#endif
                             std::fprintf(f, "P7\nWIDTH %u\nHEIGHT %u\nDEPTH 4\nMAXVAL 255\nTUPLTYPE RGB_ALPHA\nENDHDR\n", im.width, im.height);
                             std::fwrite(im.rgba.data(), 1, im.rgba.size(), f);
                             std::fclose(f);

@@ -11,6 +11,9 @@ Each release is a git tag (`vX.Y.Z`) with a matching GitHub release. The version
 
 ## [Unreleased]
 
+### Fixed
+- **Folders with any characters in their names on Windows, everywhere**: qilin and the game already read their arguments as UTF-8, but a few places still turned paths into the ANSI code page, which fails (or throws) on names outside it: the game's disc folder listings (kernel_io), the settings menu's settings-file line and its save errors, capture archives and render-target dumps, and qilin lift's check for stale chunks. All go through UTF-8 now. qilin_tests runs the real `qilin identify` on a folder with a Japanese and an accented name.
+
 ## [0.49.1] - 2026-11-28
 
 ### Fixed

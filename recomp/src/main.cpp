@@ -428,7 +428,7 @@ int cmd_lift(const Xbe& xbe, Decoder& dec, std::span<const std::string_view> arg
         std::error_code ec;
         std::vector<std::filesystem::path> stale;
         for (const auto& e : std::filesystem::directory_iterator(dir, ec)) {
-            const std::string name = e.path().filename().string();
+            const std::string name = qilin::utf8_path(e.path().filename());
             int k = 0;
             if (name.size() == 14 && name.starts_with("lifted_") && name.ends_with(".cpp") &&
                 std::from_chars(name.data() + 7, name.data() + 10, k).ec == std::errc{} && k >= nchunk)
