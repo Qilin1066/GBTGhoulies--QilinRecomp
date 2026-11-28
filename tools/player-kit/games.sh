@@ -24,7 +24,10 @@ fill() {
 # default.xbe), what a compile needs (the biggest lifted file, 2.5 MB, took
 # about 340 MB with zig's Clang at -O2), how the game starts (the disc's
 # folder and its default.xbe, as qilin_run takes them), and where releases
-# are published (tags vX.Y.Z).
+# are published (tags vX.Y.Z); and what the Windows downloads before the
+# launcher (0.33 to 0.48: Play Ghoulies.bat running kit\play.ps1 and Ninja)
+# left in the folder, removed at the launcher's start, with the disc folder
+# they remembered taken over (launcher 2's old_files and old_input_file).
 write_game_txt() {
     {
         printf 'game=%s\ntitle=%s\nexe=%s\nboot=%s\n' "$game" "$TITLE" "$2" "$BOOT"
@@ -36,6 +39,8 @@ write_game_txt() {
         printf 'step.1={qilin} lift {input}/default.xbe --out {gen}\n'
         printf 'compile_memory_mb=800\nbuild_space_mb=2048\ncache_mb=2048\n'
         printf 'run_args=--game-dir {input} {input}/default.xbe\n'
+        printf 'old_files=Play Ghoulies.bat; kit/play.ps1; kit/ninja.exe; kit/kit.ninja; work/build.ninja; work/.ninja_log; work/.ninja_deps\n'
+        printf 'old_input_file=work/disc-folder.txt\n'
         printf 'compiler=%s\n' "$3"
         if [ -n "${4:-}" ]; then printf 'compiler_args=%s\n' "$4"; fi
     } | if [ "${GAME_TXT_CRLF:-0}" = 1 ]; then sed 's/$/\r/'; else cat; fi > "$1"

@@ -102,9 +102,9 @@ anything fails on the way, the old version is left as it was. You can also
 unzip a new download anywhere, even over this folder: it finds your disc
 folder and the cache by itself, and at its first start it removes files the
 new kit no longer has (anything in kit\ or LICENSES\ that kit\files.txt
-doesn't name). Downloads before the launcher had "Play Ghoulies.bat": over
-one of those, delete that file (it no longer works) and choose your disc
-folder once more. Your saves and settings are never in this folder, so
+doesn't name), and what the downloads before the launcher left (Play
+Ghoulies.bat, the old Ghoulies.exe and its logs), keeping the disc folder
+they remembered. Your saves and settings are never in this folder, so
 nothing of yours is touched.
 
 The game is compiled for this PC's processor; moved to another PC, it is
