@@ -1,0 +1,45 @@
+{
+  "$schema": "https://recomp.fyi/schema/v1.json",
+  "game": "Grabbed by the Ghoulies",
+  "wikidata": "Q1998860",
+  "system": "Xbox",
+  "type": "recomp",
+  "original": {
+    "region": "USA",
+    "serial": "MS-083",
+    "sha1": "d952a9f05348f4e6197d5fe6fc86434d779f3280"
+  },
+  "project": "GBTGhoulies--QilinRecomp",
+  "status": "released",
+  "targets": [
+    "Windows",
+    "Linux",
+    "macOS"
+  ],
+  "maintainers": [
+    {
+      "name": "Qilin1066",
+      "link": "https://github.com/Qilin1066"
+    }
+  ],
+  "links": [
+    {
+      "label": "Downloads",
+      "url": "https://github.com/Qilin1066/GBTGhoulies--QilinRecomp/releases"
+    }
+  ],
+  "launchers": [
+    {
+      "path": "GBTGhoulies--QilinRecomp/kit/game.txt",
+      "in": "release",
+      "format": "qilin-game.txt"
+    }
+  ],
+  "help": [
+    "Raspberry Pi testing"
+  ],
+  "tags": [
+    "in-progress"
+  ],
+  "notes": "Plays from the attract sequence and save-slot menu through Chapter 1's story and first fight into the mansion, with sound, controllers and saves; not yet tested to the end. The Linux ARM64 download is for the Raspberry Pi."
+}
