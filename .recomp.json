@@ -41,5 +41,5 @@
   "tags": [
     "in-progress"
   ],
-  "notes": "Plays from the attract sequence and save-slot menu through Chapter 1's story and first fight into the mansion, with sound, controllers and saves; not yet tested to the end. The Linux ARM64 download is for the Raspberry Pi."
+  "notes": "The game runs and is playable, and has been play-tested by the maintainer. Bugs are still common, so feedback and bug reports are greatly appreciated. The Linux ARM64 download is for the Raspberry Pi."
 }
