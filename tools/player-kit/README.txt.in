@@ -1,0 +1,124 @@
+@TITLE@ QilinRecomp for Windows (64-bit)
+========================================================
+
+@TITLE@ (@STUDIO@), recompiled to run natively: the game's own
+program translated into C++ and compiled for your PC, drawn with Vulkan.
+
+No game data is included. You need your own copy of the game: @RELEASE@,
+its disc image extracted to a folder (for example with extract-xiso or
+xdvdfs). That gives a folder holding default.xbe and the folders bundles,
+demand, xwavebank and the rest.
+
+This is a work in progress: the game plays, and some things are still
+missing or wrong. Changes: CHANGELOG.md on the project's page.
+
+
+Playing
+-------
+1. Unzip the download anywhere. Building the game needs about 2 GB free.
+2. Open the folder and double-click "Play @TITLE@.exe".
+3. Click "Choose your disc folder" and pick the folder you extracted the
+   disc into (the one holding default.xbe), or drag the folder onto the
+   window. It tells you straight away if it's the wrong game or another
+   release.
+4. Wait for the first build: a few minutes (up to 15 on a slower PC). Your
+   game files never leave your PC.
+5. Click Play. The window hides while the game runs. "Add a desktop
+   shortcut" puts Play @TITLE@ on your desktop.
+
+After that, Play @TITLE@.exe remembers your disc folder (even in a new
+download folder), and Play starts the game straight away. After an update
+it builds the game again first, recompiling only what changed.
+
+The game's output is in work\run.log and work\run-errors.log, and the
+build's in work\build.log. Send them when reporting a problem. If the
+picture is wrong (something flickers, a shadow or an effect looks off),
+press F9 while it shows: the next 12 frames and what the game drew in them
+are saved to a file in the data folder's captures folder (the game says
+where). Send that file too.
+
+If Windows says "Windows protected your PC": More info, then Run anyway.
+(The download isn't signed.) Or before unpacking, right-click the zip,
+Properties, tick Unblock, OK.
+
+Needs: Windows 10 (version 1803 or later) or 11, 64-bit, and a graphics
+driver with Vulkan 1.3 (any recent NVIDIA, AMD or Intel driver).
+
+
+Controls
+--------
+Any controller Windows or SDL knows (Xbox, PlayStation, Switch, generic),
+as the Xbox controller, or the keyboard as controller 1:
+
+  Xbox controller      Keyboard
+  left stick           W A S D
+  right stick          numeric keypad 8 4 5 6
+  D-pad                arrows
+  A B X Y              Space or K, L, J, I
+  White, Black         Q, E   (left and right shoulder buttons)
+  triggers             Left Shift, Right Shift or O
+  Start, Back          Enter, Backspace or Tab
+  stick clicks         F, H
+
+F1 or Esc, or Back and Start together on a controller: the settings menu
+(the game pauses): the display (full screen, the aspect ratio, the HUD on
+wide screens, the render resolution, SMAA, AMD FSR 1, a CRT look, vsync,
+the frame rate, a frame rate counter on F3, texture filtering), the
+controls (rumble, the keyboard's keys, set by pressing them) and the game
+(volume, stereo or 5.1, the sound device, the language).
+F11 or Alt+Enter: full screen. The window can be resized: the picture keeps
+its shape.
+
+Saves and settings are kept in %LOCALAPPDATA%\qilin\@GAME@ (the settings
+in ghoulies.ini, which can be edited by hand too), with the disc folder you
+chose and the build's cache of compiled files (build-cache).
+
+
+What's in here
+--------------
+Play @TITLE@.exe  chooses your disc folder, builds the game (once)
+                             and starts it
+kit\qilin.exe       the recompiler: turns the disc's @BOOT@ into C++
+kit\lib, include    the prebuilt rest of the game: its runtime, the Xbox's
+                    kernel, Direct3D and DirectSound replaced natively, the
+                    renderer (Vulkan), the window, controls and sound (SDL3),
+                    the settings menu (Dear ImGui)
+kit\toolchain       LLVM-MinGW, a C++ compiler for Windows (Clang)
+kit\files.txt       every file this release holds (see below)
+work\               made when building: the game (@EXE@), built from your
+                    disc, the recompiled code, the build's files and the logs
+LICENSES\           the licences of everything included
+
+Source, changes and issues: https://github.com/@REPO@
+
+
+Updates and recovery
+--------------------
+"Check for updates" in Play @TITLE@.exe asks GitHub for a newer
+release (it sends nothing about you or your PC). If there is one, it
+downloads it, unpacks it beside this folder and swaps in the new kit and
+launcher, then starts again and builds the game for the new version. If
+anything fails on the way, the old version is left as it was. You can also
+unzip a new download anywhere, even over this folder: it finds your disc
+folder and the cache by itself, and at its first start it removes files the
+new kit no longer has (anything in kit\ or LICENSES\ that kit\files.txt
+doesn't name), and what the downloads before the launcher left (Play
+Ghoulies.bat, the old Ghoulies.exe and its logs), keeping the disc folder
+they remembered. Your saves and settings are never in this folder, so
+nothing of yours is touched.
+
+The game is compiled for this PC's processor; moved to another PC, it is
+built again. Compiled files come from the cache when nothing they're made
+from has changed. A failed build leaves the working game as it was; the
+one before a new build is kept as work\@EXE@.previous until the new one has
+run and closed normally. "Build again from scratch" compiles everything
+anew.
+
+Before changing an existing title-save file, the runtime keeps five copies
+under the data folder: save-history\partition1\<relative file>\1.bin
+through 5.bin (1 is the newest). Cache partitions are left out, and the
+game doesn't see these copies. If a copy can't be made, the write is
+refused. To restore one: quit the game, keep a separate copy of the current
+partition1, and copy the chosen snapshot back to partition1\<relative
+file>. Restore related files together if the game saved them as a group.
+This is file-level history, not a whole-disk transaction.
