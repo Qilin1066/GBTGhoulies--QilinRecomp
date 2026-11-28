@@ -134,6 +134,9 @@ enable_testing()
 add_executable(qilin_tests recomp/tests/tests.cpp)
 target_link_libraries(qilin_tests PRIVATE qilin_core qilin_warnings)
 qilin_tool(qilin_tests)
+# The real qilin too (its identify on a Unicode folder name, through the command line).
+target_compile_definitions(qilin_tests PRIVATE QILIN_EXE="$<TARGET_FILE:qilin>")
+add_dependencies(qilin_tests qilin)
 add_test(NAME qilin_tests COMMAND qilin_tests)
 
 # The downloads' launcher, `Play Ghoulies` (tools/player-kit/launcher: the
@@ -237,7 +240,7 @@ else()
     target_compile_options(qilin_imgui PRIVATE -w)
 endif()
 add_library(qilin_ui STATIC recomp/runtime/ui/menu.cpp)
-target_include_directories(qilin_ui PUBLIC recomp/runtime/ui)
+target_include_directories(qilin_ui PUBLIC recomp/runtime/ui PRIVATE recomp/runtime)  # recomp/runtime: path.hpp
 target_link_libraries(qilin_ui PUBLIC qilin_gfx qilin_platform qilin_imgui PRIVATE qilin_warnings)
 target_compile_definitions(qilin_ui PRIVATE QILIN_VERSION="${PROJECT_VERSION}")
 

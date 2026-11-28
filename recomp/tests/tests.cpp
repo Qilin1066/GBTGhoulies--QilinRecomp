@@ -5,13 +5,19 @@
 // No game files required (runs in CI).
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <iterator>
 #include <print>
 #include <stdexcept>
 #include <string>
+#include <tuple>
+#include <utility>
 #include <vector>
+#ifndef _WIN32
+#include <sys/wait.h>
+#endif
 
 #include "cfg.hpp"
 #include "decoder.hpp"
@@ -758,6 +764,44 @@ int main() {
         put(dir / "default.xbe", two);
         CHECK(identify(dir).code == 2);
         fs::remove_all(dir, ec);
+
+#ifdef QILIN_EXE
+        // The real qilin, started as the launcher starts it, on a folder
+        // with a Japanese and an accented name: the name reaches it only
+        // through its command line, which Windows gives a narrow main() in
+        // the ANSI code page (command_line.hpp reads the UTF-16 one).
+        {
+            const fs::path unicode = fs::temp_directory_path() / fs::path(u8"ghoulies-identify-保存 été");
+            fs::remove_all(unicode, ec);
+            for (const char* sub : {"bundles", "demand", "xwavebank"}) fs::create_directories(unicode / sub);
+            put(unicode / "default.xbe", right);
+            const fs::path out = unicode / "identify.json";
+            auto run_identify = [&](const fs::path& input) {
+                fs::remove(out, ec);
+#ifdef _WIN32
+                const std::wstring line = L"\"\"" + qilin::native_path(QILIN_EXE).wstring() + L"\" identify \"" + input.wstring() +
+                                          L"\" --json --build \"Grabbed by the Ghoulies (USA)\" > \"" + out.wstring() + L"\"\"";
+                const int code = _wsystem(line.c_str());
+#else
+                const std::string line = std::string("'") + QILIN_EXE + "' identify '" + input.string() +
+                                         "' --json --build 'Grabbed by the Ghoulies (USA)' > '" + out.string() + "'";
+                const int status = std::system(line.c_str());
+                const int code = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+#endif
+                std::ifstream in(out, std::ios::binary);
+                return std::pair{code, std::string(std::istreambuf_iterator<char>(in), {})};
+            };
+            auto [code, text] = run_identify(unicode);
+            CHECK(code == 0 && text.starts_with("{\"ok\": true, \"title\": \"Grabbed by the Ghoulies (USA)\""));
+            std::tie(code, text) = run_identify(unicode / "default.xbe");
+            CHECK(code == 0 && text.starts_with("{\"ok\": true"));
+            // A name it can't find comes back in the message as it was given.
+            const std::u8string missing = u8"é保存-missing";
+            std::tie(code, text) = run_identify(unicode / fs::path(missing));
+            CHECK(code == 2 && text.starts_with("{\"ok\": false") && text.contains(std::string(missing.begin(), missing.end())));
+            fs::remove_all(unicode, ec);
+        }
+#endif
 
         Identity quoted;
         quoted.message = "a \"b\"\n";

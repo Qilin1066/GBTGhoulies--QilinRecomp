@@ -12,6 +12,7 @@
 // information classes), and I/O completes synchronously. Anything the game
 // asks for that isn't modelled yet (an APC routine, an event handle, an
 // information class) stops the runtime with its name.
+#include "path.hpp"
 #include <thread>
 #include <atomic>
 #include <set>
@@ -120,7 +121,7 @@ fs::path child(const fs::path& dir, const std::string& name) {
     if (fs::exists(p, ec)) return p;
     const std::string want = lower(name);
     for (const auto& e : fs::directory_iterator(dir, ec))
-        if (lower(e.path().filename().string()) == want) return e.path();
+        if (lower(utf8_path(e.path().filename())) == want) return e.path();
     return p;
 }
 
@@ -286,7 +287,7 @@ std::optional<Resolved> resolve_attributes(const rt::Context& c, uint32_t oa, ui
         return v && *v && *v != '0';
     }();
     if (trace) std::fprintf(stderr, " [%s%s -> %s]", base.empty() ? "" : (base + " + ").c_str(), object.c_str(),
-                            r ? (r->host.empty() ? r->object.c_str() : r->host.string().c_str()) : "unresolved");
+                            r ? (r->host.empty() ? r->object.c_str() : utf8_path(r->host).c_str()) : "unresolved");
     return r;
 }
 
@@ -611,7 +612,7 @@ void transfer(rt::Context& c, bool write, const char* fn) {
             static uint32_t slow = 0;
             if (ns > 3'000'000 && slow < 300)
                 ++slow, std::fprintf(stderr, "qilin: reading %u bytes at %llu of %s took %.1f ms\n", len, (unsigned long long)off,
-                                     h->host.filename().string().c_str(), double(ns) / 1e6);
+                                     utf8_path(h->host.filename()).c_str(), double(ns) / 1e6);
             done = uint32_t(h->file->gcount());
             if (h->file->bad() || (h->file->fail() && !h->file->eof())) status = kAccessDenied;
             else if (!done && len) status = kEndOfFile;
@@ -875,13 +876,13 @@ void nt_query_directory_file(rt::Context& c) {
         h->entries.clear();
         std::error_code ec;
         for (const auto& e : fs::directory_iterator(h->host, ec)) h->entries.push_back(e);
-        std::ranges::sort(h->entries, {}, [](const fs::directory_entry& e) { return lower(e.path().filename().string()); });
+        std::ranges::sort(h->entries, {}, [](const fs::directory_entry& e) { return lower(utf8_path(e.path().filename())); });
         h->cursor = 0;
         h->returned = false;
         if (mask || !h->scanned) h->mask = ansi(c, mask);
         h->scanned = true;
     }
-    while (h->cursor < h->entries.size() && !wildcard(h->mask, h->entries[h->cursor].path().filename().string())) ++h->cursor;
+    while (h->cursor < h->entries.size() && !wildcard(h->mask, utf8_path(h->entries[h->cursor].path().filename()))) ++h->cursor;
     if (h->cursor >= h->entries.size()) {
         // Nothing matched since the scan began: no such file, as for an
         // empty directory (a mask that skipped every entry used to leave the
@@ -892,7 +893,7 @@ void nt_query_directory_file(rt::Context& c) {
         return;
     }
     const fs::path p = h->entries[h->cursor].path();
-    const std::string name = p.filename().string();
+    const std::string name = utf8_path(p.filename());
     const uint32_t need = 64 + uint32_t(name.size());
     if (len < 64) {
         ret(c, kInfoLengthMismatch, 40);

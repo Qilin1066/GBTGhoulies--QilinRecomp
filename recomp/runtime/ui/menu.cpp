@@ -1,4 +1,5 @@
 #include "audio_out.hpp"
+#include "path.hpp"
 #include "menu.hpp"
 
 #include <SDL3/SDL.h>
@@ -138,7 +139,7 @@ bool Menu::handle(const SDL_Event& e) {
             if (!e.key.repeat && e.key.key == SDLK_F3) {  // the frame rate counter, kept in the settings
                 s_.performance_overlay = !s_.performance_overlay;
                 if (!platform::save_settings(folder_, s_))
-                    std::printf("qilin_run: the settings can't be saved to %s\n", platform::settings_file(folder_).string().c_str());
+                    std::printf("qilin_run: the settings can't be saved to %s\n", qilin::utf8_path(platform::settings_file(folder_)).c_str());
                 return true;
             }
             break;
@@ -186,7 +187,7 @@ void Menu::toggle() {
 void Menu::close() {
     s_.fullscreen = window_.fullscreen();
     if (!platform::save_settings(folder_, s_))
-        std::printf("qilin_run: the settings can't be saved to %s\n", platform::settings_file(folder_).string().c_str());
+        std::printf("qilin_run: the settings can't be saved to %s\n", qilin::utf8_path(platform::settings_file(folder_)).c_str());
     open_ = peek_ = false;
     capture_ = -1;
     note_.clear();
@@ -500,7 +501,7 @@ void Menu::game_page() {
     ImGui::TextWrapped("Grabbed by the Ghoulies QilinRecomp %s: a static recompilation, the game's own code compiled for this computer.",
                        QILIN_VERSION);
     ImGui::TextWrapped("Graphics: Vulkan. Window, sound and input: SDL3 (zlib). Menu: Dear ImGui (MIT).");
-    ImGui::TextWrapped("Settings file: %s", platform::settings_file(folder_).string().c_str());
+    ImGui::TextWrapped("Settings file: %s", qilin::utf8_path(platform::settings_file(folder_)).c_str());
 }
 
 }  // namespace qilin::ui
